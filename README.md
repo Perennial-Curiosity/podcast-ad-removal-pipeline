@@ -76,7 +76,7 @@ python3 pipeline/publish_github.py --podcast <id>  # publish newest marked episo
 ```
 
 The nightly cron runs at 8:00pm CDT across all configured podcasts
-(Security Now, Unsubscribe Podcast, Lore), then publishes. A full
+(Security Now, Unsubscribe Podcast), then publishes. A full
 episode takes roughly an hour (transcription dominates).
 
 ## Detection architecture (the heat map)
@@ -210,7 +210,7 @@ Notes:
 - **Marked-ads summary:** plain text at the TOP of the episode description below
   the dashes dividing line (`———————————————————`), each marked ad with its
   start time in minute:seconds. **No HTML tags** — they break Podcast Addict and other
-  apps' description display. Lore's original Libsyn HTML descriptions stay
+  apps' description display. Original HTML descriptions stay
   untouched; only the prepended summary is plain text.
 - **Crash protocol:** fix the root cause, then re-run the affected episode
   from the top — full fresh run (re-download, full detection, full chapter
