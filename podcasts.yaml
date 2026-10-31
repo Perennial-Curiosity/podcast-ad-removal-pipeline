@@ -18,7 +18,3 @@ podcasts:
     name: "Unsubscribe Podcast"
     feed_url: "https://feeds.megaphone.fm/UG3792007027"
     github_feed_path: "feeds/Unsubscribe-Podcast"
-  lore:
-    name: "Lore"
-    feed_url: "https://rss.libsyn.com/shows/65267/destinations/259905.xml"
-    github_feed_path: "feeds/Lore"
