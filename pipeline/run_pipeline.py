@@ -2222,12 +2222,20 @@ def write_feed(state, site_dir, original_xml):
     enclosure URL and a detected-ads summary prepended to the description.
     Episodes marked skipped (e.g. reverted 2026-10-28 clean slate) pass
     through untouched, so their enclosures point at the original
-    publisher audio. No bonus items are emitted: QA reels and unedited
-    audit items were removed 2026-10-28 (suspect reels are release assets
-    only, never feed items)."""
+    publisher audio -- UNLESS they carry a pinned original (2026-10-31):
+    a single fixed download uploaded as a release asset, swapped in as
+    the enclosure with NO description change and NO ad chapters, so the
+    owner listening to the feed hears exactly the file held locally for
+    later manual ad-marking (dynamic publisher ads differ per download).
+    When such an episode is later marked, clear its pinned_original_*
+    fields and let the marked path take over. No bonus items are emitted:
+    QA reels and unedited audit items were removed 2026-10-28 (suspect
+    reels are release assets only, never feed items)."""
     base = state.get("base_url", "").rstrip("/")
     marked = {g: ep for g, ep in state["processed"].items()
               if not ep.get("skipped") and ("file" in ep or "enclosure_url" in ep)}
+    pinned = {g: ep for g, ep in state["processed"].items()
+              if ep.get("pinned_original_url")}
 
     def repl_item(m):
         body = m.group(1)
@@ -2236,6 +2244,13 @@ def write_feed(state, site_dir, original_xml):
         # Strip CDATA wrapper if present (html.unescape doesn't handle it)
         if guid.startswith("<![CDATA[") and guid.endswith("]]>"):
             guid = guid[9:-3].strip()
+        pin = pinned.get(guid)
+        if pin:
+            body = re.sub(
+                r'<enclosure[^>]*>',
+                f'<enclosure url="{pin["pinned_original_url"]}" length="{pin["pinned_original_bytes"]}" type="audio/mpeg"/>',
+                body, count=1)
+            return "<item>" + body + "</item>"
         ep = marked.get(guid)
         if not ep:
             return m.group(0)
