@@ -212,6 +212,13 @@ Notes:
   start time in minute:seconds. **No HTML tags** — they break Podcast Addict and other
   apps' description display. Original HTML descriptions stay
   untouched; only the prepended summary is plain text.
+- **Pinned originals (2026-10-31):** an episode can carry
+  `pinned_original_url`/`pinned_original_bytes` in state; `write_feed`
+  swaps only its enclosure to that fixed unedited download, with no
+  description change and no chapters. This exists so a listener and
+  the pipeline share one identical file for manual ad-marking when
+  the publisher's download varies per request (dynamic ads). Clear
+  the pinned fields when the episode is later marked.
 - **Crash protocol:** fix the root cause, then re-run the affected episode
   from the top — full fresh run (re-download, full detection, full chapter
   marking), verified end to end. Never patch around a crash and resume.
