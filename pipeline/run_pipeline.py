@@ -163,6 +163,11 @@ OPEN_CUES = [
     "this episode is brought",
     "this portion of",
     "today's sponsor",
+    # BLAB validation (2026-11-05): "I'm going to tell you about our
+    # good friends at BetUS who brings you this video" — YouTube hosts
+    # open sponsor reads with the "good friends at" formula.
+    "our good friends at",
+    "good friends at",
 ]
 RETURN_CUES = [
     "welcome back",
@@ -385,6 +390,48 @@ def extract_sponsors(description_html):
                             variants.add(w)
                     break
             brands.append({"label": label, "variants": variants})
+    # YouTube-style sponsor blurbs (BLAB validation, 2026-11-05): no
+    # rel="sponsored" links and no "our sponsors" section — sponsors
+    # are listed as (URL, promo-code/CTA context) pairs, e.g.
+    # "Where to store your Bitcoin? I personally use a BitBox!
+    #  - Get a 5% Discount with code 'ROBIN'
+    #  - visit: https://bitbox.swiss/robin".
+    # Accept a URL as a sponsor when promo-code/CTA wording sits within
+    # ~150 chars of it (same blurb or list item). Social platforms and
+    # link shorteners are never sponsors.
+    ad_context = re.compile(
+        r"\b(code|coupon|discount|promo(tion)?al?|visit|my link|link:|free"
+        r"|deal|offer|sponsor|partner|check out|get started|sign up|try it)\b",
+        re.I)
+    existing_variants = {v for b in brands for v in b["variants"]}
+    for um in re.finditer(
+            r"(?<![\w:/.-])(?:https?://)?(?:www\.)?([a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?:/[^\s\"']*)?)",
+            text, re.I):
+        domain = um.group(1).lower()
+        host = domain.split("/")[0]
+        if any(p in domain for p in ("instagram", "tiktok", "twitter", "x.com",
+                                     "facebook", "youtube", "youtu.be", "patreon",
+                                     "spotify", "apple.co", "apple.com", "twitch",
+                                     "discord", "reddit", "wikipedia", "amzn",
+                                     "amazon", "linktr.ee", "bit.ly", "tinyurl",
+                                     "goo.gl", "t.co", "linkedin")):
+            continue
+        window = text[max(0, um.start() - 150):um.end() + 150]
+        if not ad_context.search(window):
+            continue
+        root = re.sub(
+            r"\.(com|net|org|io|ai|tv|co|us|tools|app|dev|xyz|online|store|tech|site|cloud|me|cc|gg|life|world|news|media|agency|digital|solutions|systems|network|security)$",
+            "", host)
+        if not root or len(root) < 4:
+            continue  # short domains stay out
+        stem = root.split(".")[0]  # bitbox.swiss -> bitbox (unknown TLDs)
+        if len(stem) < 4:
+            continue
+        if stem in existing_variants or root in existing_variants:
+            continue
+        existing_variants.add(stem)
+        existing_variants.add(root)
+        brands.append({"label": stem, "variants": {root, stem}})
     # de-dupe preserving order
     seen, out = set(), []
     for b in brands:
@@ -788,7 +835,7 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None):
     candidates.extend([(s, e, l, 'brand-orphan') for s, e, l in _method_brand_orphan(words, sponsors, silences)])
     candidates.extend([(s, e, l, 'cluster') for s, e, l in _method_cluster(words, sponsors, silences)])
     candidates.extend([(s, e, l, 'cluster-popular') for s, e, l in _method_cluster_popular(words, sponsors, silences)])
-    candidates.extend([(s, e, l, 'duplicate') for s, e, l in find_duplicate_segments(words)])
+    candidates.extend([(s, e, l, 'duplicate') for s, e, l in find_duplicate_segments(words, sponsors=sponsors)])
     candidates.extend([(s, e, l, 'chapter') for s, e, l in _method_chapter(words, chapters, silences)])
     if mp3_path:
         candidates.extend([(s, e, l, 'voice') for s, e, l in _method_voice(words, mp3_path)])
@@ -940,7 +987,14 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None):
     for s, e, label, method in candidates:
         if method in ('cta', 'duplicate', 'cluster', 'brand', 'chapter'):
             dur = e - s
-            if not (MIN_AD_LEN <= dur <= MAX_AD_LEN):
+            # Promo-code CTA blocks get a lower floor (BLAB validation,
+            # 2026-11-05): a spoken "use the code X" read is virtually
+            # never anything but an ad, and YouTube-show spots run
+            # 20-30s (BLAB 1mYpuu5Wcjw BetUS: GT 47-67s was found by
+            # cta at 37-67s and dropped by the 45s floor).
+            min_len = (20 if method == 'cta' and label.startswith('code-')
+                       else MIN_AD_LEN)
+            if not (min_len <= dur <= MAX_AD_LEN):
                 continue
             # Skip if already covered by a heatmap block
             if any(s < be and e > bs for bs, be, _ in blocks):
@@ -1194,6 +1248,28 @@ def _method_cta(words, sponsors, silences):
         seg = _expand_segment(words, nw, silences, hits, brand)
         if seg is None:
             seg = _expand_tight_cluster(words, nw, silences, hits)
+        if seg is None and brand.startswith("code-"):
+            # Promo-code fallback (BLAB validation, 2026-11-05): hosts
+            # drop the code mid-read with no opening cue and no clean
+            # closing pause ("...Bitcoin brands that I partner up with,
+            # like 21 Bitcoin... with code Robin you even get a
+            # discount" — BLAB 1m1ye7pTgs0). A spoken "use the code X"
+            # is near-certain ad evidence, so keep a bounded url-style
+            # segment [anchor-45s, anchor+15s] snapped to pauses
+            # instead of dropping the read entirely.
+            t = words[hits[-1]][0]
+            pauses = get_pauses(words, silences)
+            start, end = max(0.0, t - 45.0), t + 15.0
+            for ps, pe in pauses:
+                if ps >= start and ps - start <= 10.0:
+                    start = ps
+                    break
+            for ps, pe in reversed(pauses):
+                if pe <= end and end - pe <= 10.0:
+                    end = pe
+                    break
+            if 20 <= end - start <= 180:
+                seg = (start, end, "promo-code fallback")
         if seg:
             results.append((seg[0], seg[1], brand))
     return results
@@ -1536,7 +1612,42 @@ def _method_reverb(words, mp3_path):
     return out
 
 
-def find_duplicate_segments(words, min_shingle=8, min_gap=60, min_dur=15):
+def _span_has_ad_evidence(words, s, e, sponsors=None):
+    """Ad-evidence gate for duplicate clusters (BLAB validation,
+    2026-11-05). Interviews repeat the host's/guest's pet phrases
+    verbatim (BLAB iICjXqb-jmI: Max Keiser repeats 'there's no market,
+    there's no bid... the cosmic moment' minutes apart), which matched
+    the 8-word-shingle rule and produced 6 of 7 false-positive blocks.
+    An inserted ad that runs verbatim almost always carries at least
+    one ad cue inside the span: a spoken URL, a promo-code/CTA phrase,
+    an opening sponsor cue, or a description-sponsor mention. Require
+    one of those before a duplicate cluster may vote/mark."""
+    span = [w for w in words if s <= w[0] <= e]
+    if not span:
+        return False
+    nw_span = norm_words(span)
+    # Spoken URL / domain
+    if find_bare_urls(nw_span):
+        return True
+    # Promo-code / CTA / opening-cue phrasing
+    joined = ' '.join(t for t in nw_span if t).lower()
+    if re.search(r'\b(promo(tional)? code|use code|coupon code|code [a-z0-9]{2,15}'
+                 r'|visit|check out|sign up|learn more|get started|shop now'
+                 r'|subscribe|follow us|dot com)\b', joined):
+        return True
+    for cue in OPEN_CUES:
+        if cue in joined:
+            return True
+    # Description-sponsor mention
+    if sponsors:
+        for sp in sponsors:
+            if find_mentions(nw_span, sp['variants']):
+                return True
+    return False
+
+
+def find_duplicate_segments(words, min_shingle=8, min_gap=60, min_dur=15,
+                            sponsors=None):
     """Find verbatim-repeated segments (inserted ads run 2+ times).
     Returns [(start, end, label)]."""
     from collections import defaultdict
@@ -1577,6 +1688,8 @@ def find_duplicate_segments(words, min_shingle=8, min_gap=60, min_dur=15):
         ds = max(0, cs - 20)
         de = ce + 20
         if de - ds >= min_dur:
+            if not _span_has_ad_evidence(words, ds, de, sponsors):
+                continue
             result.append((ds, de, f"duplicate-{i+1}"))
     return result
 
@@ -1800,11 +1913,21 @@ def find_url_mentions(nw):
     L = len(nw)
     url_at = find_url_positions(nw)
     out = []
-    # promo codes are standalone CTAs
+    # promo codes are standalone CTAs. BLAB validation (2026-11-05):
+    # hosts also say "use the code X" and "using this code X" (BLAB
+    # KWQMS_s4lu8 / 1mYpuu5Wcjw BetUS reads) — accept the common
+    # lead-ins, but never let a following stopword anchor ("code of
+    # ethics"). An anchor alone still can't mark: _expand_segment
+    # needs an opening cue or produced-spot evidence.
+    _code_values = {"of", "is", "in", "that", "for", "and", "to", "it",
+                    "here", "what", "we", "you", "i", "a", "the",
+                    "word", "words", "name", "names"}
     for i in range(L):
         if nw[i] == "code" and i + 1 < L:
-            if (i >= 1 and nw[i - 1] in ("use", "promo")) or \
-               (i >= 2 and nw[i - 2] == "promo"):
+            lead_ok = (i >= 1 and nw[i - 1] in
+                       ("use", "using", "promo", "with", "this", "the")) or \
+                      (i >= 2 and nw[i - 2] == "promo")
+            if lead_ok and nw[i + 1] not in _code_values:
                 out.append((f"code-{nw[i + 1]}", i + 1))
     # CTA + nearby URL = ad anchor
     for i in range(L):

@@ -1,8 +1,4 @@
-# Local runtime artifacts — never synced to the repo
+eval_work/
+regression_work/
+regression/
 __pycache__/
-*.log
-model/
-podcasts/
-episodes/
-state.json
-*.mp3
