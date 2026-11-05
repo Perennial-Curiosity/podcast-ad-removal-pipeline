@@ -1915,19 +1915,36 @@ def find_url_mentions(nw):
     out = []
     # promo codes are standalone CTAs. BLAB validation (2026-11-05):
     # hosts also say "use the code X" and "using this code X" (BLAB
-    # KWQMS_s4lu8 / 1mYpuu5Wcjw BetUS reads) — accept the common
-    # lead-ins, but never let a following stopword anchor ("code of
-    # ethics"). An anchor alone still can't mark: _expand_segment
-    # needs an opening cue or produced-spot evidence.
+    # KWQMS_s4lu8 / 1mYpuu5Wcjw BetUS reads) — accept those, but ONLY
+    # with a promo verb in the lead-in ("use/try/enter ... the code").
+    # A bare "the code runs/containing/downloaded" is Security Now
+    # tech talk, not a promo code — the A/B regression on SN 1103
+    # caught 4 such FPs from a looser pattern. An anchor alone still
+    # can't mark: _expand_segment needs an opening cue or produced-spot
+    # evidence, and never let a following stopword anchor ("code of
+    # ethics").
     _code_values = {"of", "is", "in", "that", "for", "and", "to", "it",
                     "here", "what", "we", "you", "i", "a", "the",
                     "word", "words", "name", "names"}
+
+    def _plausible_code_value(v):
+        # codes are short alphanumeric tokens; long "-ing"/"-ed"
+        # participles are tech talk ("the code containing/downloaded"),
+        # not promo codes (SN 1103 regression).
+        if v in _code_values:
+            return False
+        if len(v) >= 8 and (v.endswith("ing") or v.endswith("ed")):
+            return False
+        return True
+
     for i in range(L):
         if nw[i] == "code" and i + 1 < L:
             lead_ok = (i >= 1 and nw[i - 1] in
-                       ("use", "using", "promo", "with", "this", "the")) or \
-                      (i >= 2 and nw[i - 2] == "promo")
-            if lead_ok and nw[i + 1] not in _code_values:
+                       ("use", "using", "promo", "with")) or \
+                      (i >= 2 and nw[i - 2] == "promo") or \
+                      (i >= 2 and nw[i - 2] in ("use", "using", "try", "enter")
+                       and nw[i - 1] in ("the", "this", "a", "your"))
+            if lead_ok and _plausible_code_value(nw[i + 1]):
                 out.append((f"code-{nw[i + 1]}", i + 1))
     # CTA + nearby URL = ad anchor
     for i in range(L):

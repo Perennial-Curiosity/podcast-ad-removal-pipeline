@@ -45,6 +45,18 @@ real ad gets cut and time recall for that episode went 0% → 34.8%).
 Strictly by the numbers Round 2 trades precision for recall; by
 ad-removal utility it is the better configuration.
 
+## Security Now regression check (eval/regression_ab.py)
+
+A first, looser version of the promo-code anchor pattern matched
+Security Now tech talk ("the code containing/downloaded/runs/calls") and
+added 4 false-positive blocks on SN 1103. The A/B check caught it; the
+final pattern requires a promo verb in the lead-in ("use/try/enter
+... the code X") and rejects long participle code values. Final A/B on
+SN 1103 (old vs new code, same transcript): **kept 5 / dropped 0 /
+added 0** — all five ad blocks (Hoxhunt, ThreatLocker, TrustedTech,
+Bitwarden, Club TWiT) identical to the old code, with the re-run BLAB
+numbers unchanged.
+
 ## Remaining misses, by category
 
 - **Sub-30s GT segments** (2-27s): below the pipeline's 30s heatmap /
