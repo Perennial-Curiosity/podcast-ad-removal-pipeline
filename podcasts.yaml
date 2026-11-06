@@ -14,6 +14,8 @@ podcasts:
     house_plugs:
       - label: "Club TWiT"
         variants: ["club twit", "clubtwit"]
+      - label: "Patreon"
+        variants: ["patreon", "patreon.com"]
   unsubscribe:
     name: "Unsubscribe Podcast"
     feed_url: "https://feeds.megaphone.fm/UG3792007027"
@@ -21,3 +23,5 @@ podcasts:
     house_plugs:
       - label: "Pepperbox"
         variants: ["pepperbox", "pepperbox.tv"]
+      - label: "Patreon"
+        variants: ["patreon", "patreon.com"]
