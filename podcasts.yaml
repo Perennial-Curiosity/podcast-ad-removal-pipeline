@@ -18,3 +18,6 @@ podcasts:
     name: "Unsubscribe Podcast"
     feed_url: "https://feeds.megaphone.fm/UG3792007027"
     github_feed_path: "feeds/Unsubscribe-Podcast"
+    house_plugs:
+      - label: "Pepperbox"
+        variants: ["pepperbox", "pepperbox.tv"]
