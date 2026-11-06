@@ -10,7 +10,10 @@ Each run (per podcast, via --podcast <id>):
   5. Extracts sponsor brands from the RSS description (ground truth)
   6. Locates each sponsor's ad-read block in the transcript
   7. Marks each detected ad as a chapter ("Muse Detected Ad For <name>")
-     in the full original audio -- nothing is cut
+     in the full original audio -- nothing is cut. House plugs (a show's
+     own platforms/memberships, e.g. Pepperbox, Club TWiT) are a subtype
+     of advertisement: detected and marked the same way, but titled
+     "Muse Detected House Plug For <name>", never as an ad
   8. Keeps pre-existing chapters (or auto-generates from topic changes
      if none exist), split at ad boundaries
   9. Builds a suspect reel for low-confidence segments (review only)
@@ -2114,14 +2117,30 @@ def ad_chapter_name(label, sponsors):
     return clean(cand)
 
 
-def _ad_chapter_spans(blocks, sponsors):
+# House plugs (2026-11-06, per the owner): plugs for a show's own
+# platforms/memberships (Pepperbox, Club TWiT) are a subtype of
+# advertisement -- detected and marked like ads, but their chapter is
+# titled "Muse Detected House Plug For <name>", never as an ad.
+def is_house_plug(name, house_plugs):
+    """True when a resolved chapter name is a configured house plug."""
+    if not name or not house_plugs:
+        return False
+    low = name.strip().lower()
+    return any(hp.get("label", "").lower() == low for hp in house_plugs)
+
+
+def _ad_chapter_spans(blocks, sponsors, house_plugs=None):
     """Detected blocks -> chapter spans [(start_s, end_s, title)].
     Overlapping spans merge (first title wins); titles are
-    'Muse Detected Ad For <name>' or plain 'Muse Detected Ad'."""
+    'Muse Detected Ad For <name>' or plain 'Muse Detected Ad', except
+    house plugs, which are titled 'Muse Detected House Plug For <name>'."""
     spans = []
     for s, e, label in sorted(blocks):
         name = ad_chapter_name(label, sponsors)
-        title = f"Muse Detected Ad For {name}" if name else "Muse Detected Ad"
+        if name and is_house_plug(name, house_plugs):
+            title = f"Muse Detected House Plug For {name}"
+        else:
+            title = f"Muse Detected Ad For {name}" if name else "Muse Detected Ad"
         spans.append((float(s), float(e), title))
     merged = []
     for s, e, t in spans:
@@ -2192,19 +2211,36 @@ def marked_summary_text(ep):
     chapters model): lists the ads marked as chapters. Podcast apps
     expect plain text descriptions -- no HTML."""
     blocks = ep.get("blocks", [])
-    total = sum(b["seconds"] for b in blocks)
-    n = len(blocks)
+    def _is_plug(b):
+        return (b.get("chapter") or "").startswith("Muse Detected House Plug")
+    ads = [b for b in blocks if not _is_plug(b)]
+    plugs = [b for b in blocks if _is_plug(b)]
+    total_ads = sum(b["seconds"] for b in ads)
+    total_plugs = sum(b["seconds"] for b in plugs)
     lines = [
         "———————————————————",
         "",
-        f"Detected ads marked as chapters: {n} ad{'s' if n != 1 else ''} "
-        f"totaling {total / 60:.1f} minutes. Each ad plays in full -- "
-        f"skip to the next chapter to pass it.",
-        "",
     ]
+    if ads:
+        lines.append(
+            f"Detected ads marked as chapters: {len(ads)} ad{'s' if len(ads) != 1 else ''} "
+            f"totaling {total_ads / 60:.1f} minutes. Each ad plays in full -- "
+            f"skip to the next chapter to pass it.")
+        lines.append("")
+    if plugs:
+        lines.append(
+            f"House plugs marked as chapters: {len(plugs)} plug{'s' if len(plugs) != 1 else ''} "
+            f"totaling {total_plugs / 60:.1f} minutes.")
+        lines.append("")
+    if not blocks:
+        lines.append(
+            "Detected ads marked as chapters: 0 ads totaling 0.0 minutes. "
+            "Each ad plays in full -- skip to the next chapter to pass it.")
+        lines.append("")
     for b in blocks:
         title = b.get("chapter") or b.get("sponsor", "")
-        short = title.replace("Muse Detected Ad For ", "")
+        short = title.replace("Muse Detected Ad For ", "").replace(
+            "Muse Detected House Plug For ", "")
         start = b.get("start")
         if start is not None:
             m, s = divmod(int(start), 60)
@@ -2311,6 +2347,7 @@ def process_episode(item, state):
     log(f"transcript: {len(words)} words, {duration:.0f}s audio")
 
     sponsors = extract_sponsors(item["description"])
+    desc_sponsors = list(sponsors)
     sponsors += [dict(p) for p in HOUSE_PLUGS]
     log(f"sponsors from RSS: {[s['label'] for s in sponsors]}")
     # Always run detection: CTA/duplicate/voice/cluster-popular methods are
@@ -2325,7 +2362,9 @@ def process_episode(item, state):
     if chapters:
         log(f"{len(chapters)} chapters available for chapter-marker detection")
     blocks, suspects = detect_ad_blocks(words, sponsors, silences, mp3_path, chapters)
-    missed = check_missed_sponsors(words, sponsors, blocks)
+    # Missed-sponsor check covers description sponsors only: a house plug
+    # not mentioned in a given episode is normal, not a miss.
+    missed = check_missed_sponsors(words, desc_sponsors, blocks)
     if not sponsors:
         log("no sponsors listed in description; sponsor-independent detection only")
 
@@ -2339,7 +2378,7 @@ def process_episode(item, state):
     else:
         log("no pre-existing chapters; auto-generating from transcript")
         base = [(ms / 1000.0, t) for ms, t in generate_chapters(words, duration)]
-    ad_spans = _ad_chapter_spans(blocks, sponsors)
+    ad_spans = _ad_chapter_spans(blocks, sponsors, HOUSE_PLUGS)
     marked_chapters = insert_ad_chapters(base, ad_spans, duration)
     out_name = f"{slug}-marked.mp3"
     out_path = os.path.join(SITE_DIR, out_name)
