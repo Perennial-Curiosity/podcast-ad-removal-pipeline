@@ -3,8 +3,12 @@
 Server-side pipeline that downloads podcast episodes, transcribes them,
 detects sponsor ad reads with a multi-method heat map, and marks each ad
 as a chapter titled "Muse Detected Ad For \<company or product\>" in the
-full original audio — nothing is cut. It publishes the marked episodes
-to GitHub releases with a regenerated RSS feed for Podcast Addict.
+full original audio — nothing is cut. House plugs (a show's own
+platforms/memberships, e.g. Pepperbox, Club TWiT) are a subtype of
+advertisement: detected and marked the same way, but titled
+"Muse Detected House Plug For \<name\>", never as an ad. It publishes
+the marked episodes to GitHub releases with a regenerated RSS feed for
+Podcast Addict.
 
 Chapters model since 2026-10-28 (per the owner): previously the pipeline
 cut ads out (with a swish at every splice) and published cleaned
