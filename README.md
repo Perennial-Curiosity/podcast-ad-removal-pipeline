@@ -95,7 +95,17 @@ sponsor label first, then a label with a spoken-URL anchor in the region,
 then any non-artifact label. Sponsor-identified blocks
 are capped to the sponsor's in-block mention span ±30s, and a
 sponsor-labeled heat-map block with no mention of that sponsor within 10s
-is dropped as padding/dryness noise. Finally, in middle-ground mode
+is dropped as padding/dryness noise. A single-method segment that
+overlaps a heat-map block for the same sponsor extends the block's
+start to the segment's start (2026-11-07: the segment, often the
+cluster, frequently starts where the ad starts, while the heat-map
+block starts only where a second vote arrives at the CTA/URL tail;
+the extension stops at the ad's opening cue when one is spoken in
+between, so a cluster that starts early on content mentions of a
+common-word sponsor cannot over-extend). The show's own domains
+(derived generically from the RSS channel link and non-sponsor
+description links) are excluded from URL evidence (2026-11-07).
+Finally, in middle-ground mode
 (2026-10-29, replacing the same-day zero-over-mark shrink that the owner
 rejected for gutting sparse-mention reads — Stop Box 51s → 13s, Club
 TWiT 75s → 2s), each block edge is refined inward to the nearest
@@ -115,7 +125,7 @@ maximum.
 | `url` | Spoken URLs with NO CTA phrase (2026-10-28): dynamic spots often say just "at leaffilter.com slash gold" with no CTA phrase, so the CTA gate never anchors them. A spoken domain is itself strong ad evidence; the segment runs [first URL −45s, last URL +10s] (ads put the URL at the end) | Low — heat-map votes only, never marks alone |
 | `brand` | Description sponsors as ground truth (fuzzy matching, incl. Whisper mistranscription variants) | High — marks alone |
 | `cluster` | Dense brand mentions: 4+ in 1 minute (casual ad reads); segments bounded to the mention span ±60s, and single-method cluster blocks need a spoken URL for that sponsor nearby (a place name can fake dense mentions — 287 "rattlesnake Ridge") | High — marks alone |
-| `duplicate` | Verbatim-repeated segments ≥15s (8-word shingles); inserted ads run 2+ times | High — marks alone |
+| `duplicate` | Verbatim-repeated segments ≥15s (8-word shingles); inserted ads run 2+ times | Low — heat-map votes only, never marks alone (2026-11-07: duplicate-only blocks were false positives on repeated intros and re-read quotes; a duplicate segment must corroborate another method's vote) |
 | `chapter` | Publisher-labeled ad chapters (`[Ad]`, `Ad:`, `Advertisement`, `Sponsor`, `Commercial`, `Ad break`) from ID3 tags and RSS `<psc:chapter>` | High — marks alone |
 | `brand-orphan` | Sponsor mentions the brand method found but could not expand into a segment (no opening cue) | Low — heat-map votes only, never marks alone |
 | `cluster-popular` | Dense mentions of popular sponsors NOT in the description | Low — heat-map votes only; single-vote hits go to the suspect reel, never auto-marked |
@@ -202,6 +212,22 @@ Notes:
 - **Ollama / LLM reviewer: evaluated 2026-10-14, REJECTED.** It hallucinated
   sponsor reads, missed real ads, produced garbled timestamps, and was
   too slow and memory-hungry. Do not re-add without a fresh evaluation.
+- **SponsorBlock eval A/B (2026-11-07):** five improvements tested
+  separately against 25 SponsorBlock-anchored episodes (107 labels,
+  8 shows). Baseline: recall 0.636, median edge error 7.5s, within
+  1s 19.9%, 67 false blocks. Winners, now in the code: same-label
+  merge (recall 0.664, median 5.6s, within 1s 25.4%), duplicate
+  corroboration (false blocks 67 → 45), own-domain exclusion
+  (recall 0.654, median 7.0s). Combined: recall 0.673, median 4.9s,
+  within 1s 25.7%, false blocks 36. Losers, removed: phonetic/fuzzy
+  brand matching (Soundex+LCS — recall 0.579, false blocks 77;
+  the ~480 collision hits swamped ~72 real manglings and moved
+  block starts 200s+ late on Security Now) and head-extension from
+  brand-seeded blocks (a wash — its Modern Wisdom target turned
+  out to be label artifacts; the closing URL is already inside
+  the block). A silence-based start fallback was also rejected:
+  it would extend the Eight Sleep block 73s backward into the
+  preceding Joovv read.
 
 ## Standing rules (do not break these)
 
