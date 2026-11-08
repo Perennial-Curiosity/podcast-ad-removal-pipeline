@@ -57,6 +57,12 @@ MAX_AD_LEN = 12 * 60
 # Chunk size for transcription (seconds) — keeps each job short
 TRANSCRIBE_CHUNK = 180
 
+# A/B test toggles for the 2026-11-07 SB-eval improvements (temporary:
+# losers are removed entirely after scoring, winners become unconditional).
+# find_mentions reads AB_PHONETIC (imp1); detect_ad_blocks takes the rest
+# as kwargs so each variant scores independently.
+AB_PHONETIC = False
+
 # Popular podcast sponsors not in the episode description.
 # Used ONLY by the cluster finder (4+ mentions in 1 min) as a safety net
 # for unlisted/dynamic ads — never by the brand matcher. Hits here are
@@ -535,11 +541,101 @@ def norm_words(words):
     return [re.sub(r"\s+", " ", w[2]).strip().lower() for w in words]
 
 
+def _soundex_digits(word):
+    """Classic Soundex code minus the first letter (3 digits): the
+    consonant skeleton of a word. Two spellings with the same skeleton
+    share digits even when the first letter differs ('century'/'sentry'
+    -> 253). Vowels separate identical codes; h/w do not."""
+    codes = {'b': '1', 'f': '1', 'p': '1', 'v': '1',
+             'c': '2', 'g': '2', 'j': '2', 'k': '2', 'q': '2',
+             's': '2', 'x': '2', 'z': '2',
+             'd': '3', 't': '3', 'l': '4', 'm': '5', 'n': '5', 'r': '6'}
+    out = []
+    prev = None
+    for ch in word.lower():
+        c = codes.get(ch)
+        if c is None:
+            if ch in 'aeiouy':
+                prev = None
+            continue
+        if c != prev:
+            out.append(c)
+        prev = c
+    return (''.join(out) + '000')[:3]
+
+
+def _lcs_len(a, b):
+    """Length of the longest common substring (single-row DP)."""
+    best = 0
+    prev = [0] * (len(b) + 1)
+    for ca in a:
+        cur = [0] * (len(b) + 1)
+        for j, cb in enumerate(b, 1):
+            if ca == cb:
+                cur[j] = prev[j - 1] + 1
+                if cur[j] > best:
+                    best = cur[j]
+        prev = cur
+    return best
+
+
+def _phonetic_match(v, w, vcode=None):
+    """Do a brand variant and a transcript word share a Soundex consonant
+    skeleton? Catches Whisper manglings the 0.85 fuzzy ratio misses:
+    'hawkshunt'/'hoxhunt' (0.63), 'jura'/'jira' (0.75), 'seara'/'sierra'
+    (0.73), 'century'/'sentry' (0.77). Soundex alone is far too coarse
+    (3 digits: 'have'/'whoop' share 100, 'know'/'join' share 250, 'like'
+    matches 'helix' 424x on one episode), so a shared substring is also
+    required: >= 2 chars, and either the same first letter or >= 3 chars;
+    a word shorter than the variant needs the >= 3-char substring too.
+    The length gate keeps short-word collisions down; alpha-only keeps
+    tokens like 'ag1' out. Gated by AB_PHONETIC (imp1, 2026-11-07 A/B)."""
+    if len(v) < 4:
+        return False
+    wc = w.strip(".,!?;:'\"").lower()
+    if len(wc) < 4 or not wc.isalpha():
+        return False
+    if abs(len(wc) - len(v)) > 2:
+        return False
+    if vcode is None:
+        vcode = _soundex_digits(v)
+    if vcode != _soundex_digits(wc):
+        return False
+    lcs = _lcs_len(v, wc)
+    if lcs < 2:
+        return False
+    if wc[0] != v[0]:
+        # A different first letter is a strong sign of a different word
+        # ('center' vs 'sentry', 'needed' vs 'indeed'): allow it only
+        # when the word is longer than the variant (the mangling gained
+        # letters, as 'century' gains 'u' over 'sentry') and shares a
+        # >= 3-char substring.
+        if len(wc) <= len(v) or lcs < 3:
+            return False
+    if len(wc) < len(v) and lcs < 3:
+        return False
+    return True
+
+
+def _prefix_guard_ok(v, w):
+    """A token that merely STARTS with the brand plus a non-plural suffix
+    is a different word, not a mangling: 'factory' is not Factor (0.92),
+    'progressively' is not Progressive. Trailing punctuation does not
+    count as a suffix."""
+    if not w.startswith(v):
+        return True
+    suf = w[len(v):].strip(".,!?;:")
+    return suf in ("s", "es", "'s", "")
+
+
 def find_mentions(nw, variants):
     """Word indices mentioning a brand.
 
     Handles 'bit warden' -> 'bitwarden' (split words) and whisper
     mis-transcriptions like 'threadlocker' -> 'threatlocker' (fuzzy).
+    With AB_PHONETIC (imp1, 2026-11-07 A/B): a Soundex-digits channel
+    for mangled brands, and multi-token variants may span two transcript
+    words per token ('trustedtech team' vs 'trusted tech team').
     """
     from difflib import SequenceMatcher
     hits = []
@@ -547,22 +643,18 @@ def find_mentions(nw, variants):
     for v in variants:
         toks = v.split()
         if len(toks) == 1 and len(v) >= 6:
+            vcode = _soundex_digits(v) if AB_PHONETIC else None
             for i in range(L):
                 w = nw[i]
                 if w == v or w in (v + "s", v + "es", v + "'s"):
                     hits.append(i)
                 elif SequenceMatcher(None, v, w).ratio() >= 0.85:
-                    # Fuzzy mangling ('threadlocker' -> 'threatlocker',
-                    # 0.92) is welcome, but a token that merely STARTS
-                    # with the brand plus a non-plural suffix is a
-                    # different word, not a mangling: 'factory' is not
-                    # Factor (0.92), 'progressively' is not Progressive,
-                    # and 'need' is not Indeed (0.80, below threshold).
-                    # Trailing punctuation does not count as a suffix.
-                    if w.startswith(v):
-                        suf = w[len(v):].strip(".,!?;:")
-                        if suf not in ("s", "es", "'s", ""):
-                            continue
+                    if not _prefix_guard_ok(v, w):
+                        continue
+                    hits.append(i)
+                elif AB_PHONETIC and _phonetic_match(v, w, vcode):
+                    if not _prefix_guard_ok(v, w):
+                        continue
                     hits.append(i)
             for i in range(L - 1):
                 # Split compounds ('bit' + 'warden' -> 'bitwarden'):
@@ -575,9 +667,47 @@ def find_mentions(nw, variants):
                         v not in nw[i] and v not in nw[i + 1]:
                     hits.append(i)
             continue
+        if len(toks) == 1:
+            # Short single-token variant: substring match (as before),
+            # plus the phonetic channel under AB_PHONETIC.
+            v = toks[0]
+            vcode = _soundex_digits(v) if AB_PHONETIC else None
+            for i in range(L):
+                w = nw[i]
+                if v in w:
+                    hits.append(i)
+                elif AB_PHONETIC and _phonetic_match(v, w, vcode):
+                    if not _prefix_guard_ok(v, w):
+                        continue
+                    hits.append(i)
+            continue
         n = len(toks)
-        for i in range(L - n + 1):
-            if all(toks[j] in nw[i + j] for j in range(n)):
+        if not AB_PHONETIC:
+            for i in range(L - n + 1):
+                if all(toks[j] in nw[i + j] for j in range(n)):
+                    hits.append(i)
+            continue
+        # Multi-token variant under AB_PHONETIC: each token consumes 1
+        # transcript word (substring, as before) or 2 adjacent words
+        # whose concatenation contains the token without either word
+        # containing it alone (split-compound guard) — 'trustedtech
+        # team' matches 'trusted tech team'.
+        for i in range(L):
+            pos = i
+            ok = True
+            for tok in toks:
+                if pos >= L:
+                    ok = False
+                    break
+                if tok in nw[pos]:
+                    pos += 1
+                elif pos + 1 < L and tok in (nw[pos] + nw[pos + 1]) and \
+                        tok not in nw[pos] and tok not in nw[pos + 1]:
+                    pos += 2
+                else:
+                    ok = False
+                    break
+            if ok:
                 hits.append(i)
     return sorted(set(hits))
 
@@ -720,7 +850,9 @@ def find_closing(words, nw, silences, last, seg_start):
     return None
 
 
-def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None):
+def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
+                     tail_extend=False, head_extend=False,
+                     dup_needs_corroboration=False, own_domains=None):
     """Locate ad-read blocks via multi-method heat map (2026-10-09).
 
     Each detection method runs independently on the unedited episode,
