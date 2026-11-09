@@ -228,6 +228,17 @@ Notes:
   the block). A silence-based start fallback was also rejected:
   it would extend the Eight Sleep block 73s backward into the
   preceding Joovv read.
+- **Brand-orphan merge (2026-11-09):** a brand-orphan segment (a
+  sponsor mention the brand method could not turn into a block) is
+  now a merge candidate like the same-label merge above: when it
+  overlaps a heat-map block for the same sponsor, the block extends
+  to the orphan segment's silence-snapped bounds, stopped at the
+  first opening cue (start) or return-to-content cue (end), never
+  past another sponsor's mention or into an adjacent block, and
+  never double-extending a block the same-label merge already
+  extended. Validated alone on the same 25 episodes: recall 0.673
+  flat, median edge error 4.9 → 4.7s, within 1s 25.7 → 26.4%,
+  false blocks 36 flat; 3 edges fixed, 0 harmed.
 
 ## Standing rules (do not break these)
 
