@@ -1066,6 +1066,9 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     # to mark. Removing it cut false blocks 67 -> 45 on the 25-episode
     # SB eval at a cost of 1 matched label.
     _single_methods = ('cta', 'cluster', 'brand', 'chapter')
+    # Indices of blocks whose start the same-label merge moved (2026-11-09,
+    # brand-orphan test): the orphan pass below must not double-extend them.
+    _merge_extended = set()
     for s, e, label, method in candidates:
         if method in _single_methods:
             dur = e - s
@@ -1154,6 +1157,7 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
                     log(f"  extend '{label}': {_bs:.0f}s-{_be:.0f}s -> "
                         f"{_ns:.0f}s-{_be:.0f}s (overlap {method})")
                     blocks[_bi] = (_ns, _be, _bl)
+                    _merge_extended.add(_bi)
                 _merged = True
                 break
             if _merged:
@@ -1166,6 +1170,78 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
                 continue
             blocks.append((s, e, label))
             log(f"  single-method '{label}': {method} {s:.1f}s-{e:.1f}s ({dur:.0f}s)")
+
+    # Brand-orphan merge (2026-11-09, SB-eval improvement 6, validated
+    # on 25 SponsorBlock-anchored episodes):
+    # a brand-orphan segment — a sponsor mention _expand_segment could
+    # not turn into a block — is the only evidence for reads that name
+    # their sponsor once, so no single-method segment overlaps the
+    # heat-map block with an earlier start and the imp2 merge never
+    # fires; the block stays tail-only. Extend such a block to the
+    # orphan segment's bounds (already silence-snapped at +-45s around
+    # the mention span), same sponsor only, with the same cue guard as
+    # the imp2 merge on the start side and a return-to-content cue /
+    # different-sponsor guard on the end side. The mention-span cap
+    # below still bounds both extensions to mention span +-30s, exactly
+    # as it bounds imp2. A block the imp2 merge already extended is
+    # never extended again. An unbounded silence-based extension was
+    # tested and rejected 2026-11-07 (Eight Sleep would extend 73s
+    # backward into the preceding Joovv read), so the extension target
+    # here is always the same-sponsor orphan segment, never a raw
+    # silence gap.
+    for s, e, label, method in candidates:
+        if method != 'brand-orphan':
+            continue
+        _part = label.split(':')[-1].strip().lower().replace(' ', '')
+        for _bi, (_bs, _be, _bl) in enumerate(blocks):
+            if _bl.split(':')[-1].strip().lower().replace(' ', '') != _part:
+                continue
+            if _bi in _merge_extended:
+                continue
+            if not (s < _be and e > _bs):
+                continue
+            _ns, _ne = _bs, _be
+            if s < _bs:
+                _ns = s
+                _cue = _first_opening_cue_after(words, _nw_heat,
+                                                silences, s, _bs)
+                if _cue is not None:
+                    _ns = max(s, _cue)
+                # Never extend into a preceding block.
+                for (_bs2, _be2, _bl2) in blocks:
+                    if _be2 <= _bs and _be2 > _ns:
+                        _ns = max(_ns, _be2)
+            if e > _be:
+                _ne = e
+                # Return-to-content cue: extend only to the first
+                # RETURN_CUES phrase spoken after the block end.
+                for _i in range(len(_nw_heat)):
+                    if not (_be < words[_i][0] < e):
+                        continue
+                    _win = " ".join(_nw_heat[_i:_i + 4])
+                    if any(_c in _win for _c in RETURN_CUES):
+                        _ne = min(_ne, words[_i][0])
+                        break
+                # Different-sponsor guard (imp3 fallback rule): if
+                # another sponsor is mentioned between the block end
+                # and the target end, the end is a different ad —
+                # do not extend at all.
+                for _sp2 in sponsors:
+                    if _sp2['label'].lower().replace(' ', '') == _part:
+                        continue
+                    _hits2 = find_mentions(_nw_heat, _sp2['variants'])
+                    if any(_be < words[_h][0] < _ne for _h in _hits2):
+                        _ne = _be
+                        break
+                # Never extend into a following block.
+                for (_bs2, _be2, _bl2) in blocks:
+                    if _bs2 > _be and _bs2 < _ne:
+                        _ne = _bs2
+            if _ns != _bs or _ne != _be:
+                log(f"  orphan-extend '{label}': {_bs:.0f}s-{_be:.0f}s -> "
+                    f"{_ns:.0f}s-{_ne:.0f}s")
+                blocks[_bi] = (_ns, _ne, _bl)
+            break
 
     # Mention-span cap (2026-10-27): orphan padding (+-45s) and cluster
     # pause-snapping inflate blocks with surrounding content (Unsubscribe
