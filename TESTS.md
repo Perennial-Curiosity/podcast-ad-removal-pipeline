@@ -794,6 +794,23 @@ mismatch) proved working — all 40 stale caches detected — and is worth
 re-adding with any future switch. Full record in local HANDOFF.md;
 verification artifacts under `tmp/verify_hotwords_switch/`.
 
+**Third verification — FAILED, switch abandoned (2026-11-10,
+owner-approved).** Hotwords `Ghostbed Manscaped Nobl Superpower
+Perfect Jean` (attempt 2's title-cased labels with "The" dropped).
+Chunk 6 clean as the probe predicted, Perfect Jean found, 0 false
+blocks — but Ghostbed missed instead: recall 8/9, within 1s 4/18,
+within 2s 8/18, median 2.2s, mean 4.9s, over-mark 18.7s, coverage
+548.1/673s. The Ghostbed opening sound effect looped again in altered
+form — "tu" ×12, only 2 "ghostbed" mentions surviving in the ad
+window — so the block covered 36% of the ad, below the 50% match
+threshold. Pattern across all three attempts: each hotwords wording
+fixes one chunk and breaks another; the prompt wording decides
+loop-or-not per chunk in ways that are not predictable. Conclusion:
+the hotwords mechanism itself is unreliable here, not one bad string.
+Transcription stays plain base; `run_pipeline.py` reverted to its
+exact pre-switch state (verified: compiles, zero hotwords references).
+Result in `tmp/verify_hotwords_switch/verify_result3.json`.
+
 ---
 
 ## Earlier rejected ideas — one-line index
