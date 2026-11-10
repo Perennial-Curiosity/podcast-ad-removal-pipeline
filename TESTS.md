@@ -580,6 +580,55 @@ cheap fallback — base + hotwords (~38 min/episode) tested end-to-end
 the same way; it fixes the exact defects that motivated the switch
 (Manscaped mangling, "cha" loop).
 
+### Update — base+hotwords end-to-end, and turbo+hotwords combo (2026-11-10)
+
+**Method:** same harness, extended with a third candidate. Full
+base+hotwords transcript of 286 (21,596 words, 37.7 min wall, 40 chunks,
+no reboot). Base and turbo re-runs reproduced exactly, so the
+comparison is anchored. Results in `end_to_end/results.json`.
+
+**Turbo+hotwords slice test (step 1):** the one combination never tested
+— turbo with sponsor-name hints together on the 30-minute slice —
+scored 83.85% agreement vs 89.57% for turbo alone. It drops whole
+stretches of speech and writes "Manscape" for Manscaped. Combo stopped;
+turbo alone stays the accuracy candidate.
+
+**Transcription checks (full 286):** all 9 brands correct in-window —
+Manscaped 7x "manscaped", 0x "manscape" (base is the reverse: 0/7). No
+mangled forms anywhere. Longest repeat "blah" x7 (below the >=8 loop
+threshold); "cha" count 0 (base: x222). Agreement vs base control
+90.16%.
+
+**Results (three-way):**
+
+- Recall: 9/9 all three. False blocks: 0 all three.
+- Edges within 1s: 3/18 (16.7%) all three. Within 2s: 8/18 (44.4%)
+  base, 7/18 (38.9%) hotwords, 6/18 (33.3%) turbo.
+- Median edge error: 2.8s base, 2.8s hotwords, 4.5s turbo. Mean: 4.7s
+  base, 5.0s hotwords, 6.2s turbo.
+- Worst edge: 15.9s (NOBL start) base and hotwords, 19.2s (Perfect
+  Jean start) turbo.
+- Coverage: 606.8/673s base, 600.7/673s hotwords, 620.3/673s turbo.
+  Over-mark: 17.8s base, 17.7s hotwords, 58.9s turbo.
+- Edge by edge vs base (18 edges): 4 better, 3 worse, 11 unchanged.
+  Better: Progressive end −3.0→−2.6, Ghostbed start +11.1→+8.9, Got
+  Junk end +0.7→+0.6, Ozempic start +4.3→+1.4. Worse: Ozempic end
+  −2.6→−3.0, SuperPower start +1.3→+2.4, NOBL end −1.9→−12.0 (same
+  −12.0 as turbo — both hear something at the NOBL close that base does
+  not; the one edge that moves the mean).
+
+**Conclusion: RECOMMEND switching transcription to base+hotwords.**
+Edges essentially match base — median, worst, over-mark, and within-1s
+identical; within-2s 7 vs 8; mean slightly worse (5.0 vs 4.7) on the
+single NOBL-end edge — while keeping every transcription fix (all 9
+brands spelled right, "cha" loop gone) at ~38 min/episode vs base's
+~32. Unlike turbo (worse edges at ~5x cost), hotwords costs almost
+nothing and fixes real defects. Switch is the owner's call; not yet
+approved. Caveat: one episode, 9 ads, 18 edges; the NOBL-end move
+bears watching on a second episode. Suggested next step: confirm the
+NOBL end on a second episode (Security Now), then the
+corroboration-gated phonetic redesign.
+
 ---
 
 ## 11. Parakeet TDT 0.6B v3 transcription test — COMPLETE (2026-11-10)
