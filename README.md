@@ -21,6 +21,12 @@ This repo mirrors the live pipeline. A daily sync job pushes code and
 config changes from the working copy. If you change the pipeline, sync
 this repo in the same step (see "Keeping this repo in sync").
 
+**Test log:** [`TESTS.md`](TESTS.md) is the canonical log of every
+detection and transcription experiment tried on this pipeline — why
+each was a candidate, how to reproduce it, the numbers, and the
+verdict (kept / discarded / undecided). Read it before re-proposing a
+mechanism.
+
 ## What it produces
 
 - **Marked episode MP3** (full original with ad chapters embedded) as a
