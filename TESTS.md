@@ -813,6 +813,91 @@ Result in `tmp/verify_hotwords_switch/verify_result3.json`.
 
 ---
 
+## 14. Corroboration-gated phonetic redesign — DISCARDED, all three gates (2026-11-10)
+
+**Why:** the first phonetic test (entry 2, improvement 1) failed on
+~480 Soundex+LCS collisions vs ~72 real manglings. The redesign
+accepted a phonetic match only when a second source corroborated the
+same spot. The trademark list (entry 9) existed by then to serve as a
+gate, and the owner's web-search verification idea was a second
+candidate gate.
+
+**Method:** the imp1 phonetic gate was rebuilt fresh (its code had
+been deleted): 3-digit Soundex over all letters + longest-common-
+substring ≥2 + first-letter/LCS conditions, plus the missing
+constraint |length difference| ≤ 2 — without it the reconstruction
+gives 1,928 hits instead of imp1's 550; with it, 568 hits. Baseline
+reproduced exactly first (`combined_repro7`, all deltas 0.0 vs
+`brand_orphan`). Three gates tested alone on the same 25 episodes:
+- **phonetic_ev (evidence gate):** a phonetic hit counts only if an
+  exact/fuzzy mention of the same sponsor, or a bare-URL stem
+  phonetically matching a variant, sits within ±60s. Window
+  sensitivity checked (±30/60/120/180s); ±60s chosen — widening to
+  120s gains 2 missed-label hits but adds 16 content hits.
+- **phonetic_tm (trademark gate):** a phonetic hit counts only if the
+  heard word is NOT a live trademark. Offline it proved too blunt on
+  its own: kills ~83% of known collisions but also ~half the known
+  real manglings (woop, rora, rudder, plaid, jura, century ARE live
+  trademarks).
+- **phonetic_both:** both conditions.
+- The web-search gate was not pursued: the evidence gate already
+  plays its corroboration role, and the failure turned out structural
+  (below), not a corroboration-quality problem.
+Harness: `sb_eval/ab_detect.py` + `ab_score.py`; frozen results under
+`sb_eval/ab/phonetic_ev|tm|both/results.json`; gate analysis in
+`sb_eval/ab/phonetic_gate_analysis.py`, `phonetic_gate_window.py`,
+`phonetic_gate_hits.json`.
+
+**Results vs baseline (recall 0.673, median 4.7s, mean 12.0s, within
+1s 26.4%, within 2s 37.5%, FP 36, missed 35):**
+
+- phonetic_ev: recall 0.673, median 4.7s, mean 12.6s, within 1s
+  26.4%, within 2s 36.8%, FP 37, missed 35, labels +1/−1.
+- phonetic_tm: recall 0.636, median 4.7s, mean 12.7s, within 1s
+  27.9%, within 2s 39.0%, FP 42, missed 39, labels +1/−5.
+- phonetic_both: recall 0.664, median 4.6s, mean 12.2s, within 1s
+  26.8%, within 2s 37.3%, FP 37, missed 36, labels +0/−1.
+
+**Decision-rule check:** ev fails (median did not improve); tm fails
+outright (recall −0.037 past the 0.02 allowance, FP +16.7% past
+~10%); both is borderline/mixed (gains nothing, loses the SN 1103
+Hoxhunt label) → do not include.
+
+**Why it fails (mechanism, verified in the logs):** phonetic hits
+cluster at the **tail** of a read — the only place Whisper's error is
+a close spelling is the spelled-out URL ("hawkshunt dot com"); the
+conversational body is transcribed as unrelated words. The hits then
+flip sponsors from the orphan path to the brand path:
+`_method_brand_orphan` skips any sponsor whose `_expand_segment` now
+succeeds, so the wide orphan segment (mention span ±45s) that used to
+carry the block disappears, replaced by the brand method's narrow
+segment around the late hits. Cap and refinement then pull the block
+start inward — Hoxhunt cap 540→569s, refine 569→588s (block covers
+28s of a 189s label); SN 1096 Bitwarden start +263s, Material +215s;
+SN 1099 Guardsquare +109s, Doppel +92s. Coverage falls below 50% and
+the label is lost. The looser the gate, the worse the damage — gate
+strictness is not the fix. **More data would not resolve this;
+systematic, not noise.**
+
+**The decisive number:** the within-1s edge **count is 38 in the
+baseline and in all three variants** (ev 38/144, tm 38/136, both
+38/142). The phonetic channel improved **zero edges**; the percentage
+"gains" in tm/both are pure denominator artifacts from losing labels.
+Within-2s count is 53 in all three vs 54 baseline.
+
+**Conclusion: DISCARD all three gates.** Variant code removed
+entirely from `ab_detect.py` (only a removal comment remains);
+post-removal verification: SN 1103 re-run reproduces the
+`brand_orphan` blocks exactly. `run_pipeline.py` never touched. A
+design constraint is recorded in `STATUS_AB.md` and HANDOFF.md: any
+future mechanism that adds mentions through `find_mentions` risks the
+same orphan flip and must be checked against it. One further idea from
+this test, for the owner's direction only (a redesign, not a tweak):
+phonetic hits used **only as a vote inside already-detected blocks** —
+never creating segments or flipping the orphan path.
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
