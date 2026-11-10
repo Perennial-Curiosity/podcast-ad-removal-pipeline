@@ -768,6 +768,32 @@ no pipeline change made.** Suggested next step if approved: confirm
 the NOBL end on a second, calmer episode (Security Now) before
 treating the switch as settled.
 
+**Implementation attempt — REVERTED (2026-11-10, same day the switch
+was approved).** The switch was implemented in `run_pipeline.py`
+(sponsors extracted from the description before transcription, passed
+as hotwords) and verified twice against this entry's targets; both
+attempts failed and the code was reverted to its exact pre-switch
+state (verified: compiles clean, zero hotwords references). Attempt 1
+(ALL-CAPS description labels): recall 5/9, 1 false block, coverage
+370.0/673s. Attempt 2 (title-cased labels): recall 8/9, 1 false block,
+coverage 513.5/673s — the Perfect Jean ad missed entirely, false
+block "THE PERFECT JEAN" at 1173–1251s. Root cause, verified in the
+faster-whisper source: hotwords are prepended to the decoder prompt as
+previous context, and on ambiguous chunk starts the decoder echoes the
+prompt instead of transcribing — whole chunks collapse to repeated
+hotwords (up to ~90% word loss). Two gaps vs the tested configuration:
+the pipeline can only derive 5 description sponsors, but the test used
+9 hand-listed names including 4 dynamic-ad brands absent from the
+description; and description labels are ALL-CAPS vs the test's Title
+Case. Diagnostic lead, single-chunk probe only and untested
+end-to-end: dropping "The" from the hotwords string restores the
+collapsed chunk to normal speech. A third full verification with that
+variant needs the owner's say-so. One keeper from the attempt: the
+per-chunk `transcribe_config` fingerprint (re-transcribe on config
+mismatch) proved working — all 40 stale caches detected — and is worth
+re-adding with any future switch. Full record in local HANDOFF.md;
+verification artifacts under `tmp/verify_hotwords_switch/`.
+
 ---
 
 ## Earlier rejected ideas — one-line index
