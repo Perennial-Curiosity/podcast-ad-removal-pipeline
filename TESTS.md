@@ -621,6 +621,54 @@ candidate, not a useful complement.
 
 ---
 
+## 12. Majority-vote transcription (3-run base) — COMPLETE (2026-11-10)
+
+**Why:** the owner's idea — two base transcriptions of the same audio
+disagree on 8–12% of words, so the errors are not in the same place
+every time. Running the fast base model 3 times with different chunk
+offsets and letting the transcripts vote on each word might reach
+turbo-level accuracy more cheaply than a single slow pass.
+
+**Method:** same 30-minute slice of Unsubscribe 286 (800–2600s), 3
+base runs (int8, CPU, beam 5, 180s chunks) with chunk grids offset by
+0s, 60s, and 120s. The three transcripts were aligned word by word
+(diff-based alignment, reusing the dynamic-slot approach) and the
+majority word taken at each position; ties (all three disagree) decided
+by the middle-offset run; positions heard by only one run dropped.
+Timestamps taken from the run that supplied the winning word. Scored
+with the same metrics as the benchmark (entry 8). One aligner bug found
+and fixed during the test: the first version split substitutions into
+separate delete/insert columns, so contested words were dropped as
+singletons and the tie-break could never fire — the fix pairs replace
+spans 1:1 positionally. The 5-run variant was conditional on the 3-run
+vote reaching ≥85% agreement or within ~4 points of turbo; it did not,
+so it was not run (and would have cost ~205 min/episode, more than
+turbo).
+
+**Results:** agreement **81.0%** (single base 76.7%, hotwords 79.8%,
+small 83.5%, turbo 89.6%) — a **+4.3 point** gain over one base run.
+Brands 3/4: Manscaped still "manscape" — the systematic mishearing
+survives voting, as predicted. Loops: none by the metric, and the
+"cha" loop is a chunk-window artifact — none of the three offset runs
+has it at all; the voted transcript still has a 9-word "jucka" repeat
+at the same sound effect, missed by the loop metric because the
+punctuation varies. The three runs disagree with each other on ~15% of
+words (pairwise agreement 84.6–85.9%). Vote stats: 6,032 aligned
+positions — 5,260 unanimous, 305 majority-2, 133 ties (2.2%), 334
+singletons dropped (5.5%). Runtime ~123 min per 2h episode (more than
+the naive 3×32 estimate — the offset runs each cost more than the
+control).
+
+**Conclusion: the mechanism works, but it is not a cheaper path to
+turbo-level accuracy.** Turbo beats it on accuracy at similar cost
+(89.6% vs 81.0%, 149 vs 123 min/episode), and base+hotwords beats it
+on cost and brands (79.8%, 4/4 brands, no loops, 38 min/episode). As a
+base-model strategy it does not close the gap to turbo. The technique
+itself is not dead — it could layer onto other models — but it is not
+the switch.
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
