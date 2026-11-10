@@ -718,6 +718,58 @@ the switch.
 
 ---
 
+## 13. Base+hotwords end-to-end check — COMPLETE (2026-11-10)
+
+**Why:** entry 10 showed turbo's better words do not buy better edges,
+and entry 8 showed sponsor-name hints (hotwords) fix base's two worst
+defects cheaply — brands spelled right, the "cha" loop killed — at
+~38 min/episode. This check asked whether base+hotwords keeps base's
+edges while keeping those fixes, making it the better switch.
+
+**Method:** same harness as entry 10
+(`transcribe_bench/end_to_end/run_e2e.py`, results extended in
+`end_to_end/results.json`). Full Unsubscribe 286 transcribed with base
++ sponsor hotwords (21,596 words), then the pipeline's own
+`detect_ad_blocks`, unmodified, run on that transcript with every
+other input identical to the base/turbo comparison. Scored edge by
+edge against the owner's 286 ground truth (9 ads, 18 edges). The
+hotwords list is the episode's description sponsors. Brand/loop claims
+verified separately by `end_to_end/check_hotwords_full.py`.
+
+**Results (base vs hotwords vs turbo):**
+
+- Recall: 9/9 all three. False blocks: 0 all three.
+- Edges within 1s: 3/18 (16.7%) all three. Within 2s: 8/18 (44.4%)
+  base, 7/18 (38.9%) hotwords, 6/18 (33.3%) turbo.
+- Median edge error: 2.8s base, 2.8s hotwords, 4.5s turbo. Mean:
+  4.7s base, 5.0s hotwords, 6.2s turbo.
+- Worst edge: 15.9s (NOBL start) base and hotwords, 19.2s (Perfect
+  Jean start, −19.2) turbo.
+- Coverage: 606.8/673s base, 600.7/673s hotwords, 620.3/673s turbo.
+  Over-mark: 17.8s base, 17.7s hotwords, 58.9s turbo.
+- Edge by edge, hotwords vs base: 4 better, 3 worse, 11 unchanged.
+  Best move: Ozempic start +4.3s → +1.4s. Worst move: NOBL end
+  −1.9s → −12.0s — turbo makes exactly the same move, so both hear
+  something at the NOBL close that base does not.
+- Transcription fixes hold on the full episode: Manscaped spelled
+  right 7/7 in the ad window (base: "manscape" 7/7), all 9 brands
+  present and correct in their ad windows, "cha" count 0 (base: 222).
+  Longest same-word run in hotwords: "blah" ×7.
+- Runtime: ~38 min per 2h episode (base ~32, turbo ~149).
+
+**Conclusion: base+hotwords is the recommended switch.** Unlike
+turbo, which gives worse edges at about five times the cost, hotwords
+costs almost nothing and fixes real defects — brands spelled right, no
+"cha" loop — while the edges stay where they are (median identical,
+mean +0.3s, driven by the single NOBL-end move). Caveats: one episode,
+9 ads, 18 edges — a small sample — and the NOBL-end move bears
+watching on a second episode. **The switch itself is the owner's call;
+no pipeline change made.** Suggested next step if approved: confirm
+the NOBL end on a second, calmer episode (Security Now) before
+treating the switch as settled.
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
