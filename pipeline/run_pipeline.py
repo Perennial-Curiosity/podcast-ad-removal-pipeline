@@ -828,6 +828,7 @@ def _first_opening_cue_after(words, nw, silences, t0, t1):
 
 def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
                      own_domains=None):
+    # words: list of (start, end, word) from Whisper (may contain duplicates).
     """Locate ad-read blocks via multi-method heat map (2026-10-09).
 
     Each detection method runs independently on the unedited episode,
