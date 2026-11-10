@@ -1,0 +1,53 @@
+--- a/pipeline/run_pipeline.py
++++ b/pipeline/run_pipeline.py
+@@ -51,11 +51,50 @@
+ MIN_AD_LEN = 45
+ # Heat-map blocks need only 2+ agreeing votes, so they may be shorter
+ # than single-method blocks: dynamic spots run 30-31s (Unsubscribe 286,
+-# 2026-10-26). Single-method blocks keep the 45s floor.
++# 2026-10-26). Single-method blocks keep the 45s floor by default;
++# chapter/brand/cta may go lower (see SINGLE_METHOD_MIN).
+ HEATMAP_MIN_AD_LEN = 30
+ MAX_AD_LEN = 12 * 60
++# Per-method single-method minimum durations (seconds). Cluster stays
++# conservative because pause-snapping can inflate it; chapter is
++# publisher-authoritative; brand/cta match the heat-map floor so
++# short dynamic spots can mark alone when high-precision.
++SINGLE_METHOD_MIN = {
++    "chapter": 20,
++    "brand": 30,
++    "cta": 30,
++    "cluster": 45,
++}
+ # Chunk size for transcription (seconds) — keeps each job short
+ TRANSCRIBE_CHUNK = 180
++
++# Method reliability weights for the heat-map score (2026-11-09).
++# Promotion threshold is HEATMAP_SCORE_THRESHOLD; a region promotes when
++# the sum of distinct-method weights covering a second reaches it.
++# Calibrated so brand+anything weak still promotes, pure low-confidence
++# pairs (reverb+cluster-popular, duplicate+brand-orphan) do not, and a
++# lone url still needs corroboration.
++METHOD_WEIGHTS = {
++    "chapter": 1.00,
++    "brand": 0.95,
++    "cta": 0.90,
++    "cluster": 0.75,
++    "url": 0.70,          # bare spoken domain (tier A)
++    "url-strong": 0.85,   # domain + nearby brand/CTA/promo (tier B)
++    "duplicate": 0.40,
++    "brand-orphan": 0.35,
++    "reverb": 0.30,
++    "cluster-popular": 0.25,
++    "voice": 0.20,
++}
++HEATMAP_SCORE_THRESHOLD = 1.15
++
++# Short / common-word variants that historically produced false hits.
++# danger >= 2 requires exact match or (fuzzy >= 0.92 + corroboration).
++DANGEROUS_VARIANTS = {
++    "seed", "aura", "mint", "mitt", "ridge", "factor", "code",
++    "need", "guard", "shield", "one", "material", "security",
++}
+ 
+ # Popular podcast sponsors not in the episode description.
