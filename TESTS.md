@@ -898,6 +898,99 @@ never creating segments or flipping the orphan path.
 
 ---
 
+## 15. Per-word heat-map — DISCARDED, borderline/mixed (2026-11-10)
+
+**Why:** the owner asked 2026-11-09 whether per-word resolution
+would beat the per-second heat map. The prior assessment was probably
+not — the heat map decides *whether* an ad is here while final edges
+already come from word timestamps via refinement, and per-word
+counting risks fragmenting blocks on Whisper word-timestamp jitter.
+This test settled it empirically. The genuinely new capability a
+per-word map could enable — word-level vote counts to score
+per-boundary confidence (the boundary-scorer idea) — was evaluated as
+a secondary analysis.
+
+**Method:** word-level vote bins instead of per-second bins in
+`detect_ad_blocks`: a method segment covers a word iff the word's
+start falls inside the segment (inclusive — the analog of the
+per-second loop's inclusive second range); runs of voting words (≥2
+votes) break where the gap between consecutive voting words exceeds
+20s (the existing gap-merge threshold); block start = first voting
+word's start, end = last voting word's end. Floors unchanged in
+seconds (30s heat-map, 45s single-method). Edge refinement untouched
+— one change at a time. Orphan-flip check passed at design time: the
+variant changes binning only, adds no mentions through
+`find_mentions`. Baseline reproduced exactly first
+(`combined_repro8`, all deltas 0.0 vs `brand_orphan`). Smoke test on
+SN 1102: same 6 blocks; only the 'shell' edges moved 0.6s/0.3s.
+Harness: `sb_eval/ab_detect.py` + `ab_score.py`; frozen results in
+`sb_eval/ab/perword/results.json` (per-episode `word_votes.json`
+saved for all 25 episodes); analysis in
+`sb_eval/ab/analyze_perword.py`.
+
+**Results vs baseline (recall 0.673, median 4.7s, mean 12.0s, within
+1s 26.4%, within 2s 37.5%, within 5s 52.1%, FP 36, missed 35, 144
+edges):**
+
+- Per-word: recall 0.664 (71/107), median 4.0s, mean 11.9s, within
+  1s 27.5% (39/142), within 2s 38.7% (55/142), within 5s 53.5%, FP
+  36, missed 36, max 79.3s (flat).
+- Per-show: 99pi within-1s 83.3% → 100%; Huberman recall flat,
+  within-1s 57.1% → 54.8%; Vergecast recall 0.5 → 0.417 (one label
+  lost), median 6.1 → 2.5s (composition — see below).
+- **Fragmentation did not happen:** heat-map blocks 107 → 108 (99pi
+  2→3, Huberman true-happiness 5→4, Vergecast cloud-gaming 1→2);
+  final blocks 108 → 107. The feared word-jitter splitting never
+  materialized.
+- **Per-edge deltas (labels matched in both runs): 4 better / 4
+  worse / 134 unchanged of 142 — net edge movement zero.** The two
+  genuine improvements are both start edges fixed to 0.0s (99pi
+  6.8→0.0; Vergecast cloud-gaming 2.7→0.0).
+
+**Why discard despite the headlines passing the letter of the rule:**
+the rule's letter passes (median improves, within-1s improves,
+recall down 0.009 ≤ 0.02, FP flat), but the gains are not real
+binning gains, so this is the rule's borderline/mixed case — do not
+include. The median "improvement" (4.7→4.0s) is a composition
+artifact: the lost label's two edges (|err| 18.0s and 20.1s in the
+baseline) left the set, mechanically lowering the median. Within-1s
+count 38→39 = +2 real fixes −1 lost-label edge. The lost label
+(Vergecast, 2218–2264s, Booking) shrank to a 3.9s remnant: the
+word-binned block was 2200.2–2260s vs per-second 2200–2261s, but
+refinement pulled the per-word start 2200→2240 while the baseline
+start stayed 2200. Mechanism: `find_mentions` fuzzily matches
+'looking' ~ 'booking' at exactly 2200.00s; the integer-second block
+start included that mention, pinning the earliest in-block mention to
+2200.00 and blocking refinement; the word-binned start (2200.2s)
+excluded it, so the earliest in-block mention became the real
+'booking' at 2240.22s and a method segment starting at 2240s became
+the refined edge. A 0.2s start difference swung the edge 40s.
+**Refinement, not binning, sets the edges** — exactly as the
+2026-11-09 assessment predicted. More data would NOT resolve this:
+the effect is systematic (134/142 edges identical; refinement
+dominates final edges) and the loss mechanism is structural, not
+noise. The per-word map as a block-formation mechanism is closed.
+
+**Secondary finding — boundary confidence (the real lead from this
+test):** word-level vote profiles **do** score edge quality.
+Sharpness = mean votes of 3 words just inside the edge minus mean
+votes of 3 words just outside (n=138 matched edges, Spearman rho =
+−0.360): flat (<0.5): n=57, median |err| **13.5s**, mean 18.0s,
+within-1s 9/57; medium (0.5–2): n=59, median |err| 2.4s, mean 8.6s,
+within-1s 22/59; sharp (≥2): n=22, median |err| 2.7s, mean 6.6s,
+within-1s 4/22. Sharp vs medium is indistinguishable, but flat vs
+non-flat is a large split. A per-edge confidence score (flag or repair
+flat edges) is feasible — a boundary-scorer input, not a
+block-formation change. Not built; it needs the owner's direction.
+
+**Conclusion: DISCARD.** Variant code removed entirely from
+`run_pipeline.py` and `ab_detect.py` (zero `word_heatmap` references;
+both compile). Post-removal verification: full forced re-run of
+`combined_repro8` reproduces `brand_orphan` exactly (all deltas 0.0).
+Pipeline back to its exact pre-test state.
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
