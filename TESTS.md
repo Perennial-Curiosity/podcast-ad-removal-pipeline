@@ -526,15 +526,59 @@ it; it never downloads on its own.
 
 ---
 
-## 10. End-to-end transcription check — IN PROGRESS (2026-11-10)
+## 10. End-to-end transcription check — COMPLETE (2026-11-10)
 
-Run the pipeline's own ad detection on the turbo full transcript vs
-the base full transcript of Unsubscribe 286, and score the ad edges
-against the owner's 286 ground truth — the check that a better
-transcript actually buys better 1-second edges. Step 1 (the
-turbo+hotwords combo slice test) is done: 83.85% vs 89.57% for turbo
-alone — the combo is worse, see entry 8. Step 2 (the detection
-comparison) is in progress. Results to be added here when it lands.
+**Why:** the transcription benchmark (entry 8) proved turbo's words are
+better (89.6% agreement vs 76.7% for base). This check asked whether
+better words buy better 1-second ad edges — the thing the switch was
+proposed to serve.
+
+**Method:** the pipeline's own `detect_ad_blocks`, unmodified, run on
+the base full transcript (22,405 words) and the full turbo transcript
+(22,617 words) of Unsubscribe 286, with every other input identical
+(sponsors, own domains, silences, chapters, same mp3). Scored
+edge-by-edge against the owner's 286 ground truth (9 ads, 18 edges):
+recall, signed per-edge error, % within 1s/2s, median/mean/worst error,
+false blocks, over-mark, coverage. Harness:
+`transcribe_bench/end_to_end/run_e2e.py`, results in
+`end_to_end/results.json`. Detection is deterministic — a fixed re-run
+reproduced both block lists exactly.
+
+**Results (base vs turbo):**
+
+- Recall: 9/9 both. False blocks: 0 both.
+- Edges within 1s: 3/18 (16.7%) both. Within 2s: 8/18 (44.4%) base,
+  6/18 (33.3%) turbo.
+- Median edge error: 2.8s base, 4.5s turbo. Mean: 4.7s base, 6.2s turbo.
+- Worst edge: 15.9s (NOBL start) base, 19.2s (Perfect Jean start, −19.2)
+  turbo.
+- Coverage: 606.8/673s base, 620.3/673s turbo. Over-mark: 17.8s base,
+  58.9s turbo.
+- Edge by edge: 5 better, 5 worse, 8 unchanged — the worsenings are
+  much larger than the improvements. Biggest moves: Perfect Jean start
+  +11.0s → −19.2s, Got Junk end +0.7s → +9.5s, NOBL end −1.9s → −12.0s,
+  Ghostbed end −3.3s → +5.3s. Best improvement: Ozempic end −2.6s →
+  +0.9s. Manscaped and Leaf Filter edges identical in both runs.
+
+**Why (verified by method-level diagnosis):** edges are set by
+method-segment boundaries and closing-sentence trims, not by overall
+word accuracy. A cleaner transcript surfaces *more* true brand evidence
+— including outside the ad. Turbo hears "Perfect Jean" 19 times
+starting 34s before the ad (the host mentions the jeans in the lead-in
+story), so a brand-orphan segment fires there and the block starts
+19.2s early; base never heard those mentions. Turbo also hears the full
+Got Junk ".com" read, extending the URL evidence 9.5s past the true end.
+
+**Conclusion: DO NOT SWITCH to turbo on edge grounds.** The better
+transcript does not buy better edges on this episode, while costing
+~2.5h per episode instead of ~32 minutes. Turbo's real advantages (all
+9 brands spelled correctly, no "cha" loop, cleaner words overall) are
+genuine but non-edge benefits; whether they justify the runtime is the
+owner's call. Caveat: one episode, 9 ads, 18 edges — a small sample,
+but the direction (no gain, some harm) is clear. Next candidate: the
+cheap fallback — base + hotwords (~38 min/episode) tested end-to-end
+the same way; it fixes the exact defects that motivated the switch
+(Manscaped mangling, "cha" loop).
 
 ---
 
