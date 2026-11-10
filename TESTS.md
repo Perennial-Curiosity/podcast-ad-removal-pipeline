@@ -582,6 +582,45 @@ the same way; it fixes the exact defects that motivated the switch
 
 ---
 
+## 11. Parakeet TDT 0.6B v3 transcription test — COMPLETE (2026-11-10)
+
+**Why:** suggested by an outside model (Grok) as a candidate for higher
+accuracy transcription. Parakeet is a NeMo model, not a Whisper model.
+
+**Method:** same 30-minute slice of Unsubscribe 286 (800–2600s) and same
+scoring as the benchmark (entry 8): word agreement vs the large-v3
+reference, sponsor-name accuracy, hallucination loops, runtime. v3 runs
+transformers-native on CPU (torch 2.15.0+cpu, no NeMo install needed);
+model loads in 23s. Two setup fixes along the way: the Parakeet feature
+extractor needs `librosa` (absent from the environment, installed), and
+the driver's word-splitting assumed SentencePiece markers while v3's
+tokenizer is BPE-style (a leading space marks a word start) — the first
+smoke run had merged a whole 30s clip into one word. Word timestamps
+work natively via the TDT duration head (verified per-word spans). v2
+not tested: it is the older model, would need the heavy NeMo install,
+and v3 already trails turbo by 8.1 points, so it could not change the
+verdict.
+
+**Results:** agreement **81.5%** (base 76.7%, hotwords 79.8%, small
+83.5%, turbo 89.6%). Brands scored 4/4 by the flat scorer, but a
+token-level check shows that overstates it: Manscaped comes out
+"Manscape" (no d) in 4 of 5 standalone mentions — the same defect as
+base; turbo spells it correctly 7/7. Ghostbed mostly right with one
+"ghostbad.com" slip; Got Junk and Ozempic clean. Loops: none — the chug
+sound effect comes out as short "chicka" bursts, never a run, vs base's
+"cha" ×222. Runtime ~109 min per 2h episode (faster than turbo's 149,
+slower than small's 76 and base+hotwords' 38).
+
+**Conclusion: NOT worth pursuing.** It loses to turbo on accuracy and
+brand spelling, and it is slower than base+hotwords (109 vs 38
+min/episode) for only +1.7 points over hotwords — while hotwords fixes
+Manscaped and Parakeet does not. And since the end-to-end check (entry
+10) showed even turbo's better words do not buy better edges,
+Parakeet's weaker words have no edge case either. Not a switch
+candidate, not a useful complement.
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
