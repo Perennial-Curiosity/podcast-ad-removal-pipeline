@@ -245,6 +245,23 @@ Notes:
   extended. Validated alone on the same 25 episodes: recall 0.673
   flat, median edge error 4.9 → 4.7s, within 1s 25.7 → 26.4%,
   false blocks 36 flat; 3 edges fixed, 0 harmed.
+- **Boundary-confidence score (2026-11-10):** every detected block
+  now carries a per-edge sharpness value (`start_sharpness`,
+  `end_sharpness` in the report/state and in detection output):
+  mean votes of the 3 words just inside the edge minus mean votes
+  of the 3 words just outside, computed from per-word vote counts
+  over the method segments. Flat edges (< 0.5) are likely bad —
+  median error 14.3s vs 2.7s for sharper edges, and flat flags
+  identify edges with error over 5s at precision 0.67 / recall
+  0.58 on the 25-episode set — so the score is kept as a flag for
+  review and as an input to the future boundary scorer. It never
+  moves an edge: a repair rule built on it (flat edges move to the
+  nearest direction-appropriate vote step forward in time) was
+  tested alone and discarded — recall 0.673 → 0.701 and false
+  blocks 36 → 33, but within-1s edges 38 → 35, because the vote
+  steps sit 1–7s past the true end and the true edge is itself
+  usually flat in the profile (median sharpness 0.00), so the
+  steps do not locate the truth. Full numbers in `TESTS.md`.
 
 ## Standing rules (do not break these)
 
