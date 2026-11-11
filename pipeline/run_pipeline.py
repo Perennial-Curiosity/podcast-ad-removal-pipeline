@@ -51,11 +51,50 @@ CONFIG_PATH = os.path.join(BASE_DIR, "podcasts.yaml")
 MIN_AD_LEN = 45
 # Heat-map blocks need only 2+ agreeing votes, so they may be shorter
 # than single-method blocks: dynamic spots run 30-31s (Unsubscribe 286,
-# 2026-10-26). Single-method blocks keep the 45s floor.
+# 2026-10-26). Single-method blocks keep the 45s floor by default;
+# chapter/brand/cta may go lower (see SINGLE_METHOD_MIN).
 HEATMAP_MIN_AD_LEN = 30
 MAX_AD_LEN = 12 * 60
+# Per-method single-method minimum durations (seconds). Cluster stays
+# conservative because pause-snapping can inflate it; chapter is
+# publisher-authoritative; brand/cta match the heat-map floor so
+# short dynamic spots can mark alone when high-precision.
+SINGLE_METHOD_MIN = {
+    "chapter": 20,
+    "brand": 30,
+    "cta": 30,
+    "cluster": 45,
+}
 # Chunk size for transcription (seconds) — keeps each job short
 TRANSCRIBE_CHUNK = 180
+
+# Method reliability weights for the heat-map score (2026-11-09).
+# Promotion threshold is HEATMAP_SCORE_THRESHOLD; a region promotes when
+# the sum of distinct-method weights covering a second reaches it.
+# Calibrated so brand+anything weak still promotes, pure low-confidence
+# pairs (reverb+cluster-popular, duplicate+brand-orphan) do not, and a
+# lone url still needs corroboration.
+METHOD_WEIGHTS = {
+    "chapter": 1.00,
+    "brand": 0.95,
+    "cta": 0.90,
+    "cluster": 0.75,
+    "url": 0.70,          # bare spoken domain (tier A)
+    "url-strong": 0.85,   # domain + nearby brand/CTA/promo (tier B)
+    "duplicate": 0.40,
+    "brand-orphan": 0.35,
+    "reverb": 0.30,
+    "cluster-popular": 0.25,
+    "voice": 0.20,
+}
+HEATMAP_SCORE_THRESHOLD = 1.15
+
+# Short / common-word variants that historically produced false hits.
+# danger >= 2 requires exact match or (fuzzy >= 0.92 + corroboration).
+DANGEROUS_VARIANTS = {
+    "seed", "aura", "mint", "mitt", "ridge", "factor", "code",
+    "need", "guard", "shield", "one", "material", "security",
+}
 
 # Popular podcast sponsors not in the episode description.
 # Used ONLY by the cluster finder (4+ mentions in 1 min) as a safety net
@@ -603,26 +642,63 @@ def _prefix_guard_ok(v, w):
     return suf in ("s", "es", "'s", "")
 
 
-def find_mentions(nw, variants):
+def _variant_danger(v):
+    """Return danger score for a brand variant (higher = more collision-prone).
+
+    3: curated high-risk short/common tokens (seed, aura, mint, ...).
+    2: length <= 4.
+    1: length <= 6.
+    0: otherwise (normal fuzzy path).
+    """
+    v = v.lower().strip()
+    if v in DANGEROUS_VARIANTS:
+        return 3
+    if len(v) <= 4:
+        return 2
+    if len(v) <= 6:
+        return 1
+    return 0
+
+
+def find_mentions(nw, variants, soft=False):
     """Word indices mentioning a brand.
 
     Handles 'bit warden' -> 'bitwarden' (split words) and whisper
     mis-transcriptions like 'threadlocker' -> 'threatlocker' (fuzzy).
+
+    soft=False (default): only hard hits suitable for brand/cluster
+    promotion. Dangerous short variants require exact match (or very
+    high fuzzy + will be further gated by callers that demand
+    corroboration). soft=True: also returns soft hits from dangerous
+    variants that may only vote via brand-orphan / cluster-popular.
     """
     from difflib import SequenceMatcher
-    hits = []
+    hard, soft_hits = [], []
     L = len(nw)
     for v in variants:
+        v = v.lower().strip()
+        if not v:
+            continue
         toks = v.split()
+        danger = _variant_danger(v)
         if len(toks) == 1 and len(v) >= 6:
             for i in range(L):
                 w = nw[i]
                 if w == v or w in (v + "s", v + "es", v + "'s"):
-                    hits.append(i)
-                elif SequenceMatcher(None, v, w).ratio() >= 0.85:
-                    if not _prefix_guard_ok(v, w):
-                        continue
-                    hits.append(i)
+                    hard.append(i)
+                else:
+                    ratio = SequenceMatcher(None, v, w).ratio()
+                    if danger >= 2:
+                        # High-danger: exact only for hard; fuzzy >= 0.92
+                        # becomes a soft hit (needs corroboration upstream).
+                        if ratio >= 0.92 and _prefix_guard_ok(v, w):
+                            soft_hits.append(i)
+                    elif danger == 1:
+                        if ratio >= 0.92 and _prefix_guard_ok(v, w):
+                            hard.append(i)
+                    else:
+                        if ratio >= 0.85 and _prefix_guard_ok(v, w):
+                            hard.append(i)
             for i in range(L - 1):
                 # Split compounds ('bit' + 'warden' -> 'bitwarden'):
                 # only when the variant genuinely SPANS the boundary.
@@ -632,21 +708,31 @@ def find_mentions(nw, variants):
                 # block came from exactly that leak.
                 if v in (nw[i] + nw[i + 1]) and \
                         v not in nw[i] and v not in nw[i + 1]:
-                    hits.append(i)
+                    hard.append(i)
             continue
         if len(toks) == 1:
-            # Short single-token variant: substring match.
-            v = toks[0]
+            # Short single-token variant.
             for i in range(L):
                 w = nw[i]
-                if v in w:
-                    hits.append(i)
+                if w == v or w in (v + "s", v + "es", v + "'s"):
+                    hard.append(i)
+                elif danger >= 2:
+                    # Substring match on high-danger short tokens is soft
+                    # only — 'seed' inside 'seedling' / content words must
+                    # not promote a brand block alone.
+                    if v in w:
+                        soft_hits.append(i)
+                else:
+                    if v in w:
+                        hard.append(i)
             continue
         n = len(toks)
         for i in range(L - n + 1):
             if all(toks[j] in nw[i + j] for j in range(n)):
-                hits.append(i)
-    return sorted(set(hits))
+                hard.append(i)
+    if soft:
+        return sorted(set(hard + soft_hits))
+    return sorted(set(hard))
 
 
 def find_produced_spot(words, nw, hits, silences):
@@ -828,12 +914,15 @@ def _first_opening_cue_after(words, nw, silences, t0, t1):
 
 def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
                      own_domains=None):
-    """Locate ad-read blocks via multi-method heat map (2026-10-09).
+    """Locate ad-read blocks via multi-method weighted heat map.
 
     Each detection method runs independently on the unedited episode,
-    then results are cross-checked via a per-second vote heat map.
-    Segments with 2+ method votes are high-confidence ads.
-    Single-method hits are kept only if that method is high-precision.
+    then results are cross-checked via a per-second *weighted* heat map
+    (2026-11-09). Each method contributes METHOD_WEIGHTS[method] once per
+    second it covers. Regions whose score reaches HEATMAP_SCORE_THRESHOLD
+    (1.15) are high-confidence ads. Single-method hits are kept only if
+    that method is high-precision, with per-method minimum durations
+    (SINGLE_METHOD_MIN).
 
     SB-eval improvements (2026-11-07, validated on 25 SponsorBlock-
     anchored episodes): (1) same-label merge — a single-method segment
@@ -905,7 +994,9 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     # Run each method independently, collecting (start, end, label, method)
     candidates = []
     candidates.extend([(s, e, l, 'cta') for s, e, l in _method_cta(words, sponsors, silences, own_domains)])
-    candidates.extend([(s, e, l, 'url') for s, e, l in _method_url(words, silences, own_domains)])
+    for _u in _method_url(words, silences, own_domains, sponsors=sponsors):
+        # _method_url returns (start, end, label, method_tag)
+        candidates.append((_u[0], _u[1], _u[2], _u[3]))
     candidates.extend([(s, e, l, 'brand') for s, e, l in _method_brand(words, sponsors, silences)])
     candidates.extend([(s, e, l, 'brand-orphan') for s, e, l in _method_brand_orphan(words, sponsors, silences)])
     candidates.extend([(s, e, l, 'cluster') for s, e, l in _method_cluster(words, sponsors, silences)])
@@ -972,35 +1063,45 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
                 return l
         return labels[0] if labels else 'ad'
 
-    # Build heat map: per-second vote counts
+    # Build heat map: per-second weighted scores (2026-11-09).
+    # Each method contributes its METHOD_WEIGHTS value once per second it
+    # covers. A region promotes when the score reaches HEATMAP_SCORE_THRESHOLD
+    # (1.15). This replaces the old integer "2+ votes" rule so that
+    # high-precision methods need only weak corroboration while pure
+    # low-confidence pairs stay below the line.
     duration = int(words[-1][0]) + 1
-    votes = [0] * duration
+    scores = [0.0] * duration
     vote_detail = [[] for _ in range(duration)]  # which methods voted
     for s, e, label, method in candidates:
+        w = METHOD_WEIGHTS.get(method, 0.25)
         for sec in range(int(s), min(int(e) + 1, duration)):
-            votes[sec] += 1
+            # Cap contribution of a method to once per second even if
+            # multiple segments of the same method overlap.
+            if not any(m == method for m, _ in vote_detail[sec]):
+                scores[sec] += w
             vote_detail[sec].append((method, label))
 
-    # High-confidence: 2+ methods agree. Merge contiguous.
+    # High-confidence: weighted score >= threshold. Merge contiguous.
     blocks = []
     in_block = False
     bs = 0
     block_methods = set()
     for sec in range(duration):
-        if votes[sec] >= 2 and not in_block:
+        if scores[sec] >= HEATMAP_SCORE_THRESHOLD and not in_block:
             in_block = True
             bs = sec
             block_methods = set(m for m, _ in vote_detail[sec])
-        elif votes[sec] >= 2 and in_block:
+        elif scores[sec] >= HEATMAP_SCORE_THRESHOLD and in_block:
             block_methods.update(m for m, _ in vote_detail[sec])
-        elif votes[sec] < 2 and in_block:
+        elif scores[sec] < HEATMAP_SCORE_THRESHOLD and in_block:
             in_block = False
             be = sec
             dur = be - bs
             if HEATMAP_MIN_AD_LEN <= dur <= MAX_AD_LEN:
                 entries = sum([vote_detail[s] for s in range(bs, be)], [])
                 blocks.append((bs, be, f"{'/'.join(sorted(block_methods))}:{_pick_label(entries, bs, be)}"))
-                log(f"  heatmap {bs:.0f}s-{be:.0f}s ({dur:.0f}s) votes={sorted(block_methods)}")
+                log(f"  heatmap {bs:.0f}s-{be:.0f}s ({dur:.0f}s) methods={sorted(block_methods)} "
+                    f"peak={max(scores[bs:be]):.2f}")
     if in_block:
         be = duration
         dur = be - bs
@@ -1066,13 +1167,11 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     # to mark. Removing it cut false blocks 67 -> 45 on the 25-episode
     # SB eval at a cost of 1 matched label.
     _single_methods = ('cta', 'cluster', 'brand', 'chapter')
-    # Indices of blocks whose start the same-label merge moved (2026-11-09,
-    # brand-orphan test): the orphan pass below must not double-extend them.
-    _merge_extended = set()
     for s, e, label, method in candidates:
         if method in _single_methods:
             dur = e - s
-            if not (MIN_AD_LEN <= dur <= MAX_AD_LEN):
+            min_len = SINGLE_METHOD_MIN.get(method, MIN_AD_LEN)
+            if not (min_len <= dur <= MAX_AD_LEN):
                 continue
             # Single-method cluster blocks need a spoken URL for that
             # sponsor nearby (2026-10-28): dense mentions alone can be
@@ -1157,7 +1256,6 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
                     log(f"  extend '{label}': {_bs:.0f}s-{_be:.0f}s -> "
                         f"{_ns:.0f}s-{_be:.0f}s (overlap {method})")
                     blocks[_bi] = (_ns, _be, _bl)
-                    _merge_extended.add(_bi)
                 _merged = True
                 break
             if _merged:
@@ -1170,78 +1268,6 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
                 continue
             blocks.append((s, e, label))
             log(f"  single-method '{label}': {method} {s:.1f}s-{e:.1f}s ({dur:.0f}s)")
-
-    # Brand-orphan merge (2026-11-09, SB-eval improvement 6, validated
-    # on 25 SponsorBlock-anchored episodes):
-    # a brand-orphan segment — a sponsor mention _expand_segment could
-    # not turn into a block — is the only evidence for reads that name
-    # their sponsor once, so no single-method segment overlaps the
-    # heat-map block with an earlier start and the imp2 merge never
-    # fires; the block stays tail-only. Extend such a block to the
-    # orphan segment's bounds (already silence-snapped at +-45s around
-    # the mention span), same sponsor only, with the same cue guard as
-    # the imp2 merge on the start side and a return-to-content cue /
-    # different-sponsor guard on the end side. The mention-span cap
-    # below still bounds both extensions to mention span +-30s, exactly
-    # as it bounds imp2. A block the imp2 merge already extended is
-    # never extended again. An unbounded silence-based extension was
-    # tested and rejected 2026-11-07 (Eight Sleep would extend 73s
-    # backward into the preceding Joovv read), so the extension target
-    # here is always the same-sponsor orphan segment, never a raw
-    # silence gap.
-    for s, e, label, method in candidates:
-        if method != 'brand-orphan':
-            continue
-        _part = label.split(':')[-1].strip().lower().replace(' ', '')
-        for _bi, (_bs, _be, _bl) in enumerate(blocks):
-            if _bl.split(':')[-1].strip().lower().replace(' ', '') != _part:
-                continue
-            if _bi in _merge_extended:
-                continue
-            if not (s < _be and e > _bs):
-                continue
-            _ns, _ne = _bs, _be
-            if s < _bs:
-                _ns = s
-                _cue = _first_opening_cue_after(words, _nw_heat,
-                                                silences, s, _bs)
-                if _cue is not None:
-                    _ns = max(s, _cue)
-                # Never extend into a preceding block.
-                for (_bs2, _be2, _bl2) in blocks:
-                    if _be2 <= _bs and _be2 > _ns:
-                        _ns = max(_ns, _be2)
-            if e > _be:
-                _ne = e
-                # Return-to-content cue: extend only to the first
-                # RETURN_CUES phrase spoken after the block end.
-                for _i in range(len(_nw_heat)):
-                    if not (_be < words[_i][0] < e):
-                        continue
-                    _win = " ".join(_nw_heat[_i:_i + 4])
-                    if any(_c in _win for _c in RETURN_CUES):
-                        _ne = min(_ne, words[_i][0])
-                        break
-                # Different-sponsor guard (imp3 fallback rule): if
-                # another sponsor is mentioned between the block end
-                # and the target end, the end is a different ad —
-                # do not extend at all.
-                for _sp2 in sponsors:
-                    if _sp2['label'].lower().replace(' ', '') == _part:
-                        continue
-                    _hits2 = find_mentions(_nw_heat, _sp2['variants'])
-                    if any(_be < words[_h][0] < _ne for _h in _hits2):
-                        _ne = _be
-                        break
-                # Never extend into a following block.
-                for (_bs2, _be2, _bl2) in blocks:
-                    if _bs2 > _be and _bs2 < _ne:
-                        _ne = _bs2
-            if _ns != _bs or _ne != _be:
-                log(f"  orphan-extend '{label}': {_bs:.0f}s-{_be:.0f}s -> "
-                    f"{_ns:.0f}s-{_ne:.0f}s")
-                blocks[_bi] = (_ns, _ne, _bl)
-            break
 
     # Mention-span cap (2026-10-27): orphan padding (+-45s) and cluster
     # pause-snapping inflate blocks with surrounding content (Unsubscribe
@@ -1329,7 +1355,7 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     # where these get reviewed.
     suspects = []
     for s, e, label, method in candidates:
-        if method not in ('voice', 'cluster-popular', 'brand-orphan', 'reverb', 'url'):
+        if method not in ('voice', 'cluster-popular', 'brand-orphan', 'reverb', 'url', 'url-strong'):
             continue
         dur = e - s
         if not (MIN_AD_LEN <= dur <= MAX_AD_LEN):
@@ -1452,19 +1478,18 @@ def _method_cta(words, sponsors, silences, own_domains=None):
     return results
 
 
-def _method_url(words, silences, own_domains=None):
-    """Method 'url': spoken URLs WITHOUT a CTA phrase (Unsubscribe 287
-    Leaf Filter, 2026-10-28: dynamic spots say 'at leaffilter.com slash
-    gold' with no CTA phrase from cta_phrases, so find_url_mentions
-    never anchors them, and the same gap left 286 Leaf Filter and
-    286 Ozempic with only a reverb vote). A spoken domain is itself
-    strong ad evidence. Low-confidence: heat-map votes only, never
-    marks alone (like 'voice' and 'cluster-popular').
+def _method_url(words, silences, own_domains=None, sponsors=None):
+    """Method 'url' / 'url-strong': spoken URLs WITHOUT a CTA phrase.
 
-    Segment: URL positions for one brand within 60s form one group (a
-    spot repeats its URL twice); the segment runs [first-45s, last+10s]
-    snapped to pauses — ads put the URL at the end, so most of the
-    spot precedes it. Returns [(start, end, label)] independently.
+    Tier A ('url', weight 0.70): bare spoken domain.
+    Tier B ('url-strong', weight 0.85): spoken domain plus nearby
+    description-sponsor stem, promo-code, or toll-free pattern
+    (2026-11-09). Still never marks alone; under the weighted heat map
+    tier B needs only weak corroboration to promote.
+
+    Segment: URL positions for one brand within 60s form one group; the
+    segment runs [first-45s, last+10s] snapped to pauses. Returns
+    [(start, end, label, method_tag)] independently.
     """
     nw = norm_words(words)
     positions = find_bare_urls(nw, own_domains)
@@ -1496,7 +1521,36 @@ def _method_url(words, silences, own_domains=None):
         start = max(0.0, start)
         if not (20 <= end - start <= 180):
             continue
-        results.append((start, end, brand))
+        # Tier B if a description sponsor stem, promo code, or toll-free
+        # appears near the URL group; otherwise Tier A.
+        method_tag = "url"
+        if sponsors:
+            nw_local = nw
+            # description-sponsor stem near the group
+            for sp in sponsors:
+                hits = find_mentions(nw_local, sp.get("variants", []))
+                if any(abs(words[h][0] - g[0][1]) <= 45 or
+                       abs(words[h][0] - g[-1][1]) <= 45 for h in hits):
+                    method_tag = "url-strong"
+                    break
+        if method_tag == "url":
+            # promo-code or toll-free near the group centre
+            mid = (g[0][1] + g[-1][1]) / 2.0
+            for i, w in enumerate(nw):
+                t = words[i][0]
+                if abs(t - mid) > 30:
+                    continue
+                if w == "code" and i + 1 < len(nw):
+                    if (i >= 1 and nw[i - 1] in ("use", "promo")) or \
+                       (i >= 2 and nw[i - 2] == "promo"):
+                        method_tag = "url-strong"
+                        break
+                if w == "1" and i + 1 < len(nw) and \
+                        nw[i + 1].lstrip("-") in (
+                            "800", "888", "877", "866", "855", "844", "833"):
+                    method_tag = "url-strong"
+                    break
+        results.append((start, end, brand, method_tag))
     return results
 
 
@@ -1820,7 +1874,16 @@ def find_duplicate_segments(words, min_shingle=8, min_gap=60, min_dur=15):
             cs, ce = t, t
     clusters.append((cs, ce))
     # Expand each cluster to cover the full repeated phrase (+15s each side
-    # for the ad boundaries) and label
+    # for the ad boundaries) and label. Suppress segments whose lexical
+    # content is too similar to the episode head (repeated intros /
+    # cold-open teases) — 2026-11-09 precision pass.
+    head_end = 90.0
+    head_tokens = set()
+    for i, w in enumerate(nw):
+        if words[i][0] > head_end:
+            break
+        if w:
+            head_tokens.add(w)
     result = []
     for i, (cs, ce) in enumerate(clusters):
         dur = ce - cs
@@ -1829,8 +1892,24 @@ def find_duplicate_segments(words, min_shingle=8, min_gap=60, min_dur=15):
         # Expand by 20s each side to catch full ad
         ds = max(0, cs - 20)
         de = ce + 20
-        if de - ds >= min_dur:
-            result.append((ds, de, f"duplicate-{i+1}"))
+        if de - ds < min_dur:
+            continue
+        # Jaccard vs episode head
+        seg_tokens = set()
+        for j, w in enumerate(nw):
+            t = words[j][0]
+            if t < ds:
+                continue
+            if t > de:
+                break
+            if w:
+                seg_tokens.add(w)
+        if head_tokens and seg_tokens:
+            inter = len(head_tokens & seg_tokens)
+            union = len(head_tokens | seg_tokens)
+            if union and inter / union > 0.55:
+                continue  # intro/outro material
+        result.append((ds, de, f"duplicate-{i+1}"))
     return result
 
 
