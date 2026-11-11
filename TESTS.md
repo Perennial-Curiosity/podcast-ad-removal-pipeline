@@ -1146,6 +1146,100 @@ unchanged).
 
 ---
 
+## 17. Method-weight search — DISCARDED (2026-11-11)
+
+**Why:** PR #2 (Grok) hand-picked weights and failed badly (286
+coverage 606.7→401.9s, SB recall 0.673→0.495) — the failure was in
+the numbers, not the concept. The owner approved learning the
+weights from the labeled data instead. Two methods: coordinate
+descent from the current rule, and a logistic-regression fit as a
+cross-check.
+
+**Design:** threshold fixed at 1.0, weights on the coarse grid {0,
+0.25, 0.5, 0.75, 1.0}. Voice FIXED at 0 (review-only by standing
+rule, never promotes — not a learnable parameter). Floors unchanged
+(30s heat-map, 45s single-method). Methods weighted are the current
+pipeline methods only (chapter, brand, cta, cluster, url,
+duplicate, brand-orphan, reverb, cluster-popular, voice); url-strong
+is a PR invention and was not added. Scalar objective, stated up
+front: matched labels − 0.5 × FP (one matched label is worth two
+false blocks). True baseline: 72 matched, FP 36 → 54.0. Starting
+point (all methods 0.5, voice 0): 71 matched, FP 33 → 54.5 —
+fixing voice at 0 alone loses 1 label and removes 3 FPs. Candidates
+computed once per episode and reused via a temporary `_candidates`
+hook; a full-set evaluation took 2.6s after the first call in a
+process (vs ~20s/episode for full detect), which made the search
+and leave-one-show-out feasible. Baseline reproduced exactly first
+(`combined_repro11`, all deltas 0.0).
+
+**Coordinate descent (full 25-episode set, converged round 3):**
+- R1: reverb 0.5 → 0.0 (matched 71→69, FP 33→27);
+  cluster-popular 0.5 → 0.0 (69→69, FP 27→26)
+- R2: brand-orphan 0.5 → 1.0 (matched 69→71, FP 26→28); R3: no
+  improvement
+- **Finalist:** chapter/brand/cta/cluster/url/duplicate 0.5,
+  brand-orphan 1.0, reverb 0.0, cluster-popular 0.0, voice 0.0
+- **Full-set numbers** (harness `weights_cd`, identical to
+  in-memory): recall 0.664 (71/107), missed 36, FP 28, median
+  4.7s, mean 11.7s, within-1s 26.1% (37/142), within-2s 35.2%
+- **Decision-rule check: FAILS.** Median flat (4.7→4.7s, must
+  improve) and within-1s 38→37 edges (must hold). Recall down
+  0.009 (within 0.02), FP down 8. Per-episode: Acquired FP 5→0
+  (the big win), Sydney Sweeney +1 label, unsub-287 −1, Vergecast
+  creator −1.
+- **Must-promote checks:** orphan+reverb 1.0 ✓ (via orphan
+  alone); cluster+reverb 0.5 ✗; url+reverb 0.5 ✗. Orphan at 1.0
+  means a lone orphan segment now promotes a block at the 30s
+  floor.
+
+**Logistic-regression cross-check — disagrees, and is worse:**
+coefs brand +7.07, orphan +4.01, cluster +3.60, cta +3.28, url
++2.68, duplicate +1.68, reverb +0.49, cluster-popular +0.19,
+chapter **−19.69** (chapter coverage is strongly anti-associated
+with true-ad seconds — publisher chapter segments are long and
+mostly content at the second level). Mapped to grid: chapter 0,
+brand 1.0, cta/cluster/url/orphan 0.5, duplicate 0.25,
+reverb/cluster-popular/voice 0. Block-level: matched 60, FP 19,
+recall 0.561, objective 50.5 — worse than the starting point, and
+it fails all three must-promote checks. The disagreement is
+diagnostic: per-second fitting optimizes the wrong objective for
+block promotion; weak methods that matter at block level look
+useless per-second.
+
+**Leave-one-show-out — the deciding evidence:** search re-run per
+fold on 7 shows, tested on the held-out 8th. **Held-out aggregate:
+matched 69/107, recall 0.645, FP 39 — vs the starting point on the
+same held-out episodes 71/107, recall 0.664, FP 33.** Worse on both
+recall (−2 labels) and FP (+6). Per fold: 99pi / Acquired /
+Security Now / Vergecast unchanged; Huberman −1 label +2 FP; Lex
+same recall +2 FP; Modern Wisdom +1 label +2 FP; Unsubscribe 8/10
+(baseline 10/10), FP flat — the worst fold, on one of the two
+served shows. Fold weights are unstable: cluster 0.0 (Huberman
+fold) vs 1.0 (Lex / Modern Wisdom folds); reverb→0 learned only
+when Acquired is in training. With 107 labels and 9 free weights,
+single-weight moves flip on 1–2 labels.
+
+**Conclusion: DISCARD.** Learning the weights from data does not
+beat the current two-vote rule. The full-set gain was fitted to the
+25 episodes; on unseen shows the learned weights are worse than the
+starting point. Variant code removed entirely from
+`run_pipeline.py` (0 `method_weights` / `_candidates` refs,
+compiles); variant entries removed from `ab_detect.py` (removal
+comment only). Post-removal verification: `combined_repro12`
+reproduces `brand_orphan` exactly (all deltas 0.0). Pipeline back
+to its exact pre-test state. More labeled data could resolve it —
+a doubled dataset would give leave-one-show-out folds more signal
+— but that is the owner's call (dataset doubling is currently not
+approved), and a retry needs more labels first, not a better search
+on these 107. Frozen records: `sb_eval/ab/weights_cd/results.json`
+(harness run; `weights_base` is the starting-point record),
+`sb_eval/ab/search_weights.py` (search driver),
+`sb_eval/ab/weights_search/coordinate_descent.json`,
+`logistic.json`, `loso.json`; baseline repros
+`sb_eval/ab/combined_repro11/` and `combined_repro12/`.
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
