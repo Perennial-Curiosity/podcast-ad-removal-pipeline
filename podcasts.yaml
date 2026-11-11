@@ -1,6 +1,13 @@
 # Podcast ad-removal pipeline configuration.
 # Each podcast gets an id; the pipeline runs with --podcast <id>.
 # Add new podcasts here — no code changes needed.
+#
+# Optional per-podcast key (dynamic slots, 2026-11-11):
+#   dynamic_ads: true|false
+# When set, it overrides the probe: true runs the second-download slot
+# flow on every episode, false skips it. When absent (the default), the
+# pipeline probes once per podcast (a second download, byte-compared)
+# and remembers the result for 30 days.
 
 github_owner: Perennial-Curiosity
 github_repo: Clean-Podcasts
