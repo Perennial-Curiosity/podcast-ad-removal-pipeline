@@ -26,6 +26,8 @@ That precision is the goal. Finding the ad is only step one.
 
    Two or more methods agreeing is high confidence. Some strong single methods also count.
 
+   On feeds that serve different ads per download, a second pass downloads the episode again and compares the two transcripts: the regions that differ are inserted ads. A differing region is only marked when ad evidence backs it. Where a slot overlaps a detected block, the slot's edges replace the detector's edges.
+
 4. **Refine the edges** — Move each start and end inward to the nearest real evidence: the first and last brand mention, call to action, or URL inside the block. Starts stay where the opening cue is — cues come before brand names. Each edge also gets a confidence score (see edge sharpness below).
 
 5. **Name the sponsor** — Attach the company or product the ad is for.
@@ -56,8 +58,8 @@ That precision is the goal. Finding the ad is only step one.
 ## Current status
 
 - Automatic marking is **paused**. The owner is marking new episodes by hand.
-- Best proven edge method, not yet integrated: download an episode twice and compare the two transcripts. Where they differ is an inserted ad. Mean edge error 0.43 seconds; 13 of 14 edges within 1 second. It cannot find host-read ads — those are identical in both downloads — so it would add to the detector, not replace it.
-- Transcription model: still the fast base model. A larger model transcribes more accurately but does not improve edges, so no switch has been approved.
+- Dynamic-slot comparison integrated 2026-11-11: on feeds that serve different ads per download, a second download is transcribed and compared with the first; differing regions are inserted ads, marked only when ad evidence backs them. On the owner's two marked episodes it raised coverage at the strict scorer from 7/9 to 9/9 ads (episode 286) and 6/8 to 7/8 (episode 287), with dynamic-ad edges averaging 0.42 seconds of error. One open item: a false slot inside a real ad on 286 passes the gate — the owner decides whether to accept it or tighten the gate.
+- Transcription model: still the fast base model. A larger model transcribes more accurately but does not improve edges; a hotwords switch was approved, then abandoned after three failed verifications.
 - Every marked edge now carries a sharpness score (added 2026-11-10). Moving flat edges to the nearest vote step was tested the same day and discarded — it pushed good edges out of place.
 
 *Update this page whenever the goal, a step, or a definition changes — before the change is treated as settled.*
