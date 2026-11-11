@@ -991,6 +991,161 @@ Pipeline back to its exact pre-test state.
 
 ---
 
+## 16. Boundary-confidence score — FLAG KEPT, REPAIR DISCARDED (2026-11-10)
+
+**Why:** the per-word heat-map test (entry 15) found that word-level
+vote profiles score edge quality: flat edges (vote sharpness <0.5)
+have median error 13.5s vs 2.4s for the rest. The owner approved
+building this score. Two parts: (1) evaluate sharpness as a FLAG
+for bad edges; (2) design and A/B test a REPAIR rule for flat edges
+only. Context: the 2026-11-06 recommendation revision made the
+learned target a boundary scorer — this score is a boundary-scorer
+input.
+
+**Sharpness definition (same as entry 15's secondary analysis):**
+mean votes of 3 words just inside the edge minus mean votes of 3
+words just outside, from per-word vote profiles (a method segment
+covers a word iff the word's start falls inside it). Helpers
+`_word_votes` / `_edge_sharpness` in `run_pipeline.py`; the profiles
+reproduce the frozen perword `word_votes.json` exactly (0 diffs on
+99pi and Huberman accelerate-learning). Baseline reproduced exactly
+first (`combined_repro9`, all deltas 0.0 — recall 0.673, median
+4.7s, mean 12.0s, within-1s 26.4%, FP 36, missed 35).
+
+### Part 1 — FLAG evaluation (analysis scripts
+`sb_eval/ab/analyze_flag.py`, `ab/analyze_flag2.py`,
+`ab/analyze_repair_sim.py`; baseline matched edges, n=140 with
+profiles, 4 edges at episode boundaries have no profile)
+
+- Bucket stats on baseline edges (reproduces entry 15's finding):
+  flat (<0.5) n=60, median |err| 14.3s, mean 17.8s, within-1s
+  10/60; medium (0.5–2) n=59, median 2.7s, mean 8.7s, within-1s
+  21/59; sharp (≥2) n=21, median 2.7s, mean 6.9s, within-1s 3/21.
+  Flat vs non-flat median 14.3s vs 2.7s. Spearman rho(sharpness,
+  |err|) = −0.359.
+- Flat as a classifier of bad edges: |err| > 5s — precision 0.67,
+  recall 0.58, F1 0.62 (base rate 0.49; 40 TP, 20 FP, 29 FN);
+  |err| > 10s — precision 0.53, recall 0.63, F1 0.58 (base rate
+  0.36). Genuinely informative, far from a clean separator.
+- Threshold sweep (flag = sharpness < cut): 0.5 is near-optimal
+  for F1 at >5s (0.62; 0.25 gives 0.63, 0.75/1.0 give 0.67 but
+  flag 77 edges vs 60). The 0.5 cut stands; 0.75–1.0 is marginally
+  better on F1 but flags 28% more edges. 1.5+ flags nearly
+  everything (115/140) and precision collapses.
+- Signed direction: flat edges skew EARLY on both sides — starts
+  mean −7.9s (9 early, 2 late, n=14), ends mean −9.4s (29 early,
+  10 late, n=46). Non-flat: starts mean −0.3s, ends −2.5s.
+- **Sharpness at the TRUE label edges: median 0.00; 102/140 true
+  edges are flat (70% of starts, 76% of ends). The vote profile
+  does NOT step at the true boundary — the flag identifies bad
+  edges but the profile does not locate good ones. This is the
+  finding that kills the repair (below).**
+- Nearest vote step to the TRUE edge: starts median 3.8s (within
+  1s 20/72), ends median 2.8s (within 1s 14/72); nearest
+  method-segment boundary: starts 3.6s (22/72 within 1s), ends
+  2.3s (15/72). Only ~20–30% of true edges have a step/boundary
+  within 1s. For the 40 flat BAD edges specifically, the nearest
+  vote step to the truth is median 23.9s (starts, 1/11 within 1s)
+  and 2.8s (ends, 9/29 within 1s) — start truths sit in wide
+  step-free regions.
+- Offline repair simulation (three rules, flat edges only): R1
+  nearest step FORWARD — flat median 14.3 → 10.0s but within-1s
+  10 → 6; aggregate median 4.9 → 4.7s, within-1s 34 → 30 (of
+  140), mean 12.2s. R2 nearest step EITHER direction — worse on
+  everything (median 5.2s, within-1s 29, mean 13.7s). R3
+  direction-appropriate step FORWARD — same as R1 (median 4.7s,
+  within-1s 30, mean 12.0s). The best rule trades a 0.2s median
+  tick for −4 within-1s edges. The sharpness-margin variant
+  (target must beat current sharpness by ≥ 1.0) is worse still:
+  the qualifying step lands a median 19.9s from the truth
+  (nearest-wins) / 22.2s (sharpest-wins), 2/39 within 1s — the
+  margin filters the truth OUT, because the truth is flat.
+
+### Part 2 — REPAIR, A/B tested in the harness (variant
+`sb_eval/ab/boundary_repair/`, 65 firings)
+
+Rule as implemented (`_repair_flat_edges`, since removed):
+post-refinement, flat edges only (sharpness < 0.5), move to the
+nearest direction-appropriate vote step FORWARD in time within
+30s — start to the nearest UP step, end to the nearest DOWN step.
+No sharpness margin on the target. Hard constraints (same as the
+snap test): start stays before the first in-block mention, end
+stays after the last, never crosses an adjacent block, block
+keeps ≥ 15s; blocks with no in-block mention untouched. The
+repair is driven by the vote profile / method-segment boundaries,
+NOT by silence gaps alone — the silence+sentence snap test (entry
+4) already showed moving edges to silence gaps adds noise.
+
+Results vs baseline (recall 0.673, median 4.7s, mean 12.0s,
+within-1s 26.4%, within-2s 37.5%, within-5s 52.1%, FP 36, missed
+35, 144 edges): **boundary_repair: recall 0.701 (75/107), median
+4.6s, mean 12.1s, within-1s 23.3% (35/150), within-2s 36.0%,
+within-5s 52.7%, FP 33, missed 32, max 79.3 → 73.8s. Signed end
+−6.8 → −3.4s** (the early-end bias halves — the forward end
+moves do what they were designed to do). Per-edge deltas (labels
+matched in both): better 26 / worse 19 / same 99.
+
+**Decision-rule check: median improves (4.7 → 4.6s) and recall
+rises and FP falls — but within-1s FALLS 26.4% → 23.3% (38 → 35
+edges), so the rule's "median improves AND within-1s
+held/improved" FAILS. VERDICT: DISCARD as borderline/mixed.**
+
+The headline gains are not real edge gains. The 3 gained labels
+are marginal-overlap matches with bad edges: Huberman motivation
+(2543.5–2693.6) block 2544–2620, start +0.3 but end −73.8s;
+Modern Wisdom 4-men (4472.3–4536.0) start +13.5 / end −14.0;
+Modern Wisdom willpower (3366.9–3422.7) start +3.1 / end −22.7.
+The within-1s losses are the real story: 7 near-perfect end edges
+pushed OUT (e.g. −0.4 → +1.1, −0.4 → +4.6, −0.6 → +6.3, −0.4 →
++7.2 — all Huberman) against 3 gained. The repair "fixes" an end
+edge 0.4s early by moving it to the next down-step, which sits
+1–7s past the truth. Same failure shape as the silence+sentence
+snap (helps far-off edges, hurts near-perfect ones), at smaller
+scale. More data would NOT resolve this: the mechanism is
+systematic (true edges are flat in the profile; vote steps sit
+past the truth), not noise. The vote-step / segment-boundary
+repair is closed. A repair would need a target that actually sits
+at the true boundary — the profile does not provide one.
+
+### FLAG — KEPT
+
+The flag separates good from bad edges well enough to keep:
+blocks are now (start, end, label, start_sharpness,
+end_sharpness) from `detect_ad_blocks`, carried into the report
+and state (`start_sharpness` / `end_sharpness` per block) and
+into `detect.json`. Sharpness is None when the window is empty
+(edge at the episode boundary — 4 of 144 edges). **Edges are
+unchanged: `combined_repro10` reproduces `brand_orphan` exactly
+(all deltas 0.0), and 286/287 re-verified
+(`tmp/score_current_flag.log`): 286 7/9 ads (≥80% coverage),
+606.7/673s, over-mark 18s, 0 false; 287 6/8 ads, 463.0/531s,
+over-mark 41s, false blocks 1 (Pepperbox house plug, as before)
+— identical to the pre-flag run (`tmp/score_current_orphan.log`).**
+Repair code removed entirely (`_repair_flat_edges`,
+`boundary_repair` kwarg and hook, variant entry — zero
+`boundary_repair` references in `run_pipeline.py`). Helpers
+`_word_votes` / `_edge_sharpness` stay — they serve the flag.
+Downstream compatibility: four reusable drivers that unpacked
+blocks as 3-tuples were updated to the 5-tuple return
+(`sb_eval/transcribe_detect.py`,
+`transcribe_bench/end_to_end/run_e2e.py`,
+`validate_286_1101.py`, `score_287.py`); frozen one-off scripts
+in `tmp/` and `sb_eval/ab/test_imp2_*` / `test_imp3_*` were left
+untouched deliberately (historical records, not runnable
+tooling). What the flag enables: low-confidence edges can be
+surfaced in reporting (the nightly marked-ads list can note
+which edges are shaky), and sharpness is a ready input feature
+for the future boundary scorer (the 2026-11-06 recommendation
+revision's learned target). Variant outputs frozen under
+`sb_eval/ab/boundary_repair/`; baseline repros under
+`sb_eval/ab/combined_repro9/` (pre-flag) and
+`sb_eval/ab/combined_repro10/` (post-flag, verifies edges
+unchanged).
+
+**Conclusion: FLAG KEPT, REPAIR DISCARDED.**
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
