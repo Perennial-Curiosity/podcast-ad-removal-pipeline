@@ -826,6 +826,58 @@ def _first_opening_cue_after(words, nw, silences, t0, t1):
     return None
 
 
+def _word_votes(words, candidates):
+    """Per-word vote counts from the method segments (2026-11-10,
+    boundary-confidence test): a segment covers a word iff the word's
+    start falls inside the segment (inclusive — the analog of the
+    per-second heat map's inclusive second range). Returns a list of
+    ints parallel to words. Used by the boundary-confidence score
+    (_edge_sharpness)."""
+    import bisect as _bisect
+    starts = [w[0] for w in words]
+    votes = [0] * len(words)
+    for s, e, _l, _m in candidates:
+        i0 = _bisect.bisect_left(starts, s)
+        i1 = _bisect.bisect_right(starts, e)
+        for i in range(i0, i1):
+            votes[i] += 1
+    return votes
+
+
+def _edge_sharpness(starts, ends, votes, t, side):
+    """Sharpness of a word boundary at time t (2026-11-10,
+    boundary-confidence test): mean votes of 3 words just inside the
+    edge minus mean votes of 3 words just outside. side='start':
+    inside is the 3 words at/after t; side='end': inside is the 3
+    words ending at/before t. Returns None when either window is
+    empty (e.g. an edge at 0.0s has no outside words). Sharpness
+    separates good from bad edges — flat edges (< 0.5) have median
+    |err| ~14s vs ~2.7s for sharper edges on the 25-episode SB set —
+    but the TRUE edge is itself usually flat (median sharpness 0.00),
+    so sharpness flags bad edges without locating the truth."""
+    import bisect as _bisect
+    n = len(votes)
+    if side == "start":
+        i0 = _bisect.bisect_left(starts, t)
+        for _c in (i0 - 1, i0):
+            if 0 <= _c < n and (i0 >= n or
+                                abs(starts[_c] - t) < abs(starts[i0] - t)):
+                i0 = _c
+        inside = votes[i0:i0 + 3]
+        outside = votes[max(0, i0 - 3):i0]
+    else:
+        j0 = _bisect.bisect_left(ends, t)
+        for _c in (j0 - 1, j0):
+            if 0 <= _c < n and (j0 >= n or
+                                abs(ends[_c] - t) < abs(ends[j0] - t)):
+                j0 = _c
+        inside = votes[max(0, j0 - 2):j0 + 1]
+        outside = votes[j0 + 1:j0 + 4]
+    if not inside or not outside:
+        return None
+    return sum(inside) / len(inside) - sum(outside) / len(outside)
+
+
 def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
                      own_domains=None):
     # words: list of (start, end, word) from Whisper (may contain duplicates).
@@ -895,7 +947,11 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     spoken-URL anchor in the region, then any non-artifact label
     ('dry-island', 'voice-anomaly', 'duplicate-N' name no advertiser).
 
-    Returns (blocks, suspects). Suspects are low-confidence candidates
+    Returns (blocks, suspects). Blocks are (start, end, label,
+    start_sharpness, end_sharpness): each edge carries its boundary-
+    confidence sharpness (2026-11-10, KEPT as a flag — flat edges
+    < 0.5 are likely bad and are flagged, never moved; None when the
+    window is empty). Suspects are low-confidence candidates
     (voice, cluster-popular, brand-orphan, reverb) that did NOT become marked blocks:
     plausible ad-length segments the pipeline was unsure about. They are
     packaged into a suspect reel (2026-10-22, per the owner) for owner review of
@@ -1351,7 +1407,26 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     suspects = merged
 
     blocks.sort()
-    return [(s, e, l) for s, e, l in blocks], suspects
+    # Boundary-confidence score (2026-11-10, KEPT as a flag): each
+    # block edge carries its sharpness — mean votes of 3 words just
+    # inside the edge minus mean votes of 3 words just outside.
+    # Flat edges (< 0.5) are likely bad (median |err| ~14s vs ~2.7s
+    # for sharper edges on the 25-episode SB set) and are flagged for
+    # review; the score also feeds the future boundary scorer. It
+    # never moves an edge. None when a window is empty (edge at the
+    # episode boundary). Blocks are (start, end, label,
+    # start_sharpness, end_sharpness).
+    _votes = _word_votes(words, candidates)
+    _starts = [w[0] for w in words]
+    _ends = [w[1] for w in words]
+    scored = []
+    for s, e, l in blocks:
+        _ss = _edge_sharpness(_starts, _ends, _votes, s, "start")
+        _es = _edge_sharpness(_starts, _ends, _votes, e, "end")
+        scored.append((s, e, l,
+                       round(_ss, 2) if _ss is not None else None,
+                       round(_es, 2) if _es is not None else None))
+    return scored, suspects
 
 
 def _expand_tight_cluster(words, nw, silences, hits):
@@ -2138,10 +2213,10 @@ def check_missed_sponsors(words, sponsors, blocks):
             missed.append({"label": sp["label"], "mentions": 0})
             continue
         hit_times = [words[i][0] for i in hits]
-        covered = any(s <= t <= e for t in hit_times for s, e, _ in blocks)
+        covered = any(s <= t <= e for t in hit_times for s, e, *_ in blocks)
         if not covered:
             covered = any(sp["label"].lower() in (lbl or "").lower()
-                          for _, _, lbl in blocks)
+                          for _, _, lbl, *_ in blocks)
         if not covered:
             log(f"  WARNING: sponsor '{sp['label']}' not cut "
                 f"({len(hits)} transcript mentions)")
@@ -2398,7 +2473,7 @@ def _ad_chapter_spans(blocks, sponsors, house_plugs=None):
     'Muse Detected Ad For <name>' or plain 'Muse Detected Ad', except
     house plugs, which are titled 'Muse Detected House Plug For <name>'."""
     spans = []
-    for s, e, label in sorted(blocks):
+    for s, e, label, *_ in sorted(blocks):
         name = ad_chapter_name(label, sponsors)
         if name and is_house_plug(name, house_plugs):
             title = f"Muse Detected House Plug For {name}"
@@ -2679,16 +2754,19 @@ def process_episode(item, state, channel_link=None):
         return None
 
     state_blocks = []
-    for s, e, l in blocks:
+    for s, e, l, ss, es in blocks:
         name = ad_chapter_name(l, sponsors)
         title = chapter_for_block(s) or (
             f"Muse Detected Ad For {name}" if name else "Muse Detected Ad")
         state_blocks.append({"start": s, "end": e, "sponsor": l,
-                             "seconds": e - s, "chapter": title})
+                             "seconds": e - s, "chapter": title,
+                             "start_sharpness": ss, "end_sharpness": es})
     report = {
         "title": item["title"], "pubDate": item["pubDate"],
         "original_seconds": duration, "duration_seconds": marked_dur,
-        "blocks": [{"start": s, "end": e, "sponsor": l} for s, e, l in blocks],
+        "blocks": [{"start": s, "end": e, "sponsor": l,
+                    "start_sharpness": ss, "end_sharpness": es}
+                   for s, e, l, ss, es in blocks],
         "ad_chapters": [{"start": s, "end": e, "title": t} for s, e, t in ad_spans],
         "missed_sponsors": missed,
         "suspects": [{"start": s, "end": e, "label": l} for s, e, l in suspects],
@@ -2701,7 +2779,7 @@ def process_episode(item, state, channel_link=None):
         "file": out_name,
         "bytes": os.path.getsize(out_path),
         "ads_marked": len(blocks),
-        "ads_marked_seconds": sum(e - s for s, e, _ in blocks),
+        "ads_marked_seconds": sum(e - s for s, e, *_ in blocks),
         "duration_seconds": marked_dur,
         "blocks": state_blocks,
         "missed_sponsors": [m["label"] for m in missed],
