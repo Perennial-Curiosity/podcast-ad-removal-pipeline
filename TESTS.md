@@ -1146,7 +1146,7 @@ unchanged).
 
 ---
 
-## 17. Method-weight search — DISCARDED (2026-11-11)
+## 17. Method-weight search — SHELVED (2026-11-11)
 
 **Why:** PR #2 (Grok) hand-picked weights and failed badly (286
 coverage 606.7→401.9s, SB recall 0.673→0.495) — the failure was in
@@ -1219,24 +1219,18 @@ fold) vs 1.0 (Lex / Modern Wisdom folds); reverb→0 learned only
 when Acquired is in training. With 107 labels and 9 free weights,
 single-weight moves flip on 1–2 labels.
 
-**Conclusion: DISCARD.** Learning the weights from data does not
-beat the current two-vote rule. The full-set gain was fitted to the
-25 episodes; on unseen shows the learned weights are worse than the
-starting point. Variant code removed entirely from
-`run_pipeline.py` (0 `method_weights` / `_candidates` refs,
-compiles); variant entries removed from `ab_detect.py` (removal
-comment only). Post-removal verification: `combined_repro12`
-reproduces `brand_orphan` exactly (all deltas 0.0). Pipeline back
-to its exact pre-test state. More labeled data could resolve it —
-a doubled dataset would give leave-one-show-out folds more signal
-— but that is the owner's call (dataset doubling is currently not
-approved), and a retry needs more labels first, not a better search
-on these 107. Frozen records: `sb_eval/ab/weights_cd/results.json`
-(harness run; `weights_base` is the starting-point record),
-`sb_eval/ab/search_weights.py` (search driver),
-`sb_eval/ab/weights_search/coordinate_descent.json`,
-`logistic.json`, `loso.json`; baseline repros
-`sb_eval/ab/combined_repro11/` and `combined_repro12/`.
+**Conclusion: SHELVED (owner, 2026-11-11 — not discarded).** The
+method is sound; the data is insufficient. The full-set gain was
+fitted to the 25 episodes; on unseen shows the learned weights are
+worse than the starting point. A retry needs more manually labelled
+episodes first, not a better search on these 107 — and the retry
+data must be manual labels, not more SponsorBlock (SB marks
+host-read description sponsors only, so dynamic ads enter training
+as negatives; SB is validation data, not training data). The fitted
+weights themselves are not kept (worse on held-out shows); what is
+shelved is the test, with its frozen records (`sb_eval/ab/weights_cd/results.json`,
+`sb_eval/ab/search_weights.py`, `sb_eval/ab/weights_search/`) ready
+for a retry.
 
 ---
 
