@@ -1234,6 +1234,92 @@ for a retry.
 
 ---
 
+## 18. Dynamic-slot integration — IMPLEMENTED (2026-11-11)
+
+**Reason.** The dynamic-slot prototype (entry 7) was the most accurate
+boundary method tested: 7/7 dynamic ads, mean edge error 0.43s, 13/14
+edges within 1s. The integration design was approved 2026-11-11 and
+implemented the same day.
+
+**Methodology.** Port of the prototype's v5b density-slot aligner
+(`pipeline/slot_align.py`, 325 lines; 5-word-shingle anchors, 40-token
+density window at 0.6, hybrid boundary refinement, 8s minimum). The B
+flow runs after A detection, before chapter building, so any B failure
+degrades to detector-only output. B transcript cached in `work/B/`,
+alignment in `work/align_result.json` keyed by both SHAs. Copy A is
+always published, chapters on the A clock; B is never published and
+its mp3 is deleted after alignment. Naming is A-side only
+(detector-block label, then slot-internal brand mentions, then unnamed
+`Muse Detected Ad`). Merge: a gated slot overlapping a detector block
+takes the slot's edges + the detector's label, no refinement; a slot
+with no detector block becomes a new chapter; slot blocks bypass the
+30s/45s floors; house-plug labels are never overwritten. Gate: A-side
+any method segment overlapping the slot or a sponsor mention inside
+it; B-side brand mention plus a URL/CTA nearby. Probe once per
+podcast (byte-compare a second download) + 30-day re-probe +
+`dynamic_ads` config override. Sanity guards: differing-token rate
+>25%, duration ratio >10%, slot share >25% abort slots for the
+episode. Transcribe-config fingerprint re-added, covering both caches.
+Standalone `--slots-only` mode for manual-marking aid. Two deviations
+from DESIGN.md, both documented in code: alignment re-runs on every B
+flow (~1s) rather than skip-cached; a B-cache SHA invalidation marker
+was added because the design left the B transcript cache unkeyed by
+audio SHA (a fresh B file would have aligned against a stale cached B
+transcript) — unit-tested 3/3.
+
+**Results — Unsubscribe 286/287 vs the owner's ground truth**
+(`tmp/dynslots_val/results_286_287.json`). Detector baselines
+reproduced exactly first. Merged output: 286 — ≥50% scorer 9/9 ads,
+≥80% scorer 9/9 (was 7/9), coverage 645.3/673s (was 606.7), over-mark
+27.0s; 287 — ≥50% 8/8, ≥80% 7/8 (was 6/8), coverage 477.3/531s (was
+463.0). 17/17 ads kept at the ≥50% scorer. Dynamic-ad edges reproduce
+the prototype exactly: mean error 0.42s, 13/14 edges within 1s, worst
+1.6s. Overall edges improve on both episodes (286 mean |err|
+4.67→3.73s, within-1s 3/18→7/18; 287 4.95→4.09s, 5/16→9/16). All 10
+host-read blocks unchanged by the merge.
+
+**Gate — one failure against the design's criterion.** 287: PASS,
+3/3 true slots gated, 0 false. 286: 4/4 true slots pass, but 1 of 3
+false slots passes — the 899.4–927.1 "cha" hallucination slot, which
+sits inside the real Ghostbed ad, so a Ghostbed method segment
+overlaps it and the A-side gate fires. It becomes an unnamed extra
+block, so 286 goes from FP 0 to FP 1 at the ≥50% scorer. A
+mention-based tightening would not separate them: only the Progressive
+slots carry a brand mention from any list (description, house-plug, or
+popular brands); Got Junk, Ozempic, and Leaf Filter are in no pool, so
+requiring a mention would fail 5 of 7 true slots. Owner decision
+pending: accept this FP, or tighten the gate/merge for the
+partial-overlap case (a gated slot overlapping a detector block by
+<50% currently becomes a standalone block).
+
+**Results — SponsorBlock probe (25 episodes)**
+(`sb_eval/ab/dynslots/probe.json`): 12 dynamic, 10 static, 3
+probe-download failures (transient CDN disconnects, retried). The same
+show has both kinds (Huberman 5 dynamic / 3 static; Security Now 2
+dynamic / 2 static) — dynamic-ness is per-episode, not per-show.
+Static episodes: blocks identical to the brand-orphan baseline (10/10
+episodes spot-checked; aggregate labels 44, matched 27, recall 0.614,
+missed 17, FP 17 — an exact match on the same 10 episodes).
+
+**Security Now 1101:** detector gives 6 blocks (spans differ from the
+2026-10-27 old list — pre-existing, from own-domains and brand-orphan
+landing since then, not caused by this change). The probe shows the
+second download differs by 303,176 bytes — the feed is NOT static, so
+the B flow runs rather than the design's assumed no-op. B-flow result
+pending (driver running; transcription ~5 min per 180s chunk, 0.6x
+realtime — about 2x slower than the design's estimate, so the full
+dynamic SB run is ~40h).
+
+**Conclusion.** Implemented and merged into the pipeline; 286/287
+gains are real and the static-episode behavior is provably unchanged.
+Open: the owner's gate-gap decision, and whether the ~40h dynamic SB
+validation is worth running to completion (driver
+`sb_eval/ab/run_dynslots_remaining.sh` is running it: 1101 B flow,
+`--slots-only` test on 286, 12 dynamic SB episodes + 3 probe-failed
+retries).
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
