@@ -211,10 +211,33 @@ Notes:
 - **Unsubscribe 286 ground-truth validation (2026-10-27):** superseded by
   the 2026-10-28 entry above — the pipeline then marked 7/9 with 169s
   over-mark; the `url` vote and the other 2026-10-28 fixes took it to 9/9.
-- **Dynamic ads:** two downloads of one episode differ; transcript
-  differences over 20s reveal the ad slots, which are consistent across
-  downloads. Slot positions map via offset subtraction (costs 2x
-  transcription).
+- **Dynamic-slot integration (2026-11-11, implemented):** a second
+  download of the same episode, transcribed and aligned against the
+  first (5-word-shingle anchors, density filter on differing tokens),
+  reveals the dynamic-ad slots. The B flow runs after A detection,
+  before chapter building, on dynamic-capable feeds only (probe once
+  per podcast by byte-compare, 30-day re-probe, optional
+  `dynamic_ads` override in `podcasts.yaml`); copy A is always the
+  published copy and chapters live on the A clock. Each slot must
+  pass an evidence gate (a detector method segment overlapping it,
+  a sponsor mention inside it, or a brand + URL/CTA in the B-side
+  copy) and is named from A-side evidence only. A gated slot
+  overlapping a detector block takes the slot's edges + the
+  detector's label (no refinement on slot edges); a slot with no
+  detector block becomes a new chapter; slot blocks bypass the
+  30s/45s floors; house-plug blocks are never overwritten. Sanity
+  guards abort slots for the episode when the differing-token rate
+  exceeds 25%, the durations differ by over 10%, or gated slots
+  exceed 25% of the episode. Validated on the owner's 286/287
+  ground truth: all 7 dynamic ads found with mean edge error 0.42s
+  (13/14 edges within 1s); 286 went from 7/9 to 9/9 ads at the 80%
+  coverage scorer and 287 from 6/8 to 7/8, with all host-read
+  blocks unchanged. One gate gap remains: on 286 a false slot
+  inside the real Ghostbed ad (a transcription-hallucination
+  region) passes the gate and becomes an unnamed extra block.
+  A standalone `--slots-only <slug>` mode prints the gated slots
+  for one episode as a manual-marking aid without touching
+  pipeline state. Full numbers in `TESTS.md`.
 - **Ollama / LLM reviewer: evaluated 2026-10-14, REJECTED.** It hallucinated
   sponsor reads, missed real ads, produced garbled timestamps, and was
   too slow and memory-hungry. Do not re-add without a fresh evaluation.
