@@ -26,7 +26,7 @@ That precision is the goal. Finding the ad is only step one.
 
    Two or more methods agreeing is high confidence. Some strong single methods also count.
 
-4. **Refine the edges** — Move each start and end inward to the nearest real evidence: the first and last brand mention, call to action, or URL inside the block. Starts stay where the opening cue is — cues come before brand names.
+4. **Refine the edges** — Move each start and end inward to the nearest real evidence: the first and last brand mention, call to action, or URL inside the block. Starts stay where the opening cue is — cues come before brand names. Each edge also gets a confidence score (see edge sharpness below).
 
 5. **Name the sponsor** — Attach the company or product the ad is for.
 
@@ -42,6 +42,7 @@ That precision is the goal. Finding the ad is only step one.
 - **House plug** — The show promoting itself or its own products, including Patreon reads and Pepperbox. Labeled as a house plug, never as an ad.
 - **Recall** — The share of real ads that were found. 9 of 9 ads found is 100% recall.
 - **Edge error** — How far a marked start or end is from the true start or end, in seconds.
+- **Edge sharpness (boundary confidence)** — How sharply the evidence votes change at an edge: the average votes just inside minus the average just outside. Below 0.5 the edge is "flat" and likely wrong — flat edges miss by 14.3 seconds on average, sharp ones by 2.7. It flags shaky edges; it cannot fix them, because the true boundary is usually flat too.
 - **False block** — A chapter marking something that is not an ad.
 
 ## Why it is built this way
@@ -57,5 +58,6 @@ That precision is the goal. Finding the ad is only step one.
 - Automatic marking is **paused**. The owner is marking new episodes by hand.
 - Best proven edge method, not yet integrated: download an episode twice and compare the two transcripts. Where they differ is an inserted ad. Mean edge error 0.43 seconds; 13 of 14 edges within 1 second. It cannot find host-read ads — those are identical in both downloads — so it would add to the detector, not replace it.
 - Transcription model: still the fast base model. A larger model transcribes more accurately but does not improve edges, so no switch has been approved.
+- Every marked edge now carries a sharpness score (added 2026-11-10). Moving flat edges to the nearest vote step was tested the same day and discarded — it pushed good edges out of place.
 
 *Update this page whenever the goal, a step, or a definition changes — before the change is treated as settled.*
