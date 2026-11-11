@@ -1320,6 +1320,191 @@ retries).
 
 ---
 
+## 19. Spectral-step splice evidence (MinusPod idea 1) — DISCARDED at Phase A (2026-11-11)
+
+**Reason.** MinusPod's splice detector measures the change in
+spectral centroid/flatness across a silence — a splice point between
+separately mastered audio. AdChisel's flat-edge problem (true edges
+are themselves flat in the vote profile, entry 16) made this the
+highest-ranked borrow: the audio might step where the words do not.
+It is a change-point signal, not the rejected absolute-loudness work.
+
+**Methodology.** Phase A measured the signal before building any
+variant: feature series (frame RMS, spectral centroid, spectral
+flatness) at 8 kHz mono; how often a spectral step sits within 1s of
+a true edge, and how often a true edge has any qualifying pause
+nearby. Frozen: `sb_eval/ab/splice_step/`.
+
+**Results.** A spectral step sits within 1s of a true edge **1/34**
+times on owner truth (0/18 on 286, 1/16 on 287), and on dynamic edges
+— where the splice theory predicts it — **1/14**. Only 32% of true
+edges have any ≥0.3s pause within 1s; strict MinusPod silences number
+**zero** in both 286 and 287. Pooled across 8 episodes: 11/82
+(13.4%), precision ~1% at ~73 events/hour. Megaphone mp3s do not
+bracket splices with silence. No variant built; harness copy removed.
+
+**Conclusion.** The signal is not there. Discard. The audio channel
+does not step at the boundary on these feeds.
+
+---
+
+## 20. Per-feed jingle/stinger templates (MinusPod idea 2) — DEAD at Phase A (2026-11-11)
+
+**Reason.** MinusPod captures a short recurring break cue once per
+feed (MFCC fingerprint) and snaps a detected edge to it. A stinger at
+the break would be a sub-second edge the transcript cannot see.
+
+**Methodology.** Discovery scan on cached 286/287/1101/1103 audio:
+edge-anchored recurrence of non-speech bursts. Frozen:
+`tmp/jingle_snap/`.
+
+**Results.** No recurring break stingers on either served show.
+Edge-anchored recurrence means ~0.00–0.12; bursts at chance in all
+four episodes scanned. The negative is real, not a sensitivity
+failure — the same front-end scores the identical Progressive dynamic
+ad at exactly 1.000 cross-episode. No variant built.
+
+**Conclusion.** Dead for the served shows. The idea stays viable
+only for a future show that actually plays a break stinger.
+
+---
+
+## 21. Cross-episode recurrence, NEGATIVE direction (MinusPod idea 3) — BORDERLINE, do not include (2026-11-11)
+
+**Reason.** MinusPod uses 8-word shingles recurring across episodes
+as a boilerplate hint. AdChisel's duplicate scanner already uses
+8-word shingles within an episode; the negative direction would
+suppress blocks in recurring intro/outro regions.
+
+**Methodology.** A/B harness variant (`ab/xep_suppress/`), baseline
+reproduced exactly first. Two findings recorded: the boilerplate-zone
+restriction is load-bearing — recurrence alone would have suppressed
+14/72 real matched blocks, because sponsor reads repeat
+near-verbatim — and intro-zone suppression never fired.
+
+**Results.** FP 36→34 (two genuine Huberman outro URL plugs
+removed), everything else flat — recall 0.673, median 4.7s, mean
+12.0s, within-1s 26.4% (38/144), per-edge deltas 0/0/144. Fails the
+KEEP letter (median must improve).
+
+**Conclusion.** Borderline/mixed → do not include. The two genuine FP
+removals do not justify the residual risk (a fixed-script dynamic
+pre-roll recurring in ≥2 priors could get suppressed with a larger
+pool). 286/287/1101 checks were offline only; re-verify live if this
+is ever revisited.
+
+---
+
+## 22. Cross-episode recurrence, POSITIVE direction (MinusPod idea 3) — KEPT (2026-11-11)
+
+**Reason.** Same mechanism, inverted: sponsor copy recurring across
+episodes corroborates a weak ad — targeting the tail-only-read
+failure, where the tail contains sponsor copy repeated from other
+episodes.
+
+**Methodology.** A/B harness variant (`ab/xep_corroborate/`),
+baseline reproduced exactly first. Post-processes blocks only; no
+`find_mentions` calls, so no orphan-flip risk (checked clean).
+
+**Results.** Recall 0.673→**0.701** (+3 Huberman labels, 0 lost), FP
+36→**33**, median 4.7→**4.0s**, mean 12.0→11.9s, within-1s 26.4%→
+**29.3%** (38→44 edges), within-2s 37.5%→40.0%. Common set: 14
+better / 5 worse / 125 unchanged, within-1s 38→39. Honest caveat:
+the median gain is compositional — common-set median is flat 4.7s —
+but the composition change is *gaining* good matches, not losing bad
+ones, and the rule passes on its letter. One large harm: LMNT on
+Modern Wisdom Sydney Sweeney, start −0.8→−20.7s. Safety checks all
+clean: 286/287 byte-identical, SN 1101 still 6 blocks, SN 1103
+Hoxhunt unchanged. Live pipeline needs prior-episode transcripts as
+input; a show with no priors is a clean no-op.
+
+**Conclusion.** KEEP. Not yet merged — left in the harness copy only
+(`ab_detect_xep_corroborate.py`); merge into `run_pipeline.py` waits
+until the dynamic-slot validation driver finishes, so the slot
+validation stays pure. Untested follow-up: a span-start-vs-first-
+mention guard for the Sydney Sweeney harm.
+
+---
+
+## 23. DAI transition pairs (MinusPod idea 4) — DISCARDED (2026-11-11)
+
+**Reason.** MinusPod's transition detector: paired ≥12 dB loudness
+jumps, up then down, into 15–180s regions, promoted only with
+transcript corroboration. Lowest-ranked candidate because it is the
+loudness family (entry 3 rejected absolute loudness); the material
+difference is paired jumps plus required corroboration, never
+standalone.
+
+**Methodology.** A/B harness variant (`ab/dai_transition/`),
+baseline reproduced exactly first.
+
+**Results.** SB headlines pass the decision rule's letter (recall
+0.682, median 4.0s, within-1s 28.1%, FP flat 36; per-edge 2 better /
+0 worse / 142 unchanged), but 286 is disqualifying: coverage
+unchanged yet **over-mark 18→348s, false blocks 0→1** — a new 330s
+Patreon false block (4543–4873), the known "patron saint" trap
+promoted from suspect to marked chapter. The orphan-only
+corroboration that wins SN 1096 is the same gate that promotes the
+Patreon block. 287 unchanged; SN 1101 6 blocks identical.
+
+**Conclusion.** Discard. The gate that helps on one show promotes a
+house plug to a marked chapter on the served show. Untested
+follow-up: strong-methods-only corroboration.
+
+---
+
+## 24. Silence-midpoint snap (MinusPod idea 5) — DISCARDED at quick check (2026-11-11)
+
+**Reason.** MinusPod moves an edge to the midpoint of the nearest
+qualifying silence span, capped at 2s. Re-test of a rejected family
+(silence+sentence snap, all three forms, entry 7); the anchor differs
+materially (silence midpoint, not sentence end).
+
+**Methodology.** Offline simulation on frozen blocks, two rules,
+before building a variant. Frozen: `ab/silence_midpoint/` (+ `_b`).
+
+**Results.** Within-1s 26.4→25.0% (rule A) and 23.6% (rule B);
+per-edge 14 better / 23 worse, harm concentrated in ends; on owner
+truth only 1/34 edges moved at all. Same failure shape as the
+earlier snap tests.
+
+**Conclusion.** Discard. The refined edge is already within ~1s and
+the nearest silence is 1–2s away.
+
+---
+
+## 25. Publisher-transcript differential implementation — IMPLEMENTED, ready to merge (2026-11-11)
+
+**Reason.** MinusPod's transcript-differential: if the feed carries a
+`podcast:transcript` tag whose transcript was made before ads were
+spliced in, Whisper-only runs (≥40 words, ≥10s) are candidate ads.
+The owner directed implementation (many podcasts carry publisher
+transcripts, just not the two served shows). The Omny test the same
+day (Cabinet of Curiosities 873/874/875) found exactly 3 ads per
+episode, 9 total, all cut as clips for a listening check.
+
+**Methodology.** Scratch module `tmp/transcript_diff/
+transcript_diff.py` (661 lines, stdlib only, 26 synthetic checks
+passing; one real bug found and fixed — SRT timecode parser missing
+`* 60` on minutes). Deliberate design call: **corroboration only, no
+heat-map vote** — a vote would be a marking-behavior change needing
+an A/B run. No `find_mentions` calls, so no orphan-flip risk.
+`run_pipeline.py` untouched (0 refs). Merge is mechanical per
+`tmp/transcript_diff/INTEGRATION.md` §1–§8, stage running after the
+dynamic-slot flow and before chapter building.
+
+**Smoke tests (real feeds).** Podcasting 2.0 ep 235 (ad-free) — 0
+gaps, coverage 0.919. Cabinet of Curiosities "Wild at Heart" — **2
+gaps, both verified BetterHelp ads** (77.9s and 62.9s), VTT and SRT
+identical. Graceful degradation verified both ways (no tag →
+skipped; transcript-includes-ads → 0 gaps).
+
+**Conclusion.** Implemented and ready to merge. Merge waits until
+the dynamic-slot validation driver finishes, so the slot validation
+stays pure — same hold as entry 22.
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
