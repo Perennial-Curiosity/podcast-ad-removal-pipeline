@@ -29,10 +29,12 @@ is uncertain for an episode, the episode is left unmarked and flagged.
 """
 
 import difflib
+import glob
+import hashlib
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import subprocess
 import sys
 import time
@@ -56,6 +58,22 @@ HEATMAP_MIN_AD_LEN = 30
 MAX_AD_LEN = 12 * 60
 # Chunk size for transcription (seconds) — keeps each job short
 TRANSCRIBE_CHUNK = 180
+
+# Dynamic slots (2026-11-11, DESIGN.md): a second download of the same
+# episode, aligned against the first, reveals dynamic-ad slots — the
+# regions where the two copies differ. Integrated as a boundary source
+# for dynamic ads, not a standalone detector.
+SLOT_ALIGNER_VERSION = "v5b"   # frozen aligner params live in slot_align.py
+SLOT_PROBE_RECHECK_DAYS = 30   # re-probe a feed this often
+SLOT_MAX_ATTEMPTS = 3          # B-download retries before giving up
+SLOT_GUARD_MAX_DIFF_RATE = 0.25  # differing-token rate above this: abort slots
+SLOT_GUARD_MAX_DUR_RATIO = 0.10  # |B dur - A dur| / A dur above this: abort
+SLOT_GUARD_MAX_SLOT_SHARE = 0.25  # gated slots > 25% of episode: abort
+SLOT_B_MARGIN_S = 10.0         # B-side gate window margin around mapped B span
+# Transcribe-config fingerprint (2026-11-11): a stored config that differs
+# from the current one invalidates a cached chunk transcript. Missing
+# config = legacy cache (all pre-2026-11-11 caches are base/en/beam5).
+TRANSCRIBE_CONFIG = {"model": "base", "language": "en", "beam_size": 5}
 
 # Popular podcast sponsors not in the episode description.
 # Used ONLY by the cluster finder (4+ mentions in 1 min) as a safety net
@@ -549,8 +567,10 @@ def transcribe_chunked(mp3_path, work_dir):
         if os.path.exists(chunk_json):
             with open(chunk_json) as f:
                 data = json.load(f)
-            words.extend([(w[0], w[1], w[2]) for w in data["words"]])
-            continue
+            if data.get("transcribe_config", TRANSCRIBE_CONFIG) == TRANSCRIBE_CONFIG:
+                words.extend([(w[0], w[1], w[2]) for w in data["words"]])
+                continue
+            log(f"  chunk {i}: transcribe config changed; re-transcribing")
         chunk_wav = os.path.join(work_dir, f"chunk_{i:03d}.wav")
         subprocess.run(
             ["ffmpeg", "-y", "-v", "error", "-ss", str(start),
@@ -563,7 +583,8 @@ def transcribe_chunked(mp3_path, work_dir):
             for w in (seg.words or []):
                 cwords.append((w.start + start, w.end + start, w.word))
         with open(chunk_json, "w") as f:
-            json.dump({"words": cwords}, f)
+            json.dump({"words": cwords,
+                       "transcribe_config": TRANSCRIBE_CONFIG}, f)
         os.remove(chunk_wav)
         words.extend(cwords)
         log(f"transcribed chunk {i + 1}/{n_chunks}")
@@ -879,7 +900,7 @@ def _edge_sharpness(starts, ends, votes, t, side):
 
 
 def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
-                     own_domains=None):
+                     own_domains=None, candidates_out=None):
     # words: list of (start, end, word) from Whisper (may contain duplicates).
     """Locate ad-read blocks via multi-method heat map (2026-10-09).
 
@@ -974,6 +995,8 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
         candidates.extend([(s, e, l, 'reverb') for s, e, l in _method_reverb(words, mp3_path)])
 
     if not candidates:
+        if candidates_out is not None:
+            candidates_out.extend(candidates)
         return [], []
 
     # Spoken-URL positions (brand stem, time) for the label picker and
@@ -1426,6 +1449,10 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
         scored.append((s, e, l,
                        round(_ss, 2) if _ss is not None else None,
                        round(_es, 2) if _es is not None else None))
+    # Hand the raw method segments to the dynamic-slot gate (DESIGN.md
+    # section 6): the gate needs method-level evidence, not blocks.
+    if candidates_out is not None:
+        candidates_out.extend(candidates)
     return scored, suspects
 
 
@@ -2673,7 +2700,560 @@ def write_feed(state, site_dir, original_xml):
     return feed
 
 
-def process_episode(item, state, channel_link=None):
+# ---------------------------------------------------------------------------
+# Dynamic slots (2026-11-11, DESIGN.md)
+# ---------------------------------------------------------------------------
+# A second download of the same episode, transcribed and aligned against
+# the first, reveals the dynamic-ad slots: the regions where the two
+# copies differ. Slots are a boundary source for dynamic ads, not a
+# standalone detector: each slot must pass an evidence gate, and a gated
+# slot only ever replaces the EDGES of a detector block (or becomes a new
+# chapter when the detector found nothing there). Copy A is always the
+# published copy; chapters live on the A clock; copy B is never published
+# and its mp3 is deleted after alignment (transcript kept).
+# ---------------------------------------------------------------------------
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1 << 20)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _b_cache_check(b_dir, b_sha256):
+    """Invalidate a stale B transcript cache. The B audio changes
+    between downloads (ads rotate), so the cached B chunks are only
+    valid for the exact B file they were transcribed from. A marker
+    file records that file's SHA; a mismatch drops the chunks (and
+    transcript.json) so transcribe_chunked re-transcribes. Without
+    this, a rotated ad would be aligned against a stale B transcript
+    and the slots would be wrong."""
+    marker = os.path.join(b_dir, "b_sha256.txt")
+    if os.path.exists(marker):
+        try:
+            if open(marker).read().strip() == b_sha256:
+                return  # cache matches this B file
+        except OSError:
+            pass
+        log("  B audio differs from the cached B transcript; "
+            "dropping stale B chunks")
+        for f in glob.glob(os.path.join(b_dir, "chunk_*.json")):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        try:
+            os.remove(os.path.join(b_dir, "transcript.json"))
+        except OSError:
+            pass
+    with open(marker, "w") as f:
+        f.write(b_sha256)
+
+
+def _cleanup_b_mp3(b_mp3):
+    try:
+        if os.path.exists(b_mp3):
+            os.remove(b_mp3)
+    except OSError:
+        pass
+
+
+def _slot_overlap(a0, a1, b0, b1):
+    return max(0.0, min(a1, b1) - max(a0, b0))
+
+
+def _slot_gate_a_side(slot, candidates, a_words, nw_a, sponsors, house_plugs):
+    """A-side gate (DESIGN.md section 6a): any detector method segment
+    overlaps the slot, or a description-sponsor / house-plug mention
+    falls inside it. Returns evidence string ('detector' | 'mention')
+    or None."""
+    s, e = slot["start"], slot["end"]
+    for cs, ce, _l, _m in candidates:
+        if _slot_overlap(s, e, cs, ce) > 0:
+            return "detector"
+    variants = set()
+    for sp in list(sponsors) + list(house_plugs):
+        variants |= set(sp.get("variants", []))
+    if variants:
+        for h in find_mentions(nw_a, variants):
+            if s <= a_words[h][0] < e:
+                return "mention"
+    return None
+
+
+def _slot_gate_b_side(slot, b_words, nw_b, sponsors, house_plugs, own_domains):
+    """B-side gate (DESIGN.md section 6b, stricter): the B-side ad copy
+    in the mapped B span (with a margin) contains a sponsor brand
+    mention AND a URL/CTA nearby. Returns True/False."""
+    bs = slot["b_start"] - SLOT_B_MARGIN_S
+    be = slot["b_end"] + SLOT_B_MARGIN_S
+    variants = set()
+    for sp in list(sponsors) + list(house_plugs):
+        variants |= set(sp.get("variants", []))
+    if not variants:
+        return False
+    brand_hit = False
+    for h in find_mentions(nw_b, variants):
+        if bs <= b_words[h][0] < be:
+            brand_hit = True
+            break
+    if not brand_hit:
+        return False
+    url_idx = {i for _b, i in find_url_mentions(nw_b, own_domains)}
+    url_idx |= {i for _b, i in find_bare_urls(nw_b, own_domains)}
+    for i in url_idx:
+        if bs <= b_words[i][0] < be:
+            return True
+    return False
+
+
+def _gate_slot(slot, a_words, nw_a, b_words, nw_b, candidates,
+               sponsors, house_plugs, own_domains):
+    """Gate a slot: A-side pass first, then the stricter B-side pass.
+    Returns (passed, evidence) with evidence in
+    'detector' | 'mention' | 'b_side' | None."""
+    ev = _slot_gate_a_side(slot, candidates, a_words, nw_a, sponsors,
+                           house_plugs)
+    if ev:
+        return True, ev
+    if _slot_gate_b_side(slot, b_words, nw_b, sponsors, house_plugs,
+                         own_domains):
+        return True, "b_side"
+    return False, None
+
+
+def _slot_name_from_mentions(slot, a_words, nw_a, sponsors, house_plugs):
+    """Name a slot from A-side evidence only (DESIGN.md section 4):
+    count slot-internal brand mentions per label across description
+    sponsors, house plugs, and the popular-brands list; most mentions
+    wins, ties broken description sponsor > house plug > popular brand.
+    Returns 'slot:<Label>' or None (unnamed slot — still marked).
+    NOTE: this find_mentions call runs AFTER detection and only names
+    slot blocks; it feeds no detection method, so it cannot flip a
+    sponsor from the orphan path to the brand path (orphan-flip
+    constraint, HANDOFF.md 2026-11-10)."""
+    s, e = slot["start"], slot["end"]
+    pools = [(list(sponsors), 0), (list(house_plugs), 1),
+             (list(POPULAR_BRANDS), 2)]
+    best = None  # (count, -tier, label)
+    for pool, tier in pools:
+        for sp in pool:
+            variants = set(sp.get("variants", []))
+            if not variants:
+                continue
+            n = sum(1 for h in find_mentions(nw_a, variants)
+                    if s <= a_words[h][0] < e)
+            if n and (best is None or (n, -tier) > (best[0], best[1])):
+                best = (n, -tier, sp["label"])
+    return f"slot:{best[2]}" if best else None
+
+
+def _merge_slots(blocks, gated_slots, a_words, candidates, sponsors,
+                 house_plugs):
+    """Merge gated slots with detector blocks (DESIGN.md section 7).
+    Returns (merged_blocks, sources) with sources parallel to blocks:
+    'detector' | 'slot' | 'merged'. Slot edges are used as-is (no
+    refinement); slot blocks bypass the 30s/45s floors. A slot
+    overlapping a house-plug block never overwrites it — the detector
+    block stands and the overlap is logged for review."""
+    starts = [w[0] for w in a_words]
+    ends = [w[1] for w in a_words]
+    votes = _word_votes(a_words, candidates)
+
+    def sharpness(t, side):
+        v = _edge_sharpness(starts, ends, votes, t, side)
+        return round(v, 2) if v is not None else None
+
+    merged, sources = [], []
+    used = set()
+    for slot in sorted(gated_slots, key=lambda s: s["start"]):
+        s, e = slot["start"], slot["end"]
+        if e - s > MAX_AD_LEN:
+            log(f"  slot {s:.1f}-{e:.1f} exceeds MAX_AD_LEN; skipped")
+            continue
+        overlapping = []
+        for i, b in enumerate(blocks):
+            ov = _slot_overlap(s, e, b[0], b[1])
+            if ov >= 0.5 * (e - s):
+                overlapping.append((ov, i, b))
+        if not overlapping:
+            merged.append((s, e, slot["label"],
+                           sharpness(s, "start"), sharpness(e, "end")))
+            sources.append("slot")
+            continue
+        # House-plug blocks are never overwritten by a slot.
+        plug = None
+        for _ov, _i, b in overlapping:
+            name = ad_chapter_name(b[2], sponsors)
+            if name and is_house_plug(name, house_plugs):
+                plug = b
+                break
+        if plug is not None:
+            log(f"  slot {s:.1f}-{e:.1f} overlaps house-plug block "
+                f"{plug[0]:.1f}-{plug[1]:.1f}; detector block stands")
+            continue
+        if len(overlapping) == 1:
+            _ov, i, b = overlapping[0]
+            label = b[2]
+            used.add(i)
+        else:
+            overlapping.sort(key=lambda t: -t[0])
+            top = overlapping[0][0]
+            tied = [o for o in overlapping if abs(o[0] - top) < 1e-9]
+            labels = {o[2][2] for o in tied}
+            if len(labels) == 1:
+                label = tied[0][2][2]
+            else:
+                label = slot["label"]
+            for _ov, i, _b in overlapping:
+                used.add(i)
+        merged.append((s, e, label, sharpness(s, "start"),
+                       sharpness(e, "end")))
+        sources.append("merged")
+    for i, b in enumerate(blocks):
+        if i not in used:
+            merged.append(b)
+            sources.append("detector")
+    order = sorted(range(len(merged)), key=lambda i: merged[i][0])
+    return [merged[i] for i in order], [sources[i] for i in order]
+
+
+def _write_align_result(work, a_sha256, b_sha256, aligned, gated, rejected,
+                        guards):
+    """Persist the alignment record (DESIGN.md section 9): the density
+    slots (NOT the v1 merge spans the prototype saved), both SHAs, the
+    gate outcome per slot, and any tripped guards. Alignment itself is
+    re-run on every B flow (~1s); this file is the audit record, keyed
+    by both SHAs, not a skip-cache."""
+    payload = {
+        "aligner_version": aligned.get("aligner_version",
+                                       SLOT_ALIGNER_VERSION),
+        "a_sha256": a_sha256, "b_sha256": b_sha256,
+        "differing_token_rate": aligned.get("differing_token_rate"),
+        "n_anchors": aligned.get("n_anchors"),
+        "n_anchor_candidates": aligned.get("n_anchor_candidates"),
+        "a_duration": aligned.get("a_duration"),
+        "b_duration": aligned.get("b_duration"),
+        "slots": aligned.get("slots", []),
+        "gated": gated,
+        "rejected": rejected,
+        "guards": guards,
+    }
+    with open(os.path.join(work, "align_result.json"), "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def run_slot_flow(work, a_words, a_duration, a_mp3_path, a_sha256, b_url,
+                  sponsors, desc_sponsors, house_plugs, own_domains,
+                  candidates, blocks, b_mp3_path=None):
+    """Run the B flow for one episode (DESIGN.md sections 2-8).
+    work: episode work dir (B transcript cached in work/B/,
+    alignment record in work/align_result.json).
+    Returns a dict: status in 'slots' | 'no_slots' | 'static' |
+    'b_failed' | 'slots_rejected'; on 'slots', blocks/sources are the
+    merged detector+slot blocks; otherwise blocks/sources are the
+    detector-only blocks. A B-download failure degrades to detector-only;
+    a B-transcription crash propagates (crash protocol: fix root cause,
+    re-run the episode from the top)."""
+    try:
+        from slot_align import align_words
+    except ImportError:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from slot_align import align_words
+    b_dir = os.path.join(work, "B")
+    os.makedirs(b_dir, exist_ok=True)
+    b_mp3 = b_mp3_path or os.path.join(b_dir, "original.mp3")
+    result = {"status": "b_failed", "blocks": blocks,
+              "sources": ["detector"] * len(blocks),
+              "slots": [], "rejected": [], "b_sha256": None,
+              "b_duration": None, "differing_token_rate": None,
+              "n_anchors": None}
+    # B download (fresh each time unless a path was supplied, e.g. the
+    # probe download or a validation fixture).
+    if b_mp3_path is None and os.path.exists(b_mp3):
+        os.remove(b_mp3)
+    try:
+        if b_mp3_path is None:
+            download(b_url, b_mp3, retries=3)
+    except Exception as exc:
+        log(f"  B download failed ({exc!r}); detector-only output")
+        return result
+    try:
+        b_sha256 = sha256_file(b_mp3)
+    except OSError as exc:
+        log(f"  B file unreadable ({exc!r}); detector-only output")
+        return result
+    result["b_sha256"] = b_sha256
+    if b_sha256 == a_sha256:
+        log("  B download is byte-identical to A; no slots")
+        _cleanup_b_mp3(b_mp3)
+        result["status"] = "no_slots"
+        return result
+    # The B transcript cache is only valid for this exact B file.
+    _b_cache_check(b_dir, b_sha256)
+    # B transcription (a crash here propagates — crash protocol).
+    b_words, b_duration = transcribe_chunked(b_mp3, b_dir)
+    result["b_duration"] = b_duration
+    # Alignment.
+    try:
+        aligned = align_words(a_words, b_words)
+    except Exception as exc:
+        log(f"  slot alignment failed ({exc!r}); detector-only output")
+        result["status"] = "slots_rejected"
+        result["rejected"] = [{"reason": "align_error",
+                               "detail": repr(exc)}]
+        _cleanup_b_mp3(b_mp3)
+        return result
+    result["differing_token_rate"] = aligned["differing_token_rate"]
+    result["n_anchors"] = aligned["n_anchors"]
+    guards = []
+    if aligned["differing_token_rate"] > SLOT_GUARD_MAX_DIFF_RATE:
+        guards.append("diff_rate")
+    if a_duration and abs(b_duration - a_duration) / a_duration > \
+            SLOT_GUARD_MAX_DUR_RATIO:
+        guards.append("duration_ratio")
+    # Drop implausibly long slots before gating.
+    kept, rejected = [], []
+    for s in aligned["slots"]:
+        if s["end"] - s["start"] > MAX_AD_LEN:
+            rejected.append({"start": s["start"], "end": s["end"],
+                             "reason": "too_long"})
+        else:
+            kept.append(s)
+    # Gate.
+    nw_a = norm_words(a_words)
+    nw_b = norm_words(b_words)
+    gated = []
+    for s in kept:
+        passed, ev = _gate_slot(s, a_words, nw_a, b_words, nw_b,
+                                candidates, desc_sponsors, house_plugs,
+                                own_domains)
+        if passed:
+            s = dict(s)
+            s["evidence"] = ev
+            gated.append(s)
+        else:
+            rejected.append({"start": s["start"], "end": s["end"],
+                             "reason": "no_ad_evidence"})
+    result["rejected"] = rejected
+    # Slot-share guard.
+    total_slot_s = sum(s["end"] - s["start"] for s in gated)
+    if a_duration and total_slot_s > SLOT_GUARD_MAX_SLOT_SHARE * a_duration:
+        guards.append("slot_share")
+    if guards:
+        log(f"  slot sanity guard tripped ({', '.join(guards)}); "
+            "slots rejected")
+        result["status"] = "slots_rejected"
+        result["guards"] = guards
+        result["slots"] = gated  # kept for review, not merged
+        _cleanup_b_mp3(b_mp3)
+        _write_align_result(work, a_sha256, b_sha256, aligned, gated,
+                            rejected, guards)
+        return result
+    if not gated:
+        log("  no gated slots; detector-only output")
+        result["status"] = "no_slots"
+        _cleanup_b_mp3(b_mp3)
+        _write_align_result(work, a_sha256, b_sha256, aligned, gated,
+                            rejected, guards)
+        return result
+    # Name gated slots (A-side evidence only), then merge.
+    for s in gated:
+        s["label"] = _slot_name_from_mentions(s, a_words, nw_a,
+                                              desc_sponsors, house_plugs)
+    merged, sources = _merge_slots(blocks, gated, a_words, candidates,
+                                   sponsors, house_plugs)
+    result["status"] = "slots"
+    result["blocks"] = merged
+    result["sources"] = sources
+    result["slots"] = gated
+    _cleanup_b_mp3(b_mp3)
+    _write_align_result(work, a_sha256, b_sha256, aligned, gated,
+                        rejected, guards)
+    return result
+
+
+def _dynamic_flag_status(pcfg, state):
+    """Decide whether this feed needs a probe (DESIGN.md section 1).
+    Returns (mode, value): ('config', bool) when podcasts.yaml sets
+    dynamic_ads; ('flag', bool) when state holds a fresh (<=30d) probe
+    flag; (None, None) when a probe is needed."""
+    if pcfg and "dynamic_ads" in pcfg:
+        return "config", bool(pcfg["dynamic_ads"])
+    rec = state.get("dynamic_ads") or {}
+    checked = rec.get("checked")
+    if rec.get("status") is not None and checked:
+        try:
+            age = (date.today() - date.fromisoformat(checked)).days
+        except ValueError:
+            age = None
+        if age is not None and age <= SLOT_PROBE_RECHECK_DAYS:
+            return "flag", bool(rec["status"])
+    return None, None
+
+
+def _record_dynamic_flag(state, status, probe_episode, source):
+    state["dynamic_ads"] = {
+        "status": bool(status), "checked": date.today().isoformat(),
+        "probe_episode": probe_episode, "source": source,
+        "consecutive_no_slots": 0,
+    }
+
+
+def _run_dynamic_for_episode(item, pcfg, state, work, mp3_path, words,
+                             duration, sponsors, desc_sponsors,
+                             own_domains, candidates, blocks):
+    """Probe/flag/config logic + B flow for one episode (DESIGN.md
+    sections 1-2, 9). Returns a dict with the blocks to publish
+    (merged or detector-only), their sources, and the per-episode
+    dynamic fields for the state entry and report."""
+    prev = state.get("processed", {}).get(item["guid"], {})
+    attempts = prev.get("dynamic_attempts", 0)
+    mode, value = _dynamic_flag_status(pcfg, state)
+    info = {"dynamic_status": "static", "dynamic_slots": [],
+            "dynamic_slots_rejected": [], "dynamic_attempts": attempts,
+            "dynamic_pending": False, "b_sha256": None,
+            "b_duration": None, "differing_token_rate": None,
+            "n_anchors": None, "blocks": blocks,
+            "sources": ["detector"] * len(blocks)}
+    if mode in ("config", "flag") and not value:
+        return info  # static feed; nothing to do
+    a_sha256 = sha256_file(mp3_path)
+    b_mp3 = os.path.join(work, "B", "original.mp3")
+    if mode is None:
+        # Probe: one second download, byte-compare (DESIGN.md section 1).
+        log("  probing feed for dynamic ads (second download)")
+        try:
+            if os.path.exists(b_mp3):
+                os.remove(b_mp3)
+            download(item["audio_url"], b_mp3, retries=3)
+        except Exception as exc:
+            log(f"  probe download failed ({exc!r}); detector-only output")
+            flow = {"status": "b_failed", "blocks": blocks,
+                    "sources": ["detector"] * len(blocks),
+                    "slots": [], "rejected": [], "b_sha256": None,
+                    "b_duration": None, "differing_token_rate": None,
+                    "n_anchors": None}
+        else:
+            b_sha256 = sha256_file(b_mp3)
+            if b_sha256 == a_sha256:
+                log("  probe: second download is byte-identical; "
+                    "feed is static")
+                _cleanup_b_mp3(b_mp3)
+                _record_dynamic_flag(state, False, item["title"], "probe")
+                info["b_sha256"] = b_sha256
+                return info
+            log("  probe: second download differs; feed is dynamic")
+            _record_dynamic_flag(state, True, item["title"], "probe")
+            flow = run_slot_flow(work, words, duration, mp3_path, a_sha256,
+                                 item["audio_url"], sponsors, desc_sponsors,
+                                 HOUSE_PLUGS, own_domains, candidates, blocks,
+                                 b_mp3_path=b_mp3)
+    else:
+        # Dynamic by config or fresh flag: run the B flow (it downloads).
+        flow = run_slot_flow(work, words, duration, mp3_path, a_sha256,
+                             item["audio_url"], sponsors, desc_sponsors,
+                             HOUSE_PLUGS, own_domains, candidates, blocks)
+    # Fold the flow result into the per-episode record.
+    info["dynamic_status"] = flow["status"]
+    info["dynamic_slots"] = flow.get("slots", [])
+    info["dynamic_slots_rejected"] = flow.get("rejected", [])
+    info["b_sha256"] = flow.get("b_sha256")
+    info["b_duration"] = flow.get("b_duration")
+    info["differing_token_rate"] = flow.get("differing_token_rate")
+    info["n_anchors"] = flow.get("n_anchors")
+    info["blocks"] = flow.get("blocks", blocks)
+    info["sources"] = flow.get("sources", ["detector"] * len(blocks))
+    # Attempts / pending (DESIGN.md section 9).
+    if flow["status"] == "b_failed":
+        attempts += 1
+        info["dynamic_attempts"] = attempts
+        info["dynamic_pending"] = attempts < SLOT_MAX_ATTEMPTS
+        if not info["dynamic_pending"]:
+            log("  B download failed 3 times; giving up on this episode")
+    else:
+        info["dynamic_attempts"] = 0
+        info["dynamic_pending"] = False
+    # No-slots streak: three consecutive dynamic-flagged episodes with
+    # no slots clears the flag, so the next episode re-probes. (Config
+    # feeds have no flag to clear.)
+    rec = state.get("dynamic_ads")
+    if rec and mode == "flag":
+        if flow["status"] == "no_slots":
+            streak = rec.get("consecutive_no_slots", 0) + 1
+            rec["consecutive_no_slots"] = streak
+            if streak >= 3:
+                log(f"  no slots in {streak} consecutive dynamic "
+                    "episodes; clearing the dynamic flag "
+                    "(next episode re-probes)")
+                state.pop("dynamic_ads", None)
+        elif flow["status"] == "slots":
+            rec["consecutive_no_slots"] = 0
+    return info
+
+
+def slots_only_mode(slug, items, channel_link):
+    """Standalone slot inspection (DESIGN.md section 10): print the
+    gated slots for one already-processed episode as a manual-marking
+    aid. Writes no pipeline state and publishes nothing (the B
+    transcript and align_result.json caches may be written; state.json
+    is not)."""
+    item = None
+    for it in items:
+        s = re.sub(r"[^a-z0-9]+", "-", it["title"].lower()).strip("-")[:60]
+        if s == slug:
+            item = it
+            break
+    if not item:
+        raise SystemExit(f"no episode with slug {slug!r} in the feed")
+    work = os.path.join(EP_DIR, slug)
+    mp3_path = os.path.join(work, "original.mp3")
+    if not os.path.exists(mp3_path):
+        raise SystemExit(f"no A download at {mp3_path}; "
+                         "process the episode first")
+    words = []
+    for f in sorted(glob.glob(os.path.join(work, "chunk_*.json"))):
+        words += [tuple(w) for w in json.load(open(f))["words"]]
+    if not words:
+        raise SystemExit("no A transcript cache; process the episode first")
+    duration = probe_duration(mp3_path)
+    sponsors = extract_sponsors(item["description"])
+    desc_sponsors = list(sponsors)
+    sponsors += [dict(p) for p in HOUSE_PLUGS]
+    own_domains = extract_own_domains(item["description"], channel_link,
+                                      desc_sponsors)
+    silences = find_silences(mp3_path, work, min_dur=0.8)
+    existing_ms = read_chapters(mp3_path)
+    id3_chapters = [(ms / 1000.0, t) for ms, t in existing_ms]
+    chapters = _merge_chapters(id3_chapters, item.get("rss_chapters", []))
+    candidates_out = []
+    blocks, _suspects = detect_ad_blocks(words, sponsors, silences, mp3_path,
+                                         chapters, own_domains=own_domains,
+                                         candidates_out=candidates_out)
+    a_sha256 = sha256_file(mp3_path)
+    flow = run_slot_flow(work, words, duration, mp3_path, a_sha256,
+                         item["audio_url"], sponsors, desc_sponsors,
+                         HOUSE_PLUGS, own_domains, candidates_out, blocks)
+    print(f"episode: {item['title']}")
+    print(f"dynamic status: {flow['status']}")
+    for s in flow.get("slots", []):
+        print(f"  slot {s['start']:.1f}-{s['end']:.1f} "
+              f"({s['end'] - s['start']:.1f}s, evidence {s.get('evidence')}, "
+              f"label {s.get('label')})")
+    for r in flow.get("rejected", []):
+        print(f"  rejected {r['start']:.1f}-{r['end']:.1f}: {r['reason']}")
+    if flow["status"] == "slots":
+        print("merged blocks:")
+        for (s, e, l, _ss, _es), src in zip(flow["blocks"],
+                                            flow["sources"]):
+            print(f"  {s:.1f}-{e:.1f} {l} [{src}]")
+
+
+def process_episode(item, state, channel_link=None, pcfg=None):
     slug = re.sub(r"[^a-z0-9]+", "-", item["title"].lower()).strip("-")[:60]
     work = os.path.join(EP_DIR, slug)
     os.makedirs(work, exist_ok=True)
@@ -2706,13 +3286,24 @@ def process_episode(item, state, channel_link=None):
     chapters = _merge_chapters(id3_chapters, item.get("rss_chapters", []))
     if chapters:
         log(f"{len(chapters)} chapters available for chapter-marker detection")
+    candidates_out = []  # raw method segments, for the dynamic-slot gate
     blocks, suspects = detect_ad_blocks(words, sponsors, silences, mp3_path,
-                                        chapters, own_domains=own_domains)
+                                        chapters, own_domains=own_domains,
+                                        candidates_out=candidates_out)
     # Missed-sponsor check covers description sponsors only: a house plug
     # not mentioned in a given episode is normal, not a miss.
     missed = check_missed_sponsors(words, desc_sponsors, blocks)
     if not sponsors:
         log("no sponsors listed in description; sponsor-independent detection only")
+
+    # Dynamic slots (2026-11-11, DESIGN.md): second-download alignment
+    # as a boundary source for dynamic ads. Runs after A detection,
+    # before chapter building; any B failure degrades to detector-only.
+    dyn = _run_dynamic_for_episode(
+        item, pcfg, state, work, mp3_path, words, duration, sponsors,
+        desc_sponsors, own_domains, candidates_out, blocks)
+    blocks = dyn["blocks"]
+    block_sources = dyn["sources"]
 
     # Chapters model (2026-10-28, per the owner): no cutting. The published
     # file is the full original episode with detected ads marked as
@@ -2754,22 +3345,31 @@ def process_episode(item, state, channel_link=None):
         return None
 
     state_blocks = []
-    for s, e, l, ss, es in blocks:
+    for (s, e, l, ss, es), src in zip(blocks, block_sources):
         name = ad_chapter_name(l, sponsors)
         title = chapter_for_block(s) or (
             f"Muse Detected Ad For {name}" if name else "Muse Detected Ad")
         state_blocks.append({"start": s, "end": e, "sponsor": l,
                              "seconds": e - s, "chapter": title,
-                             "start_sharpness": ss, "end_sharpness": es})
+                             "start_sharpness": ss, "end_sharpness": es,
+                             "source": src})
     report = {
         "title": item["title"], "pubDate": item["pubDate"],
         "original_seconds": duration, "duration_seconds": marked_dur,
         "blocks": [{"start": s, "end": e, "sponsor": l,
-                    "start_sharpness": ss, "end_sharpness": es}
-                   for s, e, l, ss, es in blocks],
+                    "start_sharpness": ss, "end_sharpness": es,
+                    "source": src}
+                   for (s, e, l, ss, es), src in zip(blocks, block_sources)],
         "ad_chapters": [{"start": s, "end": e, "title": t} for s, e, t in ad_spans],
         "missed_sponsors": missed,
         "suspects": [{"start": s, "end": e, "label": l} for s, e, l in suspects],
+        "dynamic_status": dyn["dynamic_status"],
+        "dynamic_slots": dyn["dynamic_slots"],
+        "dynamic_slots_rejected": dyn["dynamic_slots_rejected"],
+        "dynamic_b_sha256": dyn["b_sha256"],
+        "dynamic_b_duration": dyn["b_duration"],
+        "differing_token_rate": dyn["differing_token_rate"],
+        "dynamic_n_anchors": dyn["n_anchors"],
     }
     with open(os.path.join(work, "report.json"), "w") as f:
         json.dump(report, f, indent=2)
@@ -2782,6 +3382,11 @@ def process_episode(item, state, channel_link=None):
         "ads_marked_seconds": sum(e - s for s, e, *_ in blocks),
         "duration_seconds": marked_dur,
         "blocks": state_blocks,
+        "dynamic_status": dyn["dynamic_status"],
+        "dynamic_slots": dyn["dynamic_slots"],
+        "dynamic_slots_rejected": dyn["dynamic_slots_rejected"],
+        "dynamic_attempts": dyn["dynamic_attempts"],
+        "dynamic_pending": dyn["dynamic_pending"],
         "missed_sponsors": [m["label"] for m in missed],
         "suspects": [{"label": l, "seconds": e - s} for s, e, l in suspects],
         "suspects_reel": suspects_reel_name,
@@ -2799,6 +3404,10 @@ def main():
                     help="podcast id from podcasts.yaml")
     ap.add_argument("--limit", type=int, default=0,
                     help="process at most N newest unprocessed episodes (0 = no limit)")
+    ap.add_argument("--slots-only", default=None, metavar="SLUG",
+                    help="print the gated dynamic slots for one already-"
+                    "processed episode (slug as in the work dir) and exit; "
+                    "writes no pipeline state and publishes nothing")
     args = ap.parse_args()
 
     cfg, pcfg = init_podcast(args.podcast)
@@ -2808,6 +3417,25 @@ def main():
     items = parse_items(xml)
     channel_link = parse_channel_link(xml)
     log(f"feed has {len(items)} items")
+    if args.slots_only:
+        slots_only_mode(args.slots_only, items, channel_link)
+        return
+    # Dynamic-slot B-download retry (DESIGN.md section 9): episodes
+    # whose B flow failed get retried before new episodes are processed.
+    pending = [(g, ep) for g, ep in state["processed"].items()
+               if ep.get("dynamic_pending")
+               and ep.get("dynamic_attempts", 0) < SLOT_MAX_ATTEMPTS]
+    if pending:
+        by_guid = {it["guid"]: it for it in items}
+        for guid, ep in pending:
+            item = by_guid.get(guid)
+            if not item or not item.get("audio_url"):
+                continue
+            log(f"retrying B flow for pending episode: {item['title']}")
+            try:
+                process_episode(item, state, channel_link, pcfg)
+            except Exception as exc:
+                log(f"FAILED retry on {item['title']}: {exc!r}")
     new_items = [it for it in reversed(items)
                  if it["guid"] and it["guid"] not in state["processed"] and it["audio_url"]]
     if args.limit:
@@ -2818,7 +3446,7 @@ def main():
     for item in new_items:
         log(f"processing: {item['title']}")
         try:
-            process_episode(item, state, channel_link)
+            process_episode(item, state, channel_link, pcfg)
         except Exception as exc:
             log(f"FAILED on {item['title']}: {exc!r}")
             # leave unprocessed so a later run retries
