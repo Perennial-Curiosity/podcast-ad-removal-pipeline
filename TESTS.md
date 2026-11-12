@@ -1499,6 +1499,18 @@ gaps, both verified BetterHelp ads** (77.9s and 62.9s), VTT and SRT
 identical. Graceful degradation verified both ways (no tag →
 skipped; transcript-includes-ads → 0 gaps).
 
+**Listening check (owner, 2026-11-11, Cabinet of Curiosities
+873/874/875, 9 clips).** Verdict: a smashing success. 875: ad 1 a
+few ms short at the end, ad 2 perfect, ad 3 missing a word or two at
+the start. 874: all three perfect. 873: all three ~0.25s short at
+the end. Edges are already inside the 1–2s goal; the ~0.25s
+short-at-end pattern on 873 is a possible future refinement (a small
+end pad), not a defect to fix now. Owner's observation: the mid-roll
+on all three episodes is a host-read ad — the publisher transcript
+omits host-read reads too, not just dynamic insertions — so the
+differential may be a general ad detector for transcript-carrying
+shows. That hypothesis is untested beyond this show.
+
 **Conclusion.** Implemented and ready to merge. Merge waits until
 the dynamic-slot validation driver finishes, so the slot validation
 stays pure — same hold as entry 22.
