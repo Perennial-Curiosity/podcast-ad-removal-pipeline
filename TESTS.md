@@ -1765,6 +1765,86 @@ to a 60–90 minute multi-speaker episode with disfluencies written into
 the script, a room-tone bed mixed under the TTS, and 6–8 same-voice
 host-read ads; a Kokoro revisit (better prosody) after that.
 
+## 30. Brand-orphan split into per-mention clusters — DISCARD at all three gaps (2026-11-12)
+
+**Reason it was a candidate.** The synthetic-episode test (entry 28)
+showed 4 of its 5 misses trace to one defect: `_method_brand_orphan`
+builds one segment per sponsor spanning first-to-last mention across
+the whole episode and silently drops it when the span exceeds
+`MAX_AD_LEN` (720s). Splitting mentions into clusters — one orphan
+segment per cluster — should recover multi-ad sponsors without the
+episode-wide drop.
+
+**Methodology.** Gap derived from data, not guessed: 1,372
+same-sponsor gaps on the 25-episode SponsorBlock set (median 10.7s,
+71.6% under 30s, then a flat tail with no sharp valley — dense mentions
+inside a read, sparse mentions across ads); the synthetic episode's 128
+gaps show a clean valley at 90–180s. Gaps 60/120/180s tested; 120s is
+the distribution-supported gap and also guarantees no same-sponsor
+cluster overlap (max padding + snap 102s < 120s), so split segments can
+never double-vote the heat map. Baseline reproduced exactly first
+(`combined_repro19`: recall 0.673, median 4.7s, mean 12.0s, within-1s
+26.4%, FP 36, missed 35). Frozen records: `ab/orphan_split60/120/180/`,
+`orphan_split/` (120, canonical), `combined_repro19/`,
+`orphan_split_gap.json`, `orphan_split_deltas.txt`.
+
+**Results (verified against the frozen `results.json` files).**
+
+| Gap | Recall | Matched | Missed | FP | Median | Mean | Within-1s | Within-2s | Max |
+|-----|--------|---------|--------|----|--------|------|-----------|-----------|-----|
+| baseline | 0.673 | 72 | 35 | 36 | 4.7s | 12.0s | 26.4% | 37.5% | 79.3s |
+| 60 | 0.710 | 76 | 31 | 63 | 4.9s | 14.1s | 25.0% | 35.5% | 120.7s |
+| 120 | 0.729 | 78 | 29 | 60 | 4.9s | 17.8s | 24.4% | 35.3% | 529.9s |
+| 180 | 0.738 | 79 | 28 | 55 | 5.6s | 15.2s | 24.1% | 34.8% | 269.4s |
+
+The recall gain (+4 to +7 labels) is real, but every gap fails the
+decision rule on three of its four conditions: median worse, within-1s
+down, FP up +53% to +75% (allowance ~10%). Common-set per-edge deltas
+are net worse at every gap (120s: 4 better / 7 worse / 131 same of
+142), and the gained labels carry bad edges — the 529.9s max error at
+gap 120 is a 552-second "Civil War History" block matched against a
+19-second label.
+
+**Why it fails — the mechanism, verified in the logs.** The old
+MAX_AD_LEN drop was load-bearing as a noise suppressor. Sponsors whose
+mentions span the whole episode are usually being discussed as content
+(guest names, ordinary words, the show's own topic), not running 3
+ads. Splitting emits orphan segments for every content-discussion
+sponsor — "David" blocks all over Huberman motivation, "material"
+blocks on SN 1099, "RIDGE" blocks on 287 — and each pairs with
+reverb/cluster/voice to form marked blocks. The trade-off exists at
+every gap; more data would not resolve it (systematic).
+
+**Secondary checks (all at gap 120).** 286/287: 17/17 at ≥50% holds
+(9/9 and 8/8; caught80 7/9 and 6/8 unchanged), but over-mark explodes
+— 286: 17.8→76.2s, false 0→1 (a Patreon block); 287: 41.2→300.8s,
+false 1→4 (three new RIDGE blocks). SN 1101: 6 blocks in both runs,
+identical spans and labels. SN 1103 Hoxhunt: block identical in
+baseline and variant (440–616.4s); the orphan method emits nothing on
+1103 in either run — `find_mentions` finds zero Hoxhunt mentions (the
+transcript says "hawkshunt") — so the orphan-flip constraint is
+satisfied trivially and the block stays caught. Synthetic episode:
+caught50 22→24/27, caught80 18→21/27; recovered one Coca-Cola (≥50%),
+Stop Box and Perfect Jean (≥80%); still missed one Coca-Cola and Leaf
+Filter; **two regressions** (Ridge 1.00→0.00 — a stray "stop" substring
+hit stole the block's label and capped it to the Stop Box span;
+SuperPower 0.98→0.00 — the Stop Box + SuperPower fusion split kept
+only the Stop Box half). FP 3→5; median 2.55→3.56s. Null episode
+identical (8 blocks); TTS pilot identical (2/3, 0 FP). **Substring
+pollution (recorded, not fixed here):** Stop Box's five singleton stray
+"stop" hits each became a 90-second orphan segment; two caused real
+harm (the Ridge theft and a 593.1–653.1s false block). The split
+amplifies the substring leak: previously a stray hit only stretched the
+episode-wide span toward a drop; now each stray hit becomes its own
+voting segment.
+
+**Conclusion: DISCARD at all three gaps.** Variant code removed
+entirely from the harness; `run_pipeline.py` never touched; no patch
+written (nothing to apply). A possible future direction is noted, not
+attempted: gate orphan segments on corroboration — a cluster only votes
+if it has ≥2 mentions or ad evidence (CTA/URL/duplicate) nearby — to
+separate "sponsor in 3 ads" from "sponsor discussed as content."
+
 ---
 
 ## Earlier rejected ideas — one-line index
