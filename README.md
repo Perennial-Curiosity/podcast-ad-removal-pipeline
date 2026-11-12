@@ -221,7 +221,11 @@ Notes:
   published copy and chapters live on the A clock. Each slot must
   pass an evidence gate (a detector method segment overlapping it,
   a sponsor mention inside it, or a brand + URL/CTA in the B-side
-  copy) and is named from A-side evidence only. A gated slot
+  copy) and is named from A-side evidence only. Exception (2026-11-11,
+  owner): a feed carrying `podcast:transcript` tags skips the second
+  download entirely — the publisher transcript is already a second
+  transcript to compare against; an explicit `dynamic_ads: true` in
+  `podcasts.yaml` beats the exception. A gated slot
   overlapping a detector block takes the slot's edges + the
   detector's label (no refinement on slot edges); a slot with no
   detector block becomes a new chapter; slot blocks bypass the
