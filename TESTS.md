@@ -1845,6 +1845,120 @@ attempted: gate orphan segments on corroboration — a cluster only votes
 if it has ≥2 mentions or ad evidence (CTA/URL/duplicate) nearby — to
 separate "sponsor in 3 ads" from "sponsor discussed as content."
 
+## 31. Substring-leak fix in find_mentions (word-boundary guard) — KEEP the single-letter guard (2026-11-12)
+
+**Reason it was a candidate.** `find_mentions` matched short brand
+variants (<6 chars) as a bare substring anywhere inside a transcript
+word (`if v in w`, line 669). Verified consequences: "aura" inside
+"restaurant" (13 mentions) produced a cluster-popular "Aura" segment
+and a wrongly labeled "Aura" block on the synthetic episode's Coca-Cola
+ad; "stop" inside "Christopher"/"stopping" produced phantom "Stop
+Box" mentions (the missed-sponsor check counts 7, only 2 real). Same
+leak class as the 287 Factor bug the code already comments on.
+
+**Methodology.** Three guard forms tested in the harness; baseline
+reproduced exactly first (`combined_repro20`: recall 0.673, median
+4.7s, mean 12.0s, within-1s 26.4%, FP 36, missed 35). The guard
+requires a word boundary on both sides: **before** — start of token or
+a non-alphanumeric char; **after** — end of token, a non-alphanumeric
+char, a plural/possessive suffix, or a **single-letter remainder** (the
+token is the variant plus one letter — a spelling/transcription variant
+of the brand, the short-variant analogue of the len≥6 fuzzy path's
+≥0.85 ratio). A multi-letter remainder (`sleeping`, `seeding`) still
+fails. The len≥6 exact/fuzzy path, split-compound branch, and
+multi-word path are untouched. The **simple** guard (boundary only)
+and the **prefix** guard (+ marketing-prefix allowance for
+`drinkag1`/`drinklmnt`/`takeultra`) were also tested; the prefix form
+was identical to the simple guard on every measurement — its 22
+recovered hits are redundant because the full variants (`drinkag1`,
+`drinklmnt`, len≥6) already match those tokens exactly.
+
+**Removed-vs-kept hits (25-episode set).** Short-path hits **698 →
+481 (217 removed, 31.1%), all phantom**: `aura` 10→0 (all `restaurant`
+forms), `mitt` 48→0 (`committee`, `committed`, `permitted`,
+`transmitting`, `intermittent`, `neurotransmitter` — zero real hits),
+`ridge` 15→9 (removed 6: `cartridge(s)` + `bridger`, all content
+words), `ag1` 103→85 (removed 18, all `drinkag1`), `sleep` 170→121,
+`lmnt` 2→0 (both `drinklmnt`). Kept: exact 360, plural/possessive 20,
+URL/hyphen/punctuation 101. The single-letter allowance re-admits only
+4 hits beyond the simple guard (`sleepy` ×2, `placed` ×2) — and
+recovers `noble` ×3 on 286 (see below). Self-test: 37/37 boundary
+cases pass; full-function diff vs the original removes 14 hits, adds 0.
+
+**Results (verified against the frozen `results.json` files).** All
+three guard forms are identical on the SponsorBlock set:
+
+| | Recall | Matched | Missed | FP | Median | Mean | Within-1s | Within-2s | Max |
+|---|---|---|---|---|---|---|---|---|---|
+| Baseline | 0.673 | 72 | 35 | 36 | 4.7s | 12.0s | 26.4% (38/144) | 37.5% | 79.3s |
+| Guard | **0.682** | **73** | **34** | **35** | 4.7s | 12.4s | **26.7%** (39/146) | 37.7% | 84.9s |
+
+Common-set per-edge deltas: **0 better / 0 worse / 144 same**. 1 label
+gained (Huberman Rorra 926–1097.6 — phantom `sleep` hits in the ad's
+tail had voted for Helix Sleep, leaving the Rorra URL evidence a
+single-vote suspect), 0 lost. The mean/max worsening is a composition
+artifact of the gained label's +24s start edge.
+
+**Secondary checks.** 286/287: the simple and prefix guards **lose
+the NOBL ad on 286** (9/9 → 8/9, coverage 606.7 → 547.6s) — Whisper
+renders NOBL as `noble` (3×)/`nobles` (1×). The **single guard
+recovers it: 286 9/9, 7/9 at ≥80%, coverage 606.7/673s, over-mark
+17.8s, false 0 — identical to baseline**. 287 identical under all
+forms (8/8, 6/8, 463.0/531s, false 1 = Pepperbox). **17/17 at ≥50%
+holds.** SN 1101: 6 blocks, identical spans and labels under all four
+implementations. SN 1103 Hoxhunt: block identical 440–616.4s (labeled
+`hawkshunt`) under all forms; all 6 blocks identical. Orphan-flip
+constraint satisfied. Synthetic episode (single guard): caught50/80
+**22/27 + 18/27 unchanged**, FP 3, median 2.55s, mean **7.95 →
+6.82s**. The **"Aura" mislabel on the 874 Coca-Cola ad is gone**
+(baseline block 1020.0–1104.8 labeled `Aura`, start error −55.5s →
+single block 1066–1106 labeled `dry-island`, start error −9.6s; the
+one within-1s loss, 8→7 edges, is that block's end edge 0.8 → 2.0s).
+Simple guard loses NOBL here too (cov 0.74 → 0.00, plus a `nobletravel`
+FP fragment). Ridge label unchanged (`rich` — a Whisper mishearing of
+the ridge.com URL, not a leak artifact). Stop Box fusion unchanged
+(still missed). Null episode: 8 blocks under all forms, but the
+**"Aura" block (800–830s) is gone** under all three guards (replaced by
+a reverb/voice `dry-island` block 760–831s). TTS pilot: identical 2/3,
+0 FP under all forms. Missed-sponsor counts (synthetic): Stop Box **7
+→ 4** (2 real + 2 genuine standalone `stop` in PC20 content; removed:
+`stopping` ×2, `Christopher` ×1), Aura **14 → 0** (13 `restaurant`
+forms + `laura`). On 287 itself: 2 → 2 (no phantoms there).
+
+**Decision-rule status — stated plainly.** The variant **fails the
+letter of the decision rule on the median (4.7 → 4.7s, flat)** —
+because zero existing edges move (0/0/144 on the common set), the
+median structurally cannot move. Every other condition passes
+(within-1s up, recall up, FP down), and the fix removes
+provably-false evidence with **zero regressions on any check**. It is
+kept as a **correctness fix**, not a detection improvement, and the
+median caveat is recorded here and in the module docstring. More data
+would not change the median (the fix's SB-edge effect is structurally
+zero). The simple guard is discarded (loses NOBL); the prefix variant
+is discarded (redundant). Loser wiring was removed from
+`ab_detect.py`; `ab/substring_fix.py` holds the final guard only, and a
+post-cleanup 1103 re-run reproduces the frozen blocks exactly.
+
+**Out of scope:** the multi-word path in the same function
+(`all(toks[j] in nw[i+j]...)`, ~line 674) uses the same per-token `in`
+pattern but requires consecutive tokens — far smaller leak surface;
+deliberately left alone. (The Stop Box phantoms came through the short
+path — its variants include the single token `stop` — so the patch
+covers the measured defects.)
+
+**Patch (merge held — do NOT apply yet).** `tmp/substring_fix_patch.diff`
+adds `_boundary_match()` and changes only the short-variant branch of
+`find_mentions` (+1 docstring line). Verified: `patch --dry-run` clean,
+patched copy compiles, its `find_mentions` is identical to the tested
+harness variant, 30/30 boundary cases pass. `run_pipeline.py` was
+never touched (the original `if v in w:` is still at line 669). The
+merge waits for the dynamic-slot validation driver to finish, like the
+recurrence, transcript-differential, and orphan-split merges. Frozen
+records: `ab/combined_repro20/`, `ab/substring_fix_single/` (kept),
+`ab/substring_fix.py`, `ab/analyze_substring_fix.py`,
+`ab/check_substring_fix_286_287_1101.py` + `.log`,
+`ab/check_substring_fix_synth_tts.py` + `.log`.
+
 ---
 
 ## Earlier rejected ideas — one-line index
