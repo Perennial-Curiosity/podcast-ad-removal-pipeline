@@ -26,7 +26,7 @@ That precision is the goal. Finding the ad is only step one.
 
    Two or more methods agreeing is high confidence. Some strong single methods also count.
 
-   On feeds that serve different ads per download, a second pass downloads the episode again and compares the two transcripts: the regions that differ are inserted ads. A differing region is only marked when ad evidence backs it. Where a slot overlaps a detected block, the slot's edges replace the detector's edges.
+   On feeds that serve different ads per download, a second pass downloads the episode again and compares the two transcripts: the regions that differ are inserted ads. A differing region is only marked when ad evidence backs it. Where a slot overlaps a detected block, the slot's edges replace the detector's edges. If the feed already supplies a transcript, no second download is made; the publisher transcript is the comparison instead.
 
 4. **Refine the edges** — Move each start and end inward to the nearest real evidence: the first and last brand mention, call to action, or URL inside the block. Starts stay where the opening cue is — cues come before brand names. Each edge also gets a confidence score (see edge sharpness below).
 
