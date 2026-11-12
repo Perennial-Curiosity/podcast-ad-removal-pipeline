@@ -1574,6 +1574,59 @@ carry paid sponsor reads.
 
 ---
 
+## 27. Phonetic vote inside blocks — DISCARD both gates (2026-11-12)
+
+**Reason.** The phonetic redesign (entry 14) failed because its hits
+flipped sponsors from the wide orphan path to the narrow brand path.
+The redesign's own record suggested the remaining use: phonetic hits
+only as a vote inside already-detected blocks, never creating
+segments. The owner approved testing it.
+
+**Methodology.** Harness only; baseline reproduced exactly first
+(combined_repro18, all deltas 0.0). Hit finder reused from the
+redesign (Soundex + LCS, |length diff| ≤ 2). Post-processing on
+detected blocks: a phonetic match of the block's own sponsor within
+60s outside an edge extends that edge to the hit. Two gates: A
+(both edges, any hit), B (end edges only, hit must have a
+phonetically-matching URL stem nearby). Offline simulation first,
+then full 25-episode runs.
+
+**Results vs baseline (recall 0.673, median 4.7s, mean 12.0s,
+within-1s 26.4%, FP 36, missed 35):**
+- A: recall 0.673→0.682 (72→73 matched, missed 35→34, FP 36→35),
+  median flat 4.7s, mean 12.0→12.3s, within-1s 26.4%→26.0% (38
+  edges, count flat), within-2s 37.5%→37.0%. Per-edge: 1 better /
+  3 worse / 140 same. The 1 better edge is the SN 1099 Bitwarden
+  end (29.9→21.2s). The 3 worse are content collisions pushing
+  already-early starts further out — Modern Wisdom Sydney Sweeney
+  Whoop start 8.3→10.4s, Willpower Momentous 7.3→10.8s, SN 1096
+  Material 26.0→74.5s ('mature' ~ 'material', 48.5s before the
+  block). The "gained" label is a reclassification, not a new
+  detection (a baseline FP block extended to 62% overlap with a
+  −22.1s end error). 6 firings total.
+- B: every headline identical to baseline; 1 better / 0 worse /
+  143 same (the same SN 1099 Bitwarden end). 2 firings.
+- SN 1103 Hoxhunt (the motivating case): block identical in
+  baseline and both variants (440–616.4s) — the 'hawkshunt' hits
+  sit inside the block already, so there is nothing outside to
+  extend toward.
+
+**Conclusion.** DISCARD both — the decision rule fails on median
+(flat in both) and on within-1s (down in A). B's single better edge
+is the same one the closing-URL fallback (entry 3) already fixes
+better (−29.9→−8.5s), and that fallback was discarded as
+unmeasurable on 25 episodes. More data would not resolve this: the
+firing rate (6 in 25 episodes) is too low for the median to move,
+and the harm mechanism (a phonetic collision just outside an early
+edge) is systematic. The phonetic idea in this form is closed:
+hits are real evidence of a URL tail, but there is nowhere useful
+left for them to vote — the orphan merge already extends blocks to
+the tail hits that matter, and the remaining outside hits are
+collisions. Variant code removed entirely; `ab/phonetic_vote.py`
+kept as the test record; `run_pipeline.py` never touched.
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
