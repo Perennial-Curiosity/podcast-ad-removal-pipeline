@@ -282,6 +282,12 @@ def parse_items(xml):
             "description": tag("description"),
             "audio_url": enc.group(1) if enc else "",
             "rss_chapters": _parse_rss_chapters(body),
+            # Transcript rule (2026-11-11, owner): a feed carrying
+            # podcast:transcript tags already has a second transcript
+            # to compare against, so the dynamic-slot second download
+            # is skipped for the whole podcast (see main() and
+            # _run_dynamic_for_episode).
+            "has_transcript": bool(re.search(r"<podcast:transcript\b", body)),
         })
     return items
 
@@ -3120,6 +3126,21 @@ def _run_dynamic_for_episode(item, pcfg, state, work, mp3_path, words,
             "b_duration": None, "differing_token_rate": None,
             "n_anchors": None, "blocks": blocks,
             "sources": ["detector"] * len(blocks)}
+    # Transcript rule (2026-11-11, owner): a feed carrying
+    # podcast:transcript tags already has a second transcript to compare
+    # against (the future transcript-differential stage), so the
+    # dynamic-slot second download is skipped entirely — no probe
+    # download, no B transcription, no B flow. Podcast-level rule: an
+    # episode without its own tag still gets no B flow. An explicit
+    # dynamic_ads: true in podcasts.yaml beats this (config wins over
+    # auto-detection). The feed may still serve dynamic ads; the B flow
+    # is skipped because the transcript comparison supersedes it.
+    if item.get("feed_has_transcript") and not (mode == "config" and value):
+        log("  feed carries podcast:transcript tags; skipping second "
+            "download (publisher transcript is the comparison)")
+        _record_dynamic_flag(state, False, item["title"], "transcript")
+        info["dynamic_status"] = "transcript"
+        return info
     if mode in ("config", "flag") and not value:
         return info  # static feed; nothing to do
     a_sha256 = sha256_file(mp3_path)
@@ -3415,6 +3436,14 @@ def main():
     state = load_state()
     xml = fetch_feed()
     items = parse_items(xml)
+    # Transcript rule (2026-11-11, owner): a feed carrying
+    # podcast:transcript tags already has a second transcript to compare
+    # against, so the dynamic-slot second download is skipped for the
+    # whole podcast. Feed-level fact, attached to each item so the
+    # B-download retry path sees it too.
+    feed_has_transcript = any(it.get("has_transcript") for it in items)
+    for it in items:
+        it["feed_has_transcript"] = feed_has_transcript
     channel_link = parse_channel_link(xml)
     log(f"feed has {len(items)} items")
     if args.slots_only:
