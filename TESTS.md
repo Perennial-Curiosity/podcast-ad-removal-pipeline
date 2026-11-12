@@ -1517,6 +1517,63 @@ stays pure — same hold as entry 22.
 
 ---
 
+## 26. Publisher-transcript differential on 3 more shows — HYPOTHESIS NOT CONFIRMED beyond Omny (2026-11-11)
+
+**Reason.** The owner's hypothesis from the Omny listening check:
+publishers generally omit ad reads — including host-read ads — from
+their transcripts, so the differential would be a general ad
+detector for transcript-carrying shows. It rested on one show. Test
+it on 2–3 more transcript-carrying shows.
+
+**Methodology.** Discovery first: 20 candidate feeds checked against
+raw feed XML for `podcast:transcript` tags. Most major publishers
+carry none (Planet Money, 99% Invisible, Radiolab, This American
+Life, The Daily, SmartLess, Front Burner, Today in Focus, Tim
+Ferriss, The Rest Is Politics, and more), even though they publish
+transcripts on their websites. Only four confirmed with tags: No
+Agenda (250), Podcasting 2.0 (210), The Bootstrapped Founder (870,
+Transistor), Contracting Officer Podcast (76, not selected — almost
+certainly no ads). Three shows selected, 2 episodes each, most
+recent with tags. Same method as the Omny test: pipeline
+`transcribe_chunked` (base), diff vs publisher transcript, ≥40
+words / ≥10s gaps are candidate ads, cut as clips. Work under
+`tmp/transcript_diff_more/`.
+
+**Results — 0 of 3 shows could test the hypothesis; no candidate ads
+anywhere, no clips cut.**
+- Podcasting 2.0 (nashownotes SRT), Ep 277: 0 gaps, coverage
+  0.8915. Ep 276: ONE gap, 17.1–49.4s, 88 words — a FALSE POSITIVE:
+  show-intro patter; the publisher SRT has a hole in the intro
+  region (block 4 spans 16.6–40.2s with ~10 words). No brand, URL,
+  or code. Both episodes genuinely have no ads (value-for-value
+  show).
+- No Agenda (nashownotes SRT), Eps 1916/1915: NOT transcribed. The
+  saved publisher SRTs were scanned first and CONTAIN the
+  promotional reads (Giggle Coffee Roasters, "visit
+  CoffeeRoasters.com, use code ITM20 for 20% off your first
+  order", 1916 03:18:28; personofmeritcomics.com; Sklazen.com;
+  similar plugs in 1915), so the differential is vacuous by
+  construction — transcribing ~9.6h of audio to confirm 0 gaps
+  would add nothing about the hypothesis. The plugs are
+  donor-business plugs, not paid sponsor reads; either way the show
+  cannot test the hypothesis.
+- The Bootstrapped Founder (Transistor VTT), Eps 439/438: 0 gaps,
+  coverages 0.9647/0.9654. No paid sponsor ads; the PodScan
+  self-plug is in the publisher VTT too.
+
+**Conclusion.** The hypothesis still rests on Cabinet of Curiosities
+alone. What the round established: (1) the differential's
+negative-control behavior is clean — 0 gaps on 4 ad-free episodes;
+(2) nashownotes transcripts are full transcripts of the final audio,
+promotional segments included; (3) a gap is not necessarily an ad —
+a publisher transcript can have holes, which validates the
+corroboration-only design of entry 25. The discriminator is HOW the
+transcript was made (pre-ad vs final-audio), not the publisher. A
+future test needs shows whose transcripts are made pre-ad AND that
+carry paid sponsor reads.
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
