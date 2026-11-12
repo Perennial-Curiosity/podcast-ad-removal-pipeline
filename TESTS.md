@@ -1625,6 +1625,146 @@ the tail hits that matter, and the remaining outside hits are
 collisions. Variant code removed entirely; `ab/phonetic_vote.py`
 kept as the test record; `run_pipeline.py` never touched.
 
+## 28. Synthetic ground-truth episode, spliced (2026-11-12)
+
+**Reason it was a candidate.** The owner has no time to manually mark
+more episodes, so verified labels must come from elsewhere. A synthetic
+episode splices already-verified ads into an ad-free value-for-value
+show: the truth is the splice map itself, exact to the millisecond,
+and the detector runs end to end on real audio.
+
+**Methodology.** Base: Podcasting 2.0 Ep 277 (5494.5s, confirmed ad-free
+value-for-value). Its donation appeal was cut at 4553.92–4825.68 (base
+clock) by keyword scan; the remaining text was verified free of
+donor-read language; cleaned base 5224.537s. 27 inserts: all 26 verified
+ads (9 from Unsubscribe 286, 8 from 287, 9 listening-verified Omny
+Cabinet of Curiosities clips) plus the Pepperbox house plug (287,
+6055–6085) as a 27th insert; the Factor segment was NOT included (owner
+ruled it not an ad). Clips cut at speech boundaries via word timestamps;
+assembled with ffmpeg hard cuts, no crossfades; truth from
+ffprobe-measured durations (6927.957s, 52 pieces). Placement: pre-roll
+(286 Progressive), several mid-rolls, post-roll (286 Perfect Jean),
+one back-to-back pair with zero gap (Stop Box + SuperPower). The
+description was synthesized in real-description style and verified with
+the pipeline's own `extract_sponsors`: all 16 sponsors extract,
+Pepperbox not a sponsor. (One deviation: Stop Box's domain written as
+stopboxusa.com — stopbox.com contains the substring "x.com" and is
+dropped by the pipeline's social-platform skip list.) The detector ran
+unmodified (`transcribe_chunked` base + `detect_ad_blocks`) on the
+synthetic episode and, as a false-positive control, on a null episode
+(cleaned base, no inserts). Artifacts: `tmp/synthetic/` (episode,
+null episode, `truth.json`, `description.txt`, `score_synthetic.json`,
+`NOTES.md`, detect JSONs).
+
+**Results (verified against `score_synthetic.json`).** Recall at ≥50%
+22/27 (0.815); at ≥80% 18/27 (0.667). 21 of 26 ads caught with a block;
+19 with the sponsor named correctly — the Ridge block is labeled
+"rich" (a mishearing of Ridge) and the 874 Coca-Cola block is labeled
+"Aura" (wrong sponsor, see below). Median edge error 2.55s, mean 7.95s,
+within 1s 8/44 (18.2%), within 2s 16/44 (36.4%). Ends beat starts: 6
+of the 8 within-1s edges are end edges; starts skew early (worst
+−60.2s). Pepperbox correctly labeled as a house plug (block overruns
+its end by +29.2s). False blocks: 3 (a content-URL block, a 2.2s
+refinement stump, the Perfect Jean fragment). Null episode: **8 false
+blocks in 87 minutes**, mostly reverb pairing with content URLs or dry
+remote-host audio. All 6 BetterHelp ads caught; Unsubscribe ads 14/17
+at ≥50%.
+
+**The 5 misses, verified reasons.** (1) 875 Coca-Cola (28.4s):
+under-floor — only the duplicate segment covers it, evidence span
+~10s. (2) 873 opening (41.0s): only reverb + voice fire, overlap 20s
+< 30s floor; the three "Coca-Cola" mentions produce no brand segment.
+(3) Leaf Filter 286 (30.7s): refinement collapse — a heat-map block
+did form, but refinement moved its end 5713 → 5642, leaving a 2.2s
+stump, because the block was labeled by a content URL (indexrobot) and
+refinement anchors on the block label's own mentions. (4) Stop Box
+(50.7s): back-to-back fusion — Stop Box + SuperPower fused into one
+heat-map block (reverb island and voice bridge the boundary, the
+SuperPower orphan window reaches back inside Stop Box); cap +
+refinement kept only the SuperPower half. The detector has no
+mechanism to split a fused block. (5) Perfect Jean (104.4s,
+post-roll): the cluster segment was dropped as an unanchored
+single-cluster block because the spoken URL falls 5s outside it; the
+surviving block covers 38%.
+
+**Root cause behind 4 of the 5 misses — brand-orphan MAX_AD_LEN gate.**
+`_method_brand_orphan` computes one segment per sponsor spanning its
+first-to-last mention across the whole episode (±45s padding) and drops
+it when the span exceeds `MAX_AD_LEN` (720s). Coca-Cola (1145s span),
+Leaf Filter (~3270s), Perfect Jean (stray content mentions), and Stop
+Box (stray substring hits) all exceed it and are silently dropped. This
+is the same silent-drop failure mode the orphan method was created to
+prevent (2026-10-14), recurring because the orphan is per sponsor per
+episode, not per ad. **Also found:** substring false matches in
+`find_mentions` (short-variant path, `if v in w`, no guard) — "aura"
+inside "restaurant" (13 mentions) produced the Aura label, and "stop"
+inside "Christopher"/"stopping" produced phantom Stop Box mentions.
+**Also found:** reverb fires almost everywhere on this episode (median
+lateAC 0.306 ≥ 0.25 gate) — a near-constant background vote that pairs
+with any other weak method, behind most null-episode false blocks; and
+refinement can shrink blocks below the floors (2.2s, 11s, 20.1s
+survivors exist).
+
+**Conclusion.** The synthetic set works as a test bed: it found two
+real, fixable defects (orphan episode-wide span; substring leak) and
+confirms the honest reading that spliced ads are easier than real
+host-reads while the base content's URL/brand density is real. No
+detector tuning was done. Next-step candidate (not started, owner
+decision): split the orphan into per-mention-cluster segments instead
+of one episode-wide span.
+
+## 29. In-house TTS pilot episode (2026-11-12)
+
+**Reason it was a candidate.** Spliced ads are a different voice in a
+different room, so they are easier than real host-read ads. An
+AI-generated episode puts the ad in the SAME voice as the show
+content, replicating the hard host-read case, with exact script truth.
+
+**Methodology.** Engine: **Piper 1.8.0** (not Kokoro). Kokoro was tried
+first: attempt 1 failed when pip's temp dir (/tmp, 512 MB tmpfs) filled
+on the 539 MB torch wheel; attempt 2 was a multi-GB CUDA torch stack
+at ~2 MB/s on a CPU-only VM, stopped per the fallback condition.
+Piper installed in under a minute, no torch. Voices:
+`en_US-lessac-medium` (host) and `en_US-amy-medium` (produced ad).
+Proof before building: a 5s sample transcribed by the pipeline's own
+faster-whisper base at word agreement 1.000. Episode 5:06, 1,006
+words, a library summer-reading-program explainer; 3 ads: Ghostbed
+host-read, same voice, 37.34–94.54 (57.2s); Manscaped host-read, same
+voice, 155.22–204.38 (49.2s); Leaf Filter produced-style, different
+voice, 249.44–279.87 (30.4s). Description synthesized and verified —
+all 3 sponsors extract via `extract_sponsors`. Detector run
+unmodified, scored vs `truth.json`. Artifacts: `tmp/tts_pilot/`
+(episode, `truth.json`, `script.txt`, `description.txt`, `detect.json`,
+`score.json`, `NOTES.md`).
+
+**Results (verified against `score.json`).** Recall 2/3 (0.667) at both
+≥50% and ≥80%; **0 false blocks**; 4 of 6 edges matched, within 1s
+1/4, within 2s 2/4, median edge error 2.66s, mean 2.44s, max 5.0s.
+Ghostbed caught at 86.6% (+5.0/−2.66 — the ad opens with 5s of
+brand-free lead-in copy and refinement pulled the start to the first
+brand evidence). Leaf Filter caught at 93.1% (+1.18/−0.91, the
+best-edged block). **Manscaped missed — a transcription defect, not a
+detection defect:** of 3 spoken "Manscaped" instances only 1 came back
+exact; both ".com" reads came back "manscape" (the known base-model
+defect, reproducing even on clean TTS audio), and the promo code
+"SUMMERREAD" came back "Summaryd" twice, killing the CTA evidence; the
+remaining signals stayed single votes and never promoted. Voice found
+0 anomalous segments (including on the different-voice ad). Reverb
+stayed disabled (episode median lateAC 0.100 — dry TTS audio, gate
+worked as designed). Silences found: 0. The ads sit only ~45s apart,
+so the wide orphan segments bridged Manscaped and Leaf Filter into one
+heat-map block (149–286s) before cap/refinement split it.
+
+**Conclusion.** The route is proven: Piper works on this VM, script
+truth is exact, the detector runs end to end. Same-voice host-read ads
+ARE detectable — Ghostbed was caught with all four text methods
+voting. The pilot's limit, stated honestly: TTS audio has no room
+tone, ums, or crosstalk, so it tests edge accuracy and detection
+logic, not ASR robustness. Recommended next step (not started): scale
+to a 60–90 minute multi-speaker episode with disfluencies written into
+the script, a room-tone bed mixed under the TTS, and 6–8 same-voice
+host-read ads; a Kokoro revisit (better prosody) after that.
+
 ---
 
 ## Earlier rejected ideas — one-line index
