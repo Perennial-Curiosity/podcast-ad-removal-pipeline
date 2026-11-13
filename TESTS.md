@@ -2015,6 +2015,66 @@ module before its held merge. Records:
 
 ---
 
+## 33. Omny transcript-differential start-pad — ADOPT NOTHING, trim-only (2026-11-13)
+
+**Reason:** The end-pad test (entry 32) found the differential's raw end
+boundary over-extends by a mean of 13.7s and adopted a +0.50s end-pad
+only after trimming to the last ad word. The owner directed measuring
+the start boundaries the same way before implementing the trim+pad.
+
+**Method:** Same probe method as entry 32, on the same 9 Omny ads:
+transcribe 1s of audio immediately BEFORE each start boundary with
+faster-whisper base, classify ad vs show content against cached
+full-episode word timings. Two boundaries per ad: the raw diff start
+(find_gaps "start") and the clip start. True ad start = start of the
+first ad-copy word. Clip start convention, determined from the data:
+floor(true ad start) for the 6 mid-roll and outro ads; the 3 openers
+start at 0.0 (file start).
+
+**Results:** Clip boundary (copy-based): mean error −2.39s, 6/9 inside
+1s (all except the three openers). Raw diff boundary: mean error
+−7.61s, only 3/9 inside 1s — the three mid-rolls, where the diff start
+IS the first ad word (errors 0.00 / −0.04 / +0.04s). Openers: the diff
+start (0.0) sits 5.50–7.80s before the copy starts; before the copy
+sits fixed opening material (iHeart bumper, "Guaranteed Human" tag, and
+on 873 a cross-promo). Under a region-based reading (the whole opening
+block counts as the ad), the clip mean error is 0.30s (9/9 inside 1s)
+and the diff mean error is 5.52s (6/9 inside 1s). Outros: the diff
+start lands inside the Patreon house plug, ~1.6s after the plug begins
+(the plug's opening words are in the publisher transcript, which is why
+the diff starts mid-plug); the 875 outro is extreme, 32.50s early, with
+26.7s of silence between the sign-off and the read. Probe A (1s before
+the raw diff start): ad content begins before it on 0 of 9 (3
+house-plug, 3 silence, 3 no audio before file start). Probe B (1s
+before the clip start): ad content begins before it on 0 of 9 (6
+silence, 3 no audio). Pad candidates on the trimmed boundary (first
+ad-copy word = true start, error 0 by definition) — none: mean 0.00s,
+9/9 exact; −0.25s: mean 0.25s, 0 overshoots; −0.50s: mean 0.50s, 1
+overshoot (873 ad1 eats 0.06s of the Iris Palmer promo tail). Both pads
+make every start edge worse by exactly the pad size.
+
+**Conclusion:** ADOPT NO start-pad — trim-only. No ad audio begins
+before the trimmed boundary on any of the 9 ads, so there is nothing
+for a negative pad to recover. The asymmetry with the end side is
+structural: the clip end sits before the last word ends (floor), so the
+word's tail extends past the boundary and a +0.50s pad recovers it; the
+clip start sits before the first word starts (floor), so the audio
+before the boundary is pre-ad silence or plug. The finding that matters
+for the module is the trim: the raw diff start is exact on mid-rolls
+but 5.50–7.80s early on openers and 8.28–32.50s early on outros — and
+trimming to the first word of the gap run fixes only the mid-rolls; the
+outros need the trim to find the first sponsor-copy word, not just the
+first word of the gap. Together with entry 32, the module needs a
+trim-to-first/last-ad-word step on both edges, plus the +0.50s end-pad,
+before its boundaries can be trusted. Records:
+`tmp/omny_transcript_diff/start_pad_report.md`,
+`tmp/omny_transcript_diff/probes/start_probe_results.json` (18 probes),
+`tmp/omny_transcript_diff/start_probe.py`. Tooling from the end test
+worked as documented, no new failures; probe runs took ~3.3 minutes
+total.
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
