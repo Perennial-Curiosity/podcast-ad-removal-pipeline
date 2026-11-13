@@ -1961,6 +1961,60 @@ records: `ab/combined_repro20/`, `ab/substring_fix_single/` (kept),
 
 ---
 
+## 32. Omny transcript-differential end-pad — ADOPT +0.50s on the trimmed boundary; raw boundary needs trimming, not padding (2026-11-13)
+
+**Reason:** Nathan's listening verdict on the Omny clips (2026-11-11) was a
+"smashing success", but he noted 873's clips were ~0.25s short at the end.
+The question was whether a small end-pad improves the differential's end
+boundaries.
+
+**Method:** On Cabinet of Curiosities 873/874/875 (9 ads), transcribe 1s
+of audio immediately after each end boundary with faster-whisper base and
+classify whether ad content continues or the show resumes, cross-checked
+against cached full-episode word timings. Two boundaries were probed
+separately: the differential's raw end boundary (the module's find_gaps
+"end") and the clip end boundary (floor of the true ad end — the last ad
+word's end time rounded down to the whole second, which is what Nathan
+heard). True ad end = end of the last ad-copy word from cached word
+timings.
+
+**Results:** The two boundaries are different things. Clip boundary: mean
+error −0.46s, all 9 inside 1s — Nathan's "~0.25s short" confirmed and
+quantified (on 873's clips: 0.02 / 0.68 / 0.90s short). Raw diff boundary:
+mean error +13.7s, only 1 of 9 inside 1s — it over-extends because the
+publisher transcript also omits adjacent non-ad material (show intro
++9–11s on all three openers, outro bumper +4s, post-midroll silence plus
+unaligned show-resumption words +40s on both 874 and 875 mid-rolls).
+Probe A (1s after the raw diff end): ad content continues on 0 of 9 (5
+show resumes, 4 silence/end-of-file). Probe B (1s after the clip end):
+ad content clearly continues 0.40–0.90s on 6 of 9, and some ad audio
+extends past the boundary on all 9. Pad candidates on the trimmed
+boundary — no pad: mean |error| 0.46s; +0.25s: mean 0.32s, max 0.65s,
+3/9 exact; +0.50s: mean 0.28s, max 0.48s, 5/9 exact. No pad pushes any
+end edge into story content; tightest case is 875 ad3, where the network
+bumper starts 0.56s past the clip end and the +0.50s pad stops 0.06s
+short of it. Isolated 1s probe transcriptions hallucinate on
+silence/near-EOF audio; classifications rest on the cached full-episode
+word timings. Probe runs were slow (~3 min per 1s clip) under CPU
+contention from the validation driver and the TTS worker. Two tooling
+failures worked around, not skipped: faster-whisper's Hugging Face hub
+attempt choked on a malformed proxy env var (fixed by passing the local
+snapshot path), then PyAV decode failed (fixed by decoding to raw PCM
+with ffmpeg and passing a numpy array).
+
+**Conclusion:** ADOPT a +0.50s end-pad, applied ONLY to the end boundary
+AFTER it is trimmed to the last ad word — never to the raw differential
+boundary. The larger finding: the differential module's raw end boundary
+over-extends by a mean of 13.7s, so the pad only makes sense as part of a
+trim-to-last-ad-word step; without trimming, a pad would be harmful. The
+"smashing success" verdict was about the trimmed clips, not the raw
+differential boundaries. The trim + pad belong in the transcript-diff
+module before its held merge. Records:
+`tmp/omny_transcript_diff/end_pad_report.md`,
+`tmp/omny_transcript_diff/probes/probe_results.json` (18 probes).
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
