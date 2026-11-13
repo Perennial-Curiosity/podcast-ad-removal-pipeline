@@ -2156,6 +2156,80 @@ pre-amendment module).
 
 ---
 
+## 35. TTS full-length scale-up — FAKE PODCAST WORKING AS INTENDED (2026-11-13)
+
+**Reason:** The owner directed scaling the TTS pilot to full length and
+running the full program against it and one manually marked Unsubscribe
+episode, to see if the results are similar. The agreed reading: the
+fake scoring somewhat better on edges is the expected cleaner-audio
+effect, not a failure; much worse results, especially on recall, would
+mean the fake is not working.
+
+**Method:** A 54:30 synthetic episode (Dan and Maya restoring a 1920s
+Craftsman house), local Piper TTS, two host voices, disfluencies
+written into the script, brown-noise room-tone bed mixed 38 dB below
+the speech. 9 ads with exact script truth: 8 same-voice host-read
+(Progressive pre-roll 40.4s, Ghostbed, Manscaped, Ridge, AG1, NOBL,
+SuperPower, Perfect Jean post-roll) + 1 produced-style different-voice
+ad (Leaf Filter, 28.5s). Design cases: one ad under 45s, one under
+the 30s floor, one back-to-back pair with zero gap (Ridge + AG1), a
+pre-roll and a post-roll. Detector-only on BOTH episodes (no
+dynamic-slot B flow), same scorer. The episode came in at 54:30,
+short of the 60–75 min target — the script ran 11,988 words. Ad
+density is higher than the real comparison episode (473.8s of ads,
+14.5%, vs 673s / 9.4% on 286). Room-tone check: 120s sample
+transcribed at 0.924 word agreement vs script; the bed did not hurt
+transcription and created no false reverb votes.
+
+**Results:** TTS: recall ≥50% 8/9 (0.889), ≥80% 7/9 (0.778), 8
+blocks, 0 false blocks, 16 edges matched, 6 within 1s (37.5%), 9
+within 2s (56.2%), median edge error 1.56s, mean 3.15s, max 10.63s.
+286: recall ≥50% 9/9 (1.000), ≥80% 7/9 (0.778), 9 blocks, 0 false
+blocks, 18 edges, 3 within 1s (16.7%), 8 within 2s (44.4%), median
+3.02s, mean 4.67s, max 15.94s. Transcription: TTS word agreement vs
+script 0.944 (11,058 words transcribed vs 11,787 script words —
+Whisper drops/merges disfluencies). Per-ad TTS: Progressive 92.9%,
+Ghostbed 79.3%, Manscaped 80.0%, Ridge MISSED (0%), AG1 89.0%, NOBL
+98.7%, SuperPower 84.2%, Leaf Filter 99.6%, Perfect Jean 93.2%.
+
+**Where the two diverge:** (1) Edges better on the fake, as expected
+(median 1.56s vs 3.02s) — cleaner audio and near-perfect
+transcription. (2) Recall one ad lower on the fake: the single miss
+is Ridge, the first half of the zero-gap back-to-back pair — the
+detector found AG1 (89.0%) but produced no Ridge block at all; the
+pair fused and only the AG1 half survived. A known mechanism gap (no
+split for back-to-back ads), seen before on the synthetic spliced
+episode (Stop Box + SuperPower). A detector gap, not a fake-episode
+gap: the same fusion would happen on real audio. (3) Ends skew early
+on the fake (Ghostbed −10.63s, Manscaped −9.63s, SuperPower −8.02s,
+AG1 −6.09s) — the scripted ad closings contain no brand/URL/CTA
+evidence in their final seconds, so refinement pulls the end back to
+the last evidence sentence; real 286 ends skew early too but less
+sharply. (4) Both under-floor ads were caught: Leaf Filter at 28.5s
+scored 99.6% with the best edges (−0.91s / −0.12s); refinement shrank
+its block to 29.3s, below the 30s floor — the floors do not bind
+after refinement. (5) Brand spelling cleaner on the fake (3–5 exact
+mentions per ad window); on real 286, three ads have zero exact
+mentions. The fake tests detection logic, not ASR robustness. (6)
+Content equally clean on both: zero sponsor mentions and zero .com
+tokens in the TTS content; 286 content has 1 .com token in 20,340
+words.
+
+**Conclusion:** the fake podcast is working as intended. The results
+differ from the real episode in the expected direction and by the
+expected amount: edges better (cleaner audio), recall one ad lower
+because of a designed hard case with a known detector gap, zero false
+blocks on both sides. A valid test bed for detection logic and edge
+accuracy, with the standing caveat that it cannot test ASR
+robustness. Records: `tmp/tts_full/` (full_episode.mp3, truth.json,
+script.txt, description.txt, detect.json, score.json,
+score_286_comparison.json, NOTES.md). Build was interrupted twice by
+VM reboots; the comparison run finished 15:37–15:44 on 2026-11-13.
+Transcription took ~68 min for the 54-min episode under CPU
+contention from the validation driver.
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
