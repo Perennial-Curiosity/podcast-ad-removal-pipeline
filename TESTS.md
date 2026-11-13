@@ -2300,6 +2300,101 @@ patch_check_286.json).
 
 ---
 
+## 38. Back-to-back ad split (rescue) — WORKS, FAILS THE LETTER OF THE DECISION RULE, OWNER'S CALL (2026-11-13)
+
+**Reason:** The TTS full-length comparison (entry 35) exposed the
+fusion as the one clear detector gap: the zero-gap Ridge+AG1 pair
+fused and only AG1 survived. The synthetic episode had the same
+failure (Stop Box+SuperPower fused into one block). No split
+mechanism exists.
+
+**Diagnosis (from the pipeline's own logs):** Both pairs share one
+mechanism in three steps: (1) one heat-map region spans both ads
+because votes never drop below 2 across the boundary; (2) the label
+picker names the whole region for one sponsor; (3) the mention-span
+cap + edge refinement, both anchored on the picked sponsor's
+mentions, trim the block to that sponsor alone — erasing the other
+ad. TTS Ridge+AG1: region 1731–1863s; AG1 wins the picker
+alphabetically (both sponsors have in-region mentions); the Ridge cta
+segment (56.8s) is skipped as "already covered"; the Ridge cluster
+segment (40.8s) is under the 45s single-method floor. Synthetic Stop
+Box+SuperPower: region 5920–6075s; Stop Box has NO method segment at
+all — its variants include bare "stop", so the leaky find_mentions
+matches "stopping"/"Christopher" episode-wide, the orphan span blows
+past the 720s MAX_AD_LEN gate and is silently dropped; no spoken URL
+and only 2 real mentions, so no CTA/cluster either. Note: the held
+substring-fix patch would let the orphan emit, but the fused block
+would still be labeled for one sponsor only — the fusion would flip,
+not resolve — the rescue is still needed after that fix.
+
+**Method:** A post-processing rescue (harness variant only): rebuild
+the raw heat-map region for each final block; if the region extends
+≥30s past the block on either side and that extension holds ≥2
+mentions of a *different* description sponsor, cleanly ordered
+against the block sponsor's mentions (all ending before / starting
+after), emit a rescue block. Edges come from the other sponsor's
+cluster segment if any (else earliest cta/brand/duplicate/chapter
+segment, else the region edge), bounded to its mention span ±30s; the
+shared edge is the block edge refinement already placed. Guards: ≥2
+mentions, span ≥5s, strict ordering, the other sponsor must not
+already have a block there, ≥30s, clipped against neighbours. One
+fix found during testing: mentions are counted in a window extended
+30s outward from the region — Stop Box's first mention (5918.8s)
+sits 1.2s *before* the region start (5920s), and without the
+look-back the rescue never fired.
+
+**Results — the two known pairs:** TTS Ridge: coverage 0.0 → 0.978,
+block 1746.78–1795.8, errors +1.07s/+0.53s; AG1 unchanged. TTS
+overall: 8/9 → 9/9 at ≥50%, 7/9 → 8/9 at ≥80%, FP 0 → 0, median
+1.56s → 1.32s, within-1s 37.5% → 38.9%. Passes the decision rule
+outright. Synthetic Stop Box: coverage 0.0 → 0.938, block
+5920–5968.7, errors +3.1s/+1.1s; SuperPower unchanged. Synthetic
+overall: 22/27 → 23/27 at ≥50%, 18/27 → 19/27 at ≥80%, FP 3 → 3,
+median 2.55s flat, within-1s count 8 flat (18.2% → 17.4% on
+denominator growth). Null episode: 8 blocks both, no rescue.
+
+**Results — SponsorBlock set (25 episodes, 107 labels):** Baseline
+repro exact. Variant: recall 0.673 → 0.692 (72 → 74 of 107), FP 36
+→ 39 (+8.3%), median 4.7 → 4.8s, within-1s 26.4% → 25.7% (count
+flat at 38). 21 of 25 episodes byte-identical; 5 rescue blocks fired
+across 4 episodes, all adjudicated: two matched SB labels (Helix
+Sleep, Eight Sleep — both pairs SB had marked missed); two are
+second halves of pairs SB labels as single segments, landing just
+under the 50% match line only because the first half already matched
+the same label (49.2%, 46.7%); one is a real ad in an SB label gap
+(lex-499 Shopify — verified by reading the transcript: the opening
+is five back-to-back ads, SB labels none of the first 2732s). Zero
+of the five is a content false block.
+
+**Verdict:** FAILS the letter — median 4.7→4.8s and within-1s
+26.4%→25.7% — so by the standing rule it is a DISCARD. But the
+failure is a measurement artifact, quantified: the two matched
+rescues contribute start edges of +77.3s and +72.7s because the SB
+label starts at the *first* ad of the pair while the rescue correctly
+starts at the split point. Variant minus those two edges: median
+4.70s (identical to baseline), mean 11.91s (better than baseline
+12.02s). SB structurally cannot represent back-to-back pairs, so a
+correct split is scored as a 70s+ start error. The detector is
+strictly better with the mechanism (2 missed SB labels recovered, 0
+content false blocks added). The call is the owner's: keep it despite
+the letter, or discard it per the rule. If kept, the SB baseline
+becomes recall 0.692 / FP 39 by SB counting. Known limitation: one
+rescue per side per block — lex-499's Element/BetterHelp reads stay
+unmarked and the NetSuite read sits inside the Shopify-labeled
+block; a future step could iterate the rescue over a block's tail.
+
+**Status:** 306-line patch (split_rescue.patch: new
+pipeline/split_rescue.py + 13-line wiring hunk applying the rescue
+after the slot flow) HELD, pending the owner's call. Verified:
+applies cleanly to a fresh pristine copy, both files compile,
+patched module reproduces the tested rescue, anonymization-clean.
+The live pipeline was never touched. Records:
+`sb_eval/ab/back_to_back_split/` (split_rescue.py, NOTE.md,
+tts_results.json, synthetic_results.json, null_results.json,
+results.json, split_rescue.patch).
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
