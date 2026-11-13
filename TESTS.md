@@ -2075,6 +2075,87 @@ total.
 
 ---
 
+## 34. Transcript-differential trim + end-pad amendment — IMPLEMENTED AND VERIFIED (2026-11-13)
+
+**Reason:** Entries 32–33 adopted the amendment in principle (trim to
+first/last ad-copy word on both edges, +0.50s end-pad, no start-pad)
+but deferred implementation until the start boundaries were measured.
+The owner directed implementing it.
+
+**Method:** The module (`tmp/transcript_diff/transcript_diff.py`,
+661 → 957 lines) now trims each gap: split the gap into speech
+segments at 1.5s word-gaps; the first segment with ad evidence sets
+the start, the last sets the end; evidence is description-sponsor
+mentions (an optional `sponsors` parameter — the pipeline passes the
+description sponsors at merge), spoken URLs (a bare TLD token like
+"com", or a single token ending in a TLD that contains a dot), and
+the word "sponsored". When no segment has evidence, the longest
+segment stands in, but only if it holds at least half the gap's
+words — otherwise the gap keeps its raw edges. A trailing repeat of
+the episode's opening bumper is stripped from the end, and one
+trailing 1–2 word segment is absorbed (a closing CTA fragment split
+off by a long pause). Start is the exact first ad word with no pad;
+end is the last ad word floored to the whole second, then +0.50s.
+Gap detection itself is untouched.
+
+**Results (9 Omny ads, sponsors=None — the real Omny case):**
+Starts: raw mean error 2.10s → trimmed 0.88s; 6/9 inside 1s → 8/9.
+Mid-rolls + outros 6/6 inside 1s, max error 0.04s. Openers: 874 and
+875 fixed exactly (0.00s); 873 stays −7.80s copy-based (0.00
+region-based) — the promo runs into the copy with only a 0.44s gap,
+below every intra-copy pause on the set, so no silence threshold
+separates them; no regression. Ends: raw mean error 5.78s → trimmed
+0.29s; 5/9 inside 1s → 9/9, max 0.48s — essentially the end test's
+bar (0.28s / 0.48s). With sponsors=["Coca-Cola", "BetterHelp"] the
+edges are identical on all 9 ads. Unit tests 45/45 pass (26 original
++ 19 new trim checks). Smoke test: PC20-235 live diff still 0 gaps
+(coverage 0.9189, 7,214 anchors); the simulated 60s drop is still
+exactly one gap (1800.0–1860.5; only the +0.50s pad moves it, +0.2s).
+Structural check: a simulated non-ad gap corroborates 0 blocks and
+never becomes a marking. Extra check on a fourth episode (Wild at
+Heart, 2 real ad gaps): both trim by 0.3s at the end, absorbing the
+lone word "Visit" after a 7.9s pause; the ad's true end past "Visit"
+is unknowable (the file ends at 808s).
+
+**Two corrections to the earlier probe reports:** (1) The module's
+own raw gaps were already better than the probe reports' numbers —
+the probe numbers came from the standalone diff script
+(whole-sequence difflib), while the module's anchor-chain alignment
+matches the Patreon plug words (they ARE in the publisher
+transcript), so its raw outro starts were already exact; the trim's
+start work was the openers plus preserving those starts. (2) The
+Omny descriptions name no sponsors at all — the trim on Omny runs
+entirely on generic URL/sponsored evidence plus the longest-segment
+fallback; the `sponsors` parameter is wired and tested for feeds
+whose descriptions do name sponsors.
+
+**Two bugs found and fixed during verification:** (1) the
+single-token URL check false-positived on ordinary words ending in a
+TLD ("delicious", "previous") — fixed by requiring a dot in the raw
+word; (2) the 7.9s pause before the closing CTA word "Visit" — the
+straggler rule was added for it. Both pinned by unit checks.
+
+**Caveat:** the three original show legs (Podcasting 2.0's 32.3s
+transcript hole, No Agenda, Bootstrapped Founder) were not re-run —
+their episode data is no longer on disk. The amendment is edge-only
+and gap detection is proven unchanged by the smoke test, so a leg
+that found no gaps still finds none, but that is inference, not a
+re-run.
+
+**Status:** ready to fold into the combined patch. INTEGRATION.md §9
+records exactly what must change: regenerate the transcript-diff
+new-file portion (piece3_td_newfile.diff) from the amended module;
+the run_pipeline.py hunks apply unchanged (sponsors is optional),
+with a recommended one-line addition to pass the description
+sponsors. The combined patch itself was not touched. Records:
+`tmp/transcript_diff/verification_log.txt`,
+`tmp/transcript_diff/verify_trim.py` +
+`tmp/transcript_diff/verify_trim_results.json`,
+`tmp/transcript_diff/transcript_diff_pre_trim.py` (backup of the
+pre-amendment module).
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
