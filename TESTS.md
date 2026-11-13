@@ -1963,7 +1963,7 @@ records: `ab/combined_repro20/`, `ab/substring_fix_single/` (kept),
 
 ## 32. Omny transcript-differential end-pad — ADOPT +0.50s on the trimmed boundary; raw boundary needs trimming, not padding (2026-11-13)
 
-**Reason:** Nathan's listening verdict on the Omny clips (2026-11-11) was a
+**Reason:** the owner's listening verdict on the Omny clips (2026-11-11) was a
 "smashing success", but he noted 873's clips were ~0.25s short at the end.
 The question was whether a small end-pad improves the differential's end
 boundaries.
@@ -1974,12 +1974,12 @@ classify whether ad content continues or the show resumes, cross-checked
 against cached full-episode word timings. Two boundaries were probed
 separately: the differential's raw end boundary (the module's find_gaps
 "end") and the clip end boundary (floor of the true ad end — the last ad
-word's end time rounded down to the whole second, which is what Nathan
+word's end time rounded down to the whole second, which is what the owner
 heard). True ad end = end of the last ad-copy word from cached word
 timings.
 
 **Results:** The two boundaries are different things. Clip boundary: mean
-error −0.46s, all 9 inside 1s — Nathan's "~0.25s short" confirmed and
+error −0.46s, all 9 inside 1s — the owner's "~0.25s short" confirmed and
 quantified (on 873's clips: 0.02 / 0.68 / 0.90s short). Raw diff boundary:
 mean error +13.7s, only 1 of 9 inside 1s — it over-extends because the
 publisher transcript also omits adjacent non-ad material (show intro
