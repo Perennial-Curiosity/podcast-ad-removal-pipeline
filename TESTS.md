@@ -2230,6 +2230,76 @@ contention from the validation driver.
 
 ---
 
+## 36. Corroboration-gated orphan segments — DISCARDED, all three gate variants (2026-11-13)
+
+**Reason:** The orphan-split test (entry 30) showed the MAX_AD_LEN
+drop is load-bearing noise suppression: splitting emits orphan
+segments for every content-discussion sponsor. The follow-up idea was
+to keep the episode-wide span but only emit an orphan segment when
+corroborated — (a) ≥2 mentions inside the span, (b) another method
+fires within the segment or ±30s, (c) both gates together.
+
+**Method:** Harness variants under `sb_eval/ab/orphan_gate_a`,
+`orphan_gate_b`, `orphan_gate_ab`. Baseline reproduced first in a
+fresh combined_repro dir (exact: recall 0.673, median 4.7s,
+within-1s 26.4%, FP 36).
+
+**Results (25 episodes, 107 labels):** Gate (a): identical to
+baseline on every headline — recall 0.673 (72/107), median 4.7s,
+within-1s 26.4%, FP 36. A complete no-op. Gate (b): recall 0.673, FP
+36, median 4.7→4.3s, within-1s 26.4%→27.1% — but the whole gain is
+a single edge, and that block loses its sponsor label (the
+Unsubscribe 287 Stop Box block is relabeled "dry-island"), an
+unscored harm. Both gates together: identical to baseline on every
+headline. Reason: 45 of 50 orphan segments pass both gates, so the
+gates barely fire — the orphan segments that exist are almost all
+already corroborated, and the ones the gates would remove are not the
+ones causing false blocks.
+
+**Conclusion:** DISCARDED at all three gates. The
+corroboration-gated orphan idea is closed: the gates do not separate
+true ads from content-discussion sponsors. The variant code was
+removed from the scratch copy only; run_pipeline.py was never
+touched; no patch was written. Records: `sb_eval/ab/orphan_gate_a`,
+`orphan_gate_b`, `orphan_gate_ab` (results.json).
+
+---
+
+## 37. Gate tightening for partial-overlap dynamic slots — MERGE WORKS, patch held separately (2026-11-13)
+
+**Reason:** The owner's decision (2026-11-13): a dynamic slot
+overlapping a detector block by less than half the slot's own
+duration must not become a standalone block. On 286, the 899.4–927.1
+"cha" hallucination slot (27.7s, inside the real Ghostbed ad) passes
+the A-side gate because a Ghostbed method segment overlaps it, and
+becomes an unnamed standalone block — FP 0→1 at ≥50%.
+
+**Method:** Overlap = overlapped seconds ÷ slot duration, threshold
+50%. Two behaviors tested: (a) merge the partial-overlap slot into
+the overlapped block (slot edges + detector label), (b) drop the
+slot. Verified on 286, 287, SN 1101, and the SB dynamic episodes
+(reusing the driver's cached B transcripts read-only).
+
+**Results:** Both merge and drop remove the 286 false positive (FP
+1→0, 9/9 at ≥50% held). Merge chosen over drop: merge gives true
+coverage 636.3/673s (base 645.3 double-counts 9.0s of overlap between
+the "cha" block and the Ghostbed block) and the Ghostbed block
+becomes 899.4–1006.7 labelled GHOSTBED, with the start error
+improving from +11.1s to −7.6s; drop keeps the detector's 918.1–1006.7
+block and loses the first 11.1s of the real Ghostbed ad. 287
+unchanged under both: 8/8, 1 false positive (Pepperbox), 7/8 at
+≥80%. Dynamic edges unchanged: 14 edges, mean error 0.43s, 13/14
+within 1s. The 58-line patch applies cleanly to a fresh copy,
+compiles, and is byte-identical to the tested copy; the live file is
+unchanged.
+
+**Status:** patch held separately — NOT in the combined patch; the
+two apply independently in either order. Records: `tmp/gate_fix/`
+(gate_fix.patch, NOTE.md, verification_log.md,
+patch_check_286.json).
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
