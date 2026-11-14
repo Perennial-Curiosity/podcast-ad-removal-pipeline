@@ -2397,6 +2397,87 @@ results.json, split_rescue.patch).
 
 ---
 
+## 39. Density / ad-copy floor for standalone slot blocks — DENSITY KEPT AS A CORRECTNESS FIX, COPY DISCARDED (2026-11-14)
+
+**Reason:** The 8 extra slot blocks from the dynamic-slot validation
+were adjudicated by hand: 6 real paid dynamic ads, 1 self-promo, 1
+non-ad outro tail (Mitochondria, 123:36–124:16, density 0.176, 3
+differing words). The slot flow emits standalone slot blocks with no
+density or ad-copy requirement. The question: can a floor remove the
+outro tail without removing real ads?
+
+**Design, from the data:** Across all 26 gated slots measured (SB
+set 18 + 286/287 8), densities are 0.176 for the one false slot and
+0.677–1.0 for everything else. The next-lowest real ad is LinkedIn
+at 0.677. Threshold 0.5 sits in the middle of that gap. The 286
+"cha" hallucination slot is 0.969 — density does not catch it (the
+held gate fix does). Ad-copy evidence (brand mention or spoken URL
+in the A-side words, using the pipeline's own pools and finders):
+LinkedIn, HubSpot, the Sydney promo, and Progressive carry at least
+one; Mitochondria carries neither — but so do Netflix and both
+RaceTrac ads (their brands are in no pipeline pool — dynamic
+sponsors are not description sponsors — and they speak no URL).
+Trailing-only was considered and rejected: 5 of the 6 real ads are
+trailing too (the outro is a rotating dynamic-ad position), so
+trailing-ness does not separate them. The floor applies to ALL
+standalone slot blocks.
+
+**Results — SB set (25 episodes, 107 labels):** Baseline repro exact
+(recall 0.673, matched 72/107, FP 44, median 4.7s, mean 12.0s,
+within-1s 26.4%). D (density ≥ 0.5): recall 0.673, matched 72/107,
+FP 44 → 43, median 4.7s, mean 12.0s, within-1s 26.4% — every
+headline flat except FP; removes ONLY the Mitochondria slot. C (copy
+only): FP 44 → 40, all else flat — but removes Mitochondria AND both
+RaceTrac ads AND the Netflix ad. DC (both): identical to C on every
+number (FP 40; same 4 removals).
+
+**Per-slot outcomes (all 8 adjudicated slots):** D keeps LinkedIn
+(0.677), both RaceTrac (0.897, 0.878), HubSpot (0.950), Netflix
+(0.868), Sydney promo (1.000), Progressive (0.912); removes only
+Mitochondria (0.176). C/DC remove Mitochondria plus both RaceTrac
+and Netflix.
+
+**286/287:** D leaves both unchanged — 286 score50 (9, 9, 1),
+score80 (9, 9, 645.3, 673, 27.0, 0); 287 score50 (8, 8, 1), score80
+(7, 8, 477.3, 531, 41.7, 1). The "cha" slot (density 0.969) is kept
+under D. C/DC: 286 score50 FP 1 → 0 (removes "cha"), score80
+coverage 645.3 → 625.2; 287 unchanged. That does not save them —
+the SB-set real-ad removals decide it.
+
+**Verdict:** D: KEEP, as a correctness fix (not a detection
+improvement). It passes the adjudication check (removes the
+Mitochondria tail, keeps all 6 real ads) and every decision-rule
+condition except the median letter: median 4.7 → 4.7s (flat),
+within-1s 26.4% (holds flat), recall flat, FP 44 → 43. The median
+cannot move — removing a false block moves no matched edge (all 144
+edges identical). Same shape as the substring fix (entry 31), kept
+as a correctness fix on exactly that reasoning: provably-false
+evidence removed with zero regressions on any check. C: DISCARD —
+removes 3 real ads; fails the adjudication check regardless of the
+SB numbers (which look better — FP 40 — precisely because SB never
+labels dynamic ads). DC: DISCARD — same 3 real ads removed; the
+density half adds nothing over C.
+
+**Status:** 26-line patch (density_floor.patch: adds
+SLOT_FLOOR_DENSITY_MIN = 0.5 and a density check in _merge_slots'
+standalone branch) HELD — the owner's call whether it folds in as
+piece 6 before merging. Verified: applies cleanly to a fresh
+pristine copy (dry-run + apply + py_compile) and to the 5-piece
+combined-patch tree (hunk 2 at +211 lines offset, no fuzz); the
+patched _merge_slots reproduces config-D scores exactly on the
+frozen 286/287 merge inputs. Anonymization-clean. Caveat: the floor
+was tested against the dynslots baseline (FP 44); on the folded
+5-piece patch the SB-set FP is 38, so the expected effect there is
+the same single-block removal (FP 38 → 37) — to be confirmed at
+fold time. The floor does not touch the 286 "cha" slot (density
+0.969); that false block is removed by the held gate fix — the two
+mechanisms are complementary. Records: `sb_eval/ab/dynslots_floor/`
+(dynslots_floor.py, NOTE.md, density_floor.patch),
+dynslots_floor_results.json, `combined_repro23/`,
+`dynslots_floor_d|_c|_dc/`.
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
