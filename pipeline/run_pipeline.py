@@ -29,9 +29,11 @@ is uncertain for an episode, the episode is left unmarked and flagged.
 """
 
 import difflib
+import fcntl
 import glob
 import hashlib
 import json
+import math
 import os
 import re
 from datetime import date, datetime, timezone
@@ -39,7 +41,12 @@ import subprocess
 import sys
 import time
 import urllib.request
+import urllib.error
 from html import unescape
+
+import sys
+sys.path.insert(0, os.path.dirname(__file__))
+from tlds import TLDS, SPOKEN_STEM_TLDS
 
 # The model snapshot lives in the default HF cache; force offline so the
 # (broken-proxy) network is never touched.
@@ -74,6 +81,10 @@ SLOT_B_MARGIN_S = 10.0         # B-side gate window margin around mapped B span
 # from the current one invalidates a cached chunk transcript. Missing
 # config = legacy cache (all pre-2026-11-11 caches are base/en/beam5).
 TRANSCRIBE_CONFIG = {"model": "base", "language": "en", "beam_size": 5}
+
+# Shared TLD regex for sponsor/URL extraction (built from pipeline/tlds.TLDS)
+_tld_pattern = "|".join(sorted(TLDS, key=len, reverse=True))
+TLD_REGEX = rf"\.({_tld_pattern})$"
 
 # Popular podcast sponsors not in the episode description.
 # Used ONLY by the cluster finder (4+ mentions in 1 min) as a safety net
@@ -148,6 +159,37 @@ def house_plugs(pcfg):
 def github_feed_url(cfg, pcfg):
     return (f"https://raw.githubusercontent.com/{cfg['github_owner']}/"
             f"{cfg['github_repo']}/main/{pcfg['github_feed_path']}")
+
+
+def cleanup_work_dir(podcast_id, slug):
+    """Remove partial work files for an episode (crash protocol: re-run from top)."""
+    paths = podcast_paths(podcast_id)
+    work = os.path.join(paths["ep_dir"], slug)
+    mp3_path = os.path.join(work, "original.mp3")
+    try:
+        if os.path.exists(mp3_path):
+            os.remove(mp3_path)
+        # Remove chunk files and transcripts
+        for f in glob.glob(os.path.join(work, "chunk_*.json")):
+            os.remove(f)
+        for f in glob.glob(os.path.join(work, "*.wav")):
+            os.remove(f)
+        for f in (os.path.join(work, "transcript.json"),
+                  os.path.join(work, "report.json"),
+                  os.path.join(work, "align_result.json")):
+            if os.path.exists(f):
+                os.remove(f)
+        # Remove B directory if exists
+        b_dir = os.path.join(work, "B")
+        if os.path.isdir(b_dir):
+            for f in glob.glob(os.path.join(b_dir, "*")):
+                os.remove(f)
+            os.rmdir(b_dir)
+        # Remove work dir if empty
+        if os.path.isdir(work) and not os.listdir(work):
+            os.rmdir(work)
+    except OSError:
+        pass  # Best effort cleanup
 
 
 # Per-podcast globals, populated by main() from podcasts.yaml.
@@ -262,6 +304,61 @@ def _parse_rss_chapters(body):
 
 
 def parse_items(xml):
+    """Parse RSS feed items using ElementTree for robustness."""
+    import xml.etree.ElementTree as ET
+    items = []
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        # Fallback to regex if XML is malformed
+        return _parse_items_regex_fallback(xml)
+
+    # Handle namespaces
+    ns = {'': 'http://www.w3.org/2005/Atom',
+          'itunes': 'http://www.itunes.com/dtds/podcast-1.0.dtd',
+          'psc': 'https://podcaststandards.org/1.0/',
+          'rawvoice': 'http://www.rawvoice.com/rawvoiceRssModule/',
+          'podcast': 'https://podcastindex.org/namespace/1.0'}
+
+    # Find channel and items
+    channel = root.find('channel') if root.tag != 'channel' else root
+    if channel is None:
+        return _parse_items_regex_fallback(xml)
+
+    for item_elem in channel.findall('item'):
+        def tag(name):
+            elem = item_elem.find(name)
+            if elem is None or elem.text is None:
+                return ""
+            val = unescape(elem.text).strip()
+            if val.startswith("<![CDATA[") and val.endswith("]]>"):
+                val = val[9:-3].strip()
+            return val
+
+        # Enclosure URL
+        enc = item_elem.find('enclosure')
+        audio_url = enc.get('url', '') if enc is not None else ''
+
+        # RSS chapters (psc:chapter)
+        rss_chapters = _parse_rss_chapters(ET.tostring(item_elem, encoding='unicode'))
+
+        # podcast:transcript detection
+        has_transcript = item_elem.find('.//{https://podcastindex.org/namespace/1.0}transcript') is not None
+
+        items.append({
+            "guid": tag("guid") or audio_url,
+            "title": tag("title"),
+            "pubDate": tag("pubDate"),
+            "description": tag("description"),
+            "audio_url": audio_url,
+            "rss_chapters": rss_chapters,
+            "has_transcript": has_transcript,
+        })
+    return items
+
+
+def _parse_items_regex_fallback(xml):
+    """Original regex-based parser as fallback."""
     items = []
     for m in re.finditer(r"<item>(.*?)</item>", xml, re.S):
         body = m.group(1)
@@ -270,7 +367,6 @@ def parse_items(xml):
             if not mm:
                 return ""
             val = unescape(mm.group(1)).strip()
-            # Strip CDATA wrapper (html.unescape doesn't handle it)
             if val.startswith("<![CDATA[") and val.endswith("]]>"):
                 val = val[9:-3].strip()
             return val
@@ -282,11 +378,6 @@ def parse_items(xml):
             "description": tag("description"),
             "audio_url": enc.group(1) if enc else "",
             "rss_chapters": _parse_rss_chapters(body),
-            # Transcript rule (2026-11-11, owner): a feed carrying
-            # podcast:transcript tags already has a second transcript
-            # to compare against, so the dynamic-slot second download
-            # is skipped for the whole podcast (see main() and
-            # _run_dynamic_for_episode).
             "has_transcript": bool(re.search(r"<podcast:transcript\b", body)),
         })
     return items
@@ -303,12 +394,11 @@ def extract_sponsors(description_html):
         text = re.sub(r"<[^>]+>", "", m.group(1)).strip().lower()
         text = re.sub(r"^https?://(www\.)?", "", text)
         text = text.split("/")[0]
-        # NOTE: keep this TLD list in sync with the plain-text branch below
-        # and with find_url_mentions' tlds. Missing a TLD is a silent miss:
+        # Use shared TLD list. Missing a TLD is a silent miss:
         # SN 1101 (2026-10-22) — "canary.tools" kept its ".tools" suffix, so
         # the variant set never contained the spoken word "canary" and all
         # methods reported 0 mentions despite 16+ spoken mentions.
-        root = re.sub(r"\.(com|net|org|io|ai|tv|co|us|tools|app|dev|xyz|online|store|tech|site|cloud|me|cc|gg|life|world|news|media|agency|digital|solutions|systems|network|security)$", "", text)
+        root = re.sub(TLD_REGEX, "", text)
         variants = {root, root.replace(".", " "), root.replace("-", " ")}
         # Bare domain stem: the host says "Canary", not "canary.tools" —
         # and Whisper tokenizes spoken URLs into separate words (and may
@@ -369,9 +459,8 @@ def extract_sponsors(description_html):
                                          "facebook", "youtube", "patreon", "pepperbox")):
                 continue
             host = domain.split("/")[0]
-            # Same extended TLD list as the sponsored-links branch above;
-            # see the SN 1101 note there about silent misses.
-            root = re.sub(r"\.(com|net|org|io|ai|tv|co|us|tools|app|dev|xyz|online|store|tech|site|cloud|me|cc|gg|life|world|news|media|agency|digital|solutions|systems|network|security)$", "", host)
+            # Use shared TLD list; see the SN 1101 note above about silent misses.
+            root = re.sub(TLD_REGEX, "", host)
             # strip common marketing prefixes (drink, get, try, take, shop, join)
             root_stripped = re.sub(r"^(drink|get|try|take|shop|join)", "", root)
             if not root or len(root) < 2:
@@ -3465,6 +3554,8 @@ def main():
                 process_episode(item, state, channel_link, pcfg)
             except Exception as exc:
                 log(f"FAILED retry on {item['title']}: {exc!r}")
+                slug = re.sub(r"[^a-z0-9]+", "-", item["title"].lower()).strip("-")[:60]
+                cleanup_work_dir(args.podcast, slug)
     new_items = [it for it in reversed(items)
                  if it["guid"] and it["guid"] not in state["processed"] and it["audio_url"]]
     if args.limit:
@@ -3478,6 +3569,8 @@ def main():
             process_episode(item, state, channel_link, pcfg)
         except Exception as exc:
             log(f"FAILED on {item['title']}: {exc!r}")
+            slug = re.sub(r"[^a-z0-9]+", "-", item["title"].lower()).strip("-")[:60]
+            cleanup_work_dir(args.podcast, slug)
             # leave unprocessed so a later run retries
     write_feed(state, SITE_DIR, xml)
     log("feed regenerated")
