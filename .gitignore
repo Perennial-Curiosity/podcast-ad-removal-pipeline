@@ -6,3 +6,16 @@ podcasts/
 episodes/
 state.json
 *.mp3
+*.wav
+feed-site/
+.venv/
+venv/
+.env
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+.pytest_cache/
+.coverage
