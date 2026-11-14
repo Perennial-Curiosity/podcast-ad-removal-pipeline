@@ -70,6 +70,7 @@ SLOT_GUARD_MAX_DIFF_RATE = 0.25  # differing-token rate above this: abort slots
 SLOT_GUARD_MAX_DUR_RATIO = 0.10  # |B dur - A dur| / A dur above this: abort
 SLOT_GUARD_MAX_SLOT_SHARE = 0.25  # gated slots > 25% of episode: abort
 SLOT_B_MARGIN_S = 10.0         # B-side gate window margin around mapped B span
+SLOT_FLOOR_DENSITY_MIN = 0.5  # standalone slot density below this: drop (not an ad read)
 # Transcribe-config fingerprint (2026-11-11): a stored config that differs
 # from the current one invalidates a cached chunk transcript. Missing
 # config = legacy cache (all pre-2026-11-11 caches are base/en/beam5).
@@ -262,6 +263,11 @@ def _parse_rss_chapters(body):
 
 
 def parse_items(xml):
+    try:
+        import transcript_diff
+    except ImportError:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import transcript_diff
     items = []
     for m in re.finditer(r"<item>(.*?)</item>", xml, re.S):
         body = m.group(1)
@@ -288,6 +294,10 @@ def parse_items(xml):
             # is skipped for the whole podcast (see main() and
             # _run_dynamic_for_episode).
             "has_transcript": bool(re.search(r"<podcast:transcript\b", body)),
+            # Publisher-transcript differential (2026-11-11, idea 6):
+            # the raw transcript tags, for the corroboration stage in
+            # process_episode. [] when the item carries no tag.
+            "transcript_tags": transcript_diff.extract_transcript_tags(body),
         })
     return items
 
@@ -619,6 +629,50 @@ def norm_words(words):
     return [re.sub(r"\s+", " ", w[2]).strip().lower() for w in words]
 
 
+def _boundary_match(v, w):
+    """True if short variant v occurs in token w at a word boundary.
+
+    A short brand variant (len<6) may match inside a transcript word
+    only at a word boundary, not mid-word: 'aura' must not match
+    inside 'restaurant', 'stop' must not match inside 'christopher'
+    or 'stopping'. Before: start of token or a non-alphanumeric char.
+    After: end of token, a non-alphanumeric char, a plural/possessive
+    suffix ('s', 'es', "'s"), or a single-letter remainder — the token
+    is the variant plus one letter, a spelling/transcription variant
+    of the brand ('noble' for NOBL; the short-variant analogue of the
+    len>=6 fuzzy path's >=0.85 ratio). A multi-letter remainder
+    ('sleeping', 'seeding') still fails.
+    """
+    start = 0
+    while True:
+        i = w.find(v, start)
+        if i == -1:
+            return False
+        if i == 0 or (not w[i - 1].isalnum()):
+            before_ok = True
+        else:
+            before_ok = False
+        after = w[i + len(v):]
+        if after == "" or (not after[0].isalnum()):
+            after_ok = True
+        elif after.startswith("'s") and (len(after) == 2
+                                         or not after[2].isalnum()):
+            after_ok = True
+        elif after.startswith("es") and (len(after) == 2
+                                         or not after[2].isalnum()):
+            after_ok = True
+        elif after.startswith("s") and (len(after) == 1
+                                        or not after[1].isalnum()):
+            after_ok = True
+        elif len(after.rstrip(".,!?;:")) == 1 and \
+                after.rstrip(".,!?;:").isalnum():
+            after_ok = True
+        else:
+            after_ok = False
+        if before_ok and after_ok:
+            return True
+        start = i + 1
+
 def _prefix_guard_ok(v, w):
     """A token that merely STARTS with the brand plus a non-plural suffix
     is a different word, not a mangling: 'factory' is not Factor (0.92),
@@ -635,6 +689,7 @@ def find_mentions(nw, variants):
 
     Handles 'bit warden' -> 'bitwarden' (split words) and whisper
     mis-transcriptions like 'threadlocker' -> 'threatlocker' (fuzzy).
+    Short variants match only at a word boundary (_boundary_match).
     """
     from difflib import SequenceMatcher
     hits = []
@@ -662,11 +717,13 @@ def find_mentions(nw, variants):
                     hits.append(i)
             continue
         if len(toks) == 1:
-            # Short single-token variant: substring match.
+            # Short single-token variant: word-boundary match only.
+            # A bare substring match leaks: 'aura' inside 'restaurant',
+            # 'stop' inside 'christopher'/'stopping' (2026-11-12).
             v = toks[0]
             for i in range(L):
                 w = nw[i]
-                if v in w:
+                if _boundary_match(v, w):
                     hits.append(i)
             continue
         n = len(toks)
@@ -1460,6 +1517,126 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     if candidates_out is not None:
         candidates_out.extend(candidates)
     return scored, suspects
+
+
+# ---------------------------------------------------------------------------
+# Cross-episode recurrence, POSITIVE direction only (2026-11-11, KEPT)
+# Port of the SB-eval xep_corroborate variant
+# (sb_eval/ab_detect_xep_corroborate.py::apply_xep_corroboration).
+# A recurring span — 8-word shingles of this transcript that appear
+# in >= 2 prior episodes of the same podcast — is sponsor copy
+# repeated across episodes. When such a span overlaps a block the
+# detector already found, it corroborates that block: the block's
+# edges extend to the span's bounds, so a tail-only read (votes
+# arrive only at the CTA/URL tail) recovers its story-opening
+# seconds. It never creates a block, never adds a vote, never adds
+# a mention, and never touches find_mentions / norm_words / sponsors
+# — so the brand-orphan path cannot flip (the phonetic-redesign
+# failure mode: extra mentions moving a sponsor from the orphan path
+# to the brand path and shrinking its block).
+# Guards, mirroring the orphan merge: a span must overlap the block
+# by >= XEP_MIN_OVERLAP_S (a span that barely touches a block is weak
+# corroboration); max 90s extension per side; start side stops at
+# the first opening cue in between; end side stops at the first
+# return-to-content cue; neither side crosses a different sponsor's
+# mention or an adjacent block. The closest overlapping span bound
+# is used (least extension). Sharpness is recomputed for moved edges.
+# Measured on the 25-episode SB set: recall 0.673 -> 0.701, FP
+# 36 -> 33, median 4.7 -> 4.0s, within-1s 26.4% -> 29.3%.
+# Runs in process_episode AFTER detect_ad_blocks and BEFORE the
+# dynamic-slot flow (the harness order): the slot flow can replace
+# a block's edges with the more accurate slot edges, so xep fixes
+# detector-only edges and slots override where they gate.
+XEP_MAX_EXT = 90.0
+XEP_MIN_OVERLAP_S = 5.0
+
+
+def _xep_part(label):
+    return label.split(":")[-1].strip().lower().replace(" ", "")
+
+
+def _apply_xep_corroboration(blocks, words, sponsors, silences,
+                             candidates, ep_dir, slug):
+    """Extend already-detected blocks to overlapping recurring-span
+    bounds (positive direction only). Returns the (possibly extended)
+    block list, sorted, with sharpness recomputed for moved edges.
+    Blocks, labels, and sources are otherwise untouched."""
+    try:
+        import xep_recurrence
+    except ImportError:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import xep_recurrence
+    spans, _priors = xep_recurrence.recurring_spans_for_episode(
+        ep_dir, slug)
+    if not spans or not blocks:
+        return blocks
+    nw = norm_words(words)
+    mentions = {}
+    for sp in sponsors:
+        hits = find_mentions(nw, sp["variants"])
+        mentions[sp["label"].lower().replace(" ", "")] = sorted(
+            words[h][0] for h in hits)
+    out = []
+    for bi, (bs, be, label, ss, es) in enumerate(blocks):
+        part = _xep_part(label)
+        cand = [s for s in spans
+                if min(s["end"], be) - max(s["start"], bs) >= XEP_MIN_OVERLAP_S]
+        ns, ne = bs, be
+        starts = [s["start"] for s in cand if s["start"] < bs]
+        if starts:
+            t = max(starts)
+            t = max(t, bs - XEP_MAX_EXT)
+            cue = _first_opening_cue_after(words, nw, silences, t, bs)
+            if cue is not None:
+                t = max(t, cue)
+            for (bs2, be2, *_r) in blocks:
+                if be2 <= bs and be2 > t:
+                    t = max(t, be2)
+            for p, times in mentions.items():
+                if p == part:
+                    continue
+                if any(t < x < bs for x in times):
+                    t = bs
+                    break
+            ns = t
+        ends = [s["end"] for s in cand if s["end"] > be]
+        if ends:
+            t = min(ends)
+            t = min(t, be + XEP_MAX_EXT)
+            for i in range(len(nw)):
+                if not (be < words[i][0] < t):
+                    continue
+                if any(c in " ".join(nw[i:i + 4]) for c in RETURN_CUES):
+                    t = min(t, words[i][0])
+                    break
+            for (bs2, be2, *_r) in blocks:
+                if bs2 > be and bs2 < t:
+                    t = min(t, bs2)
+            for p, times in mentions.items():
+                if p == part:
+                    continue
+                if any(be < x < t for x in times):
+                    t = be
+                    break
+            ne = t
+        if ns != bs or ne != be:
+            log(f"  xep-corroborate '{label}': {bs:.0f}s-{be:.0f}s -> "
+                f"{ns:.0f}s-{ne:.0f}s")
+        out.append((ns, ne, label, ss, es))
+    out.sort()
+    # Recompute boundary sharpness for moved edges (same functions the
+    # pipeline uses; None when a window is empty).
+    votes = _word_votes(words, candidates)
+    starts = [w[0] for w in words]
+    ends = [w[1] for w in words]
+    rescored = []
+    for s, e, l, ss, es in out:
+        _ss = _edge_sharpness(starts, ends, votes, s, "start")
+        _es = _edge_sharpness(starts, ends, votes, e, "end")
+        rescored.append((s, e, l,
+                         round(_ss, 2) if _ss is not None else None,
+                         round(_es, 2) if _es is not None else None))
+    return rescored
 
 
 def _expand_tight_cluster(words, nw, silences, hits):
@@ -2865,7 +3042,15 @@ def _merge_slots(blocks, gated_slots, a_words, candidates, sponsors,
     'detector' | 'slot' | 'merged'. Slot edges are used as-is (no
     refinement); slot blocks bypass the 30s/45s floors. A slot
     overlapping a house-plug block never overwrites it — the detector
-    block stands and the overlap is logged for review."""
+    block stands and the overlap is logged for review. Partial-overlap
+    tightening (gate fix, 2026-11-13): a slot overlapping a detector
+    block by <50% of the slot's duration never becomes a standalone
+    block — it is merged INTO the most-overlapped detector block,
+    extending that block to cover the slot (the 286 "cha" slot,
+    899.4-927.1, overlapped the Ghostbed block by only 32% and passed
+    the gate as an unnamed false block). A slot partially overlapping
+    only house-plug blocks is dropped instead; the detector block
+    stands."""
     starts = [w[0] for w in a_words]
     ends = [w[1] for w in a_words]
     votes = _word_votes(a_words, candidates)
@@ -2882,11 +3067,50 @@ def _merge_slots(blocks, gated_slots, a_words, candidates, sponsors,
             log(f"  slot {s:.1f}-{e:.1f} exceeds MAX_AD_LEN; skipped")
             continue
         overlapping = []
+        partial = []
         for i, b in enumerate(blocks):
             ov = _slot_overlap(s, e, b[0], b[1])
             if ov >= 0.5 * (e - s):
                 overlapping.append((ov, i, b))
+            elif ov > 0:
+                partial.append((ov, i, b))
         if not overlapping:
+            if partial:
+                best = None
+                for ov, i, b in partial:
+                    nm = ad_chapter_name(b[2], sponsors)
+                    if nm and is_house_plug(nm, house_plugs):
+                        continue
+                    if best is None or ov > best[0]:
+                        best = (ov, i, b)
+                if best is not None:
+                    _ov, i, b = best
+                    pct = 100.0 * _ov / (e - s) if e > s else 0.0
+                    ns, ne = min(s, b[0]), max(e, b[1])
+                    log(f"  slot {s:.1f}-{e:.1f} partially overlaps "
+                        f"detector block {b[0]:.1f}-{b[1]:.1f} "
+                        f"({_ov:.1f}s, {pct:.0f}% of slot); merged into "
+                        f"block -> {ns:.1f}-{ne:.1f}")
+                    merged.append((ns, ne, b[2], sharpness(ns, "start"),
+                                   sharpness(ne, "end")))
+                    sources.append("merged")
+                    used.add(i)
+                    continue
+                log(f"  slot {s:.1f}-{e:.1f} partially overlaps only "
+                    "house-plug blocks; dropped")
+                continue
+            # Density floor (2026-11-14): a standalone slot whose
+            # A-side words barely differ from B is not an ad read
+            # — it is a repeated sign-off / outro tail (Huberman
+            # Mitochondria, density 0.176, 3 differing words, no
+            # brand, no ad copy). Across all 26 gated slots
+            # measured, densities are 0.176 for the one false slot
+            # and 0.677-1.0 for everything else; 0.5 sits in the
+            # middle of that gap.
+            if slot.get("density", 0) < SLOT_FLOOR_DENSITY_MIN:
+                log(f"  slot {s:.1f}-{e:.1f} density "
+                    f"{slot.get('density')} below floor; skipped")
+                continue
             merged.append((s, e, slot["label"],
                            sharpness(s, "start"), sharpness(e, "end")))
             sources.append("slot")
@@ -3311,6 +3535,18 @@ def process_episode(item, state, channel_link=None, pcfg=None):
     blocks, suspects = detect_ad_blocks(words, sponsors, silences, mp3_path,
                                         chapters, own_domains=own_domains,
                                         candidates_out=candidates_out)
+    # Cross-episode recurrence, positive direction (2026-11-11, KEPT):
+    # recurring sponsor-copy spans from prior episodes of this show
+    # extend already-detected blocks to the span's bounds. Runs after
+    # detection and before the dynamic-slot flow (the harness order);
+    # the slot flow can still replace a block's edges with the more
+    # accurate slot edges. Any failure degrades to detector-only.
+    try:
+        blocks = _apply_xep_corroboration(blocks, words, sponsors,
+                                           silences, candidates_out,
+                                           EP_DIR, slug)
+    except Exception as exc:
+        log(f"  xep-corroboration skipped ({exc!r}); detector-only output")
     # Missed-sponsor check covers description sponsors only: a house plug
     # not mentioned in a given episode is normal, not a miss.
     missed = check_missed_sponsors(words, desc_sponsors, blocks)
@@ -3325,6 +3561,58 @@ def process_episode(item, state, channel_link=None, pcfg=None):
         desc_sponsors, own_domains, candidates_out, blocks)
     blocks = dyn["blocks"]
     block_sources = dyn["sources"]
+
+    # Back-to-back split (2026-11-13): rescue a second sponsor's ad
+    # trimmed from the head/tail of a fused heat-map region (see
+    # sb_eval/ab/back_to_back_split/NOTE.md). Post-processing on the
+    # final blocks + raw candidates, after the slot flow so rescued
+    # blocks keep source "rescue" in block_sources. KEPT 2026-11-14
+    # (owner's decision): the A/B rule fails on the SB letter (median
+    # 4.7->4.8s, within-1s 26.4%->25.7%) because SB merges
+    # back-to-back pairs into single labels; every rescue block
+    # verified a real ad.
+    from split_rescue import rescue_fused_blocks
+    blocks, block_sources, _rescues = rescue_fused_blocks(
+        blocks, candidates_out, words, sponsors, sources=block_sources)
+
+    # Publisher-transcript differential (idea 6): corroborate marked
+    # blocks, hold the rest as suspects. Never marks on its own;
+    # any failure degrades to detector-only (status logged).
+    td_enabled = bool(pcfg.get("transcript_diff", True)) if pcfg else True
+    td_result = {"status": "skipped", "transcript_url": None,
+                 "transcript_type": None, "coverage": None,
+                 "n_anchors": 0, "gaps": [], "error": None}
+    td_corr = {"corroborated": [], "held": []}
+    if td_enabled and item.get("transcript_tags"):
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import transcript_diff as _td
+        td_result = _td.run_transcript_diff(
+            words, item.get("transcript_tags") or [], work_dir=work,
+            sponsors=[b["label"] for b in
+                      extract_sponsors(item.get("description") or "")])
+    if td_result["status"] == "ok" and td_result["gaps"]:
+        td_corr = _td.corroborate_blocks(td_result["gaps"], blocks)
+        for c in td_corr["corroborated"]:
+            i = c["block_index"]
+            # Record the boost; never lower, cap at 0.95 (the boost
+            # is recorded, not applied to a numeric confidence —
+            # AdChisel blocks carry no confidence field today; see
+            # §5 for the field this lands in).
+            block_sources[i] = block_sources[i] + "+transcript-diff"
+            log(f"  transcript-diff corroborates block "
+                f"{blocks[i][0]:.0f}-{blocks[i][1]:.0f}s "
+                f"(+{c['boost']:.2f}"
+                f"{' offset-confirmed' if c['offset_confirmed'] else ''})")
+        for g in td_corr["held"]:
+            suspects.append((g["start"], g["end"], "transcript-diff:held"))
+            log(f"  SUSPECT transcript-diff held gap "
+                f"{g['start']:.1f}-{g['end']:.1f}s "
+                f"({g['duration']:.0f}s, {g['words']} words) — held, not marked")
+    elif td_result["status"] in ("error", "unreliable"):
+        log(f"  transcript-diff: {td_result['status']} "
+            f"({td_result.get('error') or 'coverage ' + str(td_result.get('coverage'))}); "
+            f"detector-only output")
+    # status "skipped" (no tag / disabled): silent, as today.
 
     # Chapters model (2026-10-28, per the owner): no cutting. The published
     # file is the full original episode with detected ads marked as
@@ -3391,6 +3679,20 @@ def process_episode(item, state, channel_link=None, pcfg=None):
         "dynamic_b_duration": dyn["b_duration"],
         "differing_token_rate": dyn["differing_token_rate"],
         "dynamic_n_anchors": dyn["n_anchors"],
+        "transcript_diff": {
+            "status": td_result["status"],
+            "transcript_url": td_result["transcript_url"],
+            "transcript_type": td_result["transcript_type"],
+            "coverage": td_result["coverage"],
+            "n_anchors": td_result["n_anchors"],
+            "gaps": td_result["gaps"],
+            "corroborated": [{"block_index": c["block_index"],
+                              "boost": c["boost"],
+                              "offset_confirmed": c["offset_confirmed"]}
+                             for c in td_corr["corroborated"]],
+            "held": td_corr["held"],
+            "error": td_result["error"],
+        },
     }
     with open(os.path.join(work, "report.json"), "w") as f:
         json.dump(report, f, indent=2)
@@ -3408,6 +3710,11 @@ def process_episode(item, state, channel_link=None, pcfg=None):
         "dynamic_slots_rejected": dyn["dynamic_slots_rejected"],
         "dynamic_attempts": dyn["dynamic_attempts"],
         "dynamic_pending": dyn["dynamic_pending"],
+        "transcript_diff_status": td_result["status"],
+        "transcript_diff_coverage": td_result["coverage"],
+        "transcript_diff_gaps": len(td_result["gaps"]),
+        "transcript_diff_corroborated": len(td_corr["corroborated"]),
+        "transcript_diff_held": len(td_corr["held"]),
         "missed_sponsors": [m["label"] for m in missed],
         "suspects": [{"label": l, "seconds": e - s} for s, e, l in suspects],
         "suspects_reel": suspects_reel_name,
