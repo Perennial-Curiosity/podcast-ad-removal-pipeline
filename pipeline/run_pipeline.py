@@ -29,9 +29,11 @@ is uncertain for an episode, the episode is left unmarked and flagged.
 """
 
 import difflib
+import fcntl
 import glob
 import hashlib
 import json
+import math
 import os
 import re
 from datetime import date, datetime, timezone
@@ -39,7 +41,10 @@ import subprocess
 import sys
 import time
 import urllib.request
+import urllib.error
 from html import unescape
+
+from .tlds import TLDS, SPOKEN_STEM_TLDS
 
 # The model snapshot lives in the default HF cache; force offline so the
 # (broken-proxy) network is never touched.
@@ -298,17 +303,20 @@ def extract_sponsors(description_html):
     Two sources: rel="sponsored" links (ground truth), and plain-text
     sponsor lists ("THANK YOU TO OUR SPONSORS! AG1 ... SHOPIFY ...").
     """
+    # Build TLD regex from shared list
+    tld_pattern = "|".join(sorted(TLDS, key=len, reverse=True))
+    tld_regex = rf"\.({tld_pattern})$"
+
     brands = []
     for m in re.finditer(r'<a[^>]*rel="sponsored"[^>]*>(.*?)</a>', description_html, re.I | re.S):
         text = re.sub(r"<[^>]+>", "", m.group(1)).strip().lower()
         text = re.sub(r"^https?://(www\.)?", "", text)
         text = text.split("/")[0]
-        # NOTE: keep this TLD list in sync with the plain-text branch below
-        # and with find_url_mentions' tlds. Missing a TLD is a silent miss:
+        # Use shared TLD list. Missing a TLD is a silent miss:
         # SN 1101 (2026-10-22) — "canary.tools" kept its ".tools" suffix, so
         # the variant set never contained the spoken word "canary" and all
         # methods reported 0 mentions despite 16+ spoken mentions.
-        root = re.sub(r"\.(com|net|org|io|ai|tv|co|us|tools|app|dev|xyz|online|store|tech|site|cloud|me|cc|gg|life|world|news|media|agency|digital|solutions|systems|network|security)$", "", text)
+        root = re.sub(tld_regex, "", text)
         variants = {root, root.replace(".", " "), root.replace("-", " ")}
         # Bare domain stem: the host says "Canary", not "canary.tools" —
         # and Whisper tokenizes spoken URLs into separate words (and may
@@ -369,9 +377,8 @@ def extract_sponsors(description_html):
                                          "facebook", "youtube", "patreon", "pepperbox")):
                 continue
             host = domain.split("/")[0]
-            # Same extended TLD list as the sponsored-links branch above;
-            # see the SN 1101 note there about silent misses.
-            root = re.sub(r"\.(com|net|org|io|ai|tv|co|us|tools|app|dev|xyz|online|store|tech|site|cloud|me|cc|gg|life|world|news|media|agency|digital|solutions|systems|network|security)$", "", host)
+            # Use shared TLD list; see the SN 1101 note above about silent misses.
+            root = re.sub(tld_regex, "", host)
             # strip common marketing prefixes (drink, get, try, take, shop, join)
             root_stripped = re.sub(r"^(drink|get|try|take|shop|join)", "", root)
             if not root or len(root) < 2:
@@ -488,7 +495,9 @@ def load_state():
 def save_state(state):
     tmp = STATE_PATH + ".tmp"
     with open(tmp, "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
         json.dump(state, f, indent=2)
+        fcntl.flock(f, fcntl.LOCK_UN)
     os.replace(tmp, STATE_PATH)
 
 
@@ -505,6 +514,9 @@ def download(url, dest, retries=6):
                 log(f"downloading {url}")
             req = urllib.request.Request(url, headers={"User-Agent": "podcast-ad-pipeline/1.0"})
             with urllib.request.urlopen(req, timeout=120) as r, open(dest, "wb") as f:
+                # urllib doesn't raise on 4xx/5xx — check status explicitly
+                if hasattr(r, "status") and r.status >= 400:
+                    raise urllib.error.HTTPError(url, r.status, r.reason, r.headers, None)
                 while True:
                     chunk = r.read(1 << 20)
                     if not chunk:
@@ -529,6 +541,9 @@ def download(url, dest, retries=6):
 
 
 def probe_duration(path):
+    # Check ffprobe exists first
+    if subprocess.run(["which", "ffprobe"], capture_output=True).returncode != 0:
+        raise FileNotFoundError("ffprobe not found in PATH — install ffmpeg")
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "csv=p=0", path],
@@ -1059,11 +1074,14 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
         return labels[0] if labels else 'ad'
 
     # Build heat map: per-second vote counts
-    duration = int(words[-1][0]) + 1
+    duration = int(math.ceil(words[-1][1]))  # use word END time, ceil for full coverage
     votes = [0] * duration
     vote_detail = [[] for _ in range(duration)]  # which methods voted
     for s, e, label, method in candidates:
-        for sec in range(int(s), min(int(e) + 1, duration)):
+        # Clamp to valid range; int(e) may equal duration if e is exactly on boundary
+        sec_start = max(0, int(s))
+        sec_end = min(duration - 1, int(e))
+        for sec in range(sec_start, sec_end + 1):
             votes[sec] += 1
             vote_detail[sec].append((method, label))
 
@@ -1172,10 +1190,6 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
             if method == 'cluster':
                 import re as _re2
                 from difflib import SequenceMatcher as _SM
-                _tlds = {"com", "net", "org", "io", "tv", "co", "ai",
-                         "me", "tools", "app", "dev", "xyz", "online",
-                         "store", "tech", "site", "cloud", "cc", "gg",
-                         "life", "world", "news", "media"}
                 _p = label.lower().replace(' ', '')
                 _allowed = {_p}
                 for _sp in sponsors:
@@ -1185,7 +1199,7 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
                         _norm = _v.lower().replace(' ', '')
                         _allowed.add(_norm)
                         for _comp in _re2.split(r'[.\s]+', _v.lower()):
-                            if _comp and _comp not in _tlds:
+                            if _comp and _comp not in SPOKEN_STEM_TLDS:
                                 _allowed.add(_comp)
                 _anchored = False
                 for _b, _t in _bare_times:
@@ -2103,20 +2117,16 @@ def find_url_positions(nw):
     """All spoken URL positions: {word_index: brand stem}.
 
     Shared by find_url_mentions (CTA-gated anchors) and _method_url
-    (bare URLs). NOTE: keep in sync with extract_sponsors' TLD lists. A
-    missing TLD is a silent miss: SN 1101 (2026-10-22) — the spoken
-    "canary.tools" URL produced no URL anchor because "tools" was not
-    in this set.
+    (bare URLs). Uses shared TLDS. A missing TLD is a silent miss:
+    SN 1101 (2026-10-22) — the spoken "canary.tools" URL produced no
+    URL anchor because "tools" was not in the set.
     """
-    tlds = {"com", "net", "org", "io", "tv", "co", "ai", "me", "tools",
-            "app", "dev", "xyz", "online", "store", "tech", "site",
-            "cloud", "cc", "gg", "life", "world", "news", "media"}
     L = len(nw)
     url_at = {}
     for i in range(L):
         w = nw[i]
         brand = None
-        if w == "dot" and i + 1 < L and nw[i + 1].rstrip(".,") in tlds:
+        if w == "dot" and i + 1 < L and nw[i + 1].rstrip(".,") in TLDS:
             parts = []
             for j in (i - 1, i - 2):
                 if j < 0:
@@ -2129,7 +2139,7 @@ def find_url_positions(nw):
             parts.reverse()
             if parts:
                 brand = "".join(parts)
-        elif w.startswith(".") and w[1:].rstrip(".,") in tlds and i > 0:
+        elif w.startswith(".") and w[1:].rstrip(".,") in TLDS and i > 0:
             pw = nw[i - 1].strip(".,")
             if re.fullmatch(r"[a-z0-9'-]{2,}", pw) and pw not in (
                     "our", "my", "the", "website", "site"):
