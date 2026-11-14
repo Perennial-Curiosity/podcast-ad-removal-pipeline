@@ -2376,18 +2376,20 @@ starts at the split point. Variant minus those two edges: median
 12.02s). SB structurally cannot represent back-to-back pairs, so a
 correct split is scored as a 70s+ start error. The detector is
 strictly better with the mechanism (2 missed SB labels recovered, 0
-content false blocks added). The call is the owner's: keep it despite
-the letter, or discard it per the rule. If kept, the SB baseline
-becomes recall 0.692 / FP 39 by SB counting. Known limitation: one
+content false blocks added). **Decision 2026-11-14: the owner kept it
+despite the letter.** If kept, the SB baseline becomes recall 0.692 /
+FP 39 by SB counting. Known limitation: one
 rescue per side per block — lex-499's Element/BetterHelp reads stay
 unmarked and the NetSuite read sits inside the Shopify-labeled
 block; a future step could iterate the rescue over a block's tail.
 
 **Status:** 306-line patch (split_rescue.patch: new
 pipeline/split_rescue.py + 13-line wiring hunk applying the rescue
-after the slot flow) HELD, pending the owner's call. Verified:
-applies cleanly to a fresh pristine copy, both files compile,
-patched module reproduces the tested rescue, anonymization-clean.
+after the slot flow) KEPT by the owner's decision 2026-11-14; being
+folded into the combined patch as piece 5 (same treatment as the gate
+fix), still held until merge day. Verified: applies cleanly to a
+fresh pristine copy, both files compile, patched module reproduces
+the tested rescue, anonymization-clean.
 The live pipeline was never touched. Records:
 `sb_eval/ab/back_to_back_split/` (split_rescue.py, NOTE.md,
 tts_results.json, synthetic_results.json, null_results.json,
