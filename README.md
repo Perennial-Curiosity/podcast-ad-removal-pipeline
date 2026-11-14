@@ -236,12 +236,43 @@ Notes:
   ground truth: all 7 dynamic ads found with mean edge error 0.42s
   (13/14 edges within 1s); 286 went from 7/9 to 9/9 ads at the 80%
   coverage scorer and 287 from 6/8 to 7/8, with all host-read
-  blocks unchanged. One gate gap remains: on 286 a false slot
-  inside the real Ghostbed ad (a transcription-hallucination
-  region) passes the gate and becomes an unnamed extra block.
+  blocks unchanged. Gate gap, closed 2026-11-13 and merged
+  2026-11-14: on 286 a false slot inside the real Ghostbed ad (a
+  transcription-hallucination region) used to pass the gate and
+  become an unnamed extra block; a slot overlapping a detector
+  block by under 50% now merges into the block instead — the
+  Ghostbed block becomes 899.4–1006.7 and 286 scores 9/9 at the
+  80% coverage scorer with zero false blocks.
   A standalone `--slots-only <slug>` mode prints the gated slots
   for one episode as a manual-marking aid without touching
   pipeline state. Full numbers in `TESTS.md`.
+- **Six-mechanism merge (2026-11-14, live):** the combined patch
+  (1,870 lines) is now the pipeline — `pipeline/run_pipeline.py`
+  plus three new modules (`xep_recurrence.py`,
+  `transcript_diff.py`, `split_rescue.py`). (1) Substring-leak
+  guard: short brand variants need a word boundary, so "aura" no
+  longer matches "restaurant" and "stop" no longer matches
+  "stopping" or "Christopher" (217 phantom hits removed, zero
+  regressions). (2) Cross-episode recurrence, positive direction
+  only: a sponsor recurring across the show's other episodes
+  corroborates a block (recall 0.673 → 0.701, false blocks
+  36 → 33 on the 25-episode set). (3) Publisher-transcript
+  differential, corroboration only: where the publisher supplies
+  a transcript, gaps in it are ad evidence, trimmed to the first
+  and last ad word with a +0.50s end pad. (4) Gate tightening for
+  partial-overlap slots (see above). (5) Back-to-back split
+  rescue: a second sponsor's ad fused into one heat-map region is
+  split out (recovers Ridge on the synthetic-voice test episode
+  and Stop Box on the spliced test episode). (6) Density floor
+  for standalone slot blocks: a slot is only marked when at
+  least half its words differ between the two downloads —
+  removes the one non-ad outro tail, keeps all 6 real dynamic
+  ads. Post-merge numbers on the live pipeline: 25-episode set
+  recall 0.701 (75/107), false blocks 38, median edge error 4.8s,
+  within 1s 26.0%; slot-flow false blocks 44 → 43; 286/287 slot
+  flow 286 9/9 at ≥80% (636.3/673s, 0 false), 287 7/8 (477.3/531s,
+  1 false — Pepperbox house plug); SN 1101 still 6 blocks. Full
+  numbers in `TESTS.md`.
 - **Ollama / LLM reviewer: evaluated 2026-10-14, REJECTED.** It hallucinated
   sponsor reads, missed real ads, produced garbled timestamps, and was
   too slow and memory-hungry. Do not re-add without a fresh evaluation.
