@@ -159,11 +159,12 @@ SITE_DIR = None
 STATE_PATH = None
 HOUSE_PLUGS = []
 GITHUB_FEED_URL = None
+PODCAST_ID = None
 
 
 def init_podcast(podcast_id):
     """Load config and set per-podcast globals. Returns (cfg, pcfg)."""
-    global FEED_URL, EP_DIR, SITE_DIR, STATE_PATH, HOUSE_PLUGS, GITHUB_FEED_URL
+    global FEED_URL, EP_DIR, SITE_DIR, STATE_PATH, HOUSE_PLUGS, GITHUB_FEED_URL, PODCAST_ID
     cfg, pcfg = load_config(podcast_id)
     paths = podcast_paths(podcast_id)
     FEED_URL = pcfg["feed_url"]
@@ -172,6 +173,7 @@ def init_podcast(podcast_id):
     STATE_PATH = paths["state_path"]
     HOUSE_PLUGS = house_plugs(pcfg)
     GITHUB_FEED_URL = github_feed_url(cfg, pcfg)
+    PODCAST_ID = podcast_id
     for d in (paths["root"], EP_DIR, SITE_DIR):
         os.makedirs(d, exist_ok=True)
     return cfg, pcfg
@@ -3498,6 +3500,36 @@ def slots_only_mode(slug, items, channel_link):
             print(f"  {s:.1f}-{e:.1f} {l} [{src}]")
 
 
+def _record_history(item, blocks, block_sources, duration):
+    """Append this episode's blocks to the per-podcast history file
+    (the learning component's collection step, 2026-11-14; see
+    history/README.md). Called once, after a successful detection.
+    Never fails an episode run: any problem is logged and the run
+    continues. A zero-block episode still records one zero-ad row so
+    the average ad count stays honest (see podcast_history)."""
+    try:
+        import hashlib as _hashlib
+        try:
+            import podcast_history as _ph
+        except ImportError:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import podcast_history as _ph
+        version = _hashlib.md5(open(__file__, "rb").read()).hexdigest()[:12]
+        result = _ph.append_episode(
+            _ph.default_history_dir(), PODCAST_ID, item["guid"],
+            item["title"], duration, item.get("pubDate", ""),
+            blocks, block_sources, HOUSE_PLUGS, version)
+        if result["ok"] and result["rows_written"]:
+            log(f"  history: appended {result['rows_written']} rows "
+                f"to {PODCAST_ID}.csv")
+        elif result["ok"]:
+            log(f"  history: skipped ({result['skipped']})")
+        else:
+            log(f"  history: write failed ({result['error']}); continuing")
+    except Exception as exc:  # never fail an episode run on history
+        log(f"  history: skipped ({exc!r}); continuing")
+
+
 def process_episode(item, state, channel_link=None, pcfg=None):
     slug = re.sub(r"[^a-z0-9]+", "-", item["title"].lower()).strip("-")[:60]
     work = os.path.join(EP_DIR, slug)
@@ -3721,6 +3753,7 @@ def process_episode(item, state, channel_link=None, pcfg=None):
         "suspects_reel_bytes": os.path.getsize(os.path.join(SITE_DIR, suspects_reel_name)) if suspects_reel_name else 0,
     }
     save_state(state)
+    _record_history(item, blocks, block_sources, duration)
     log(f"done: {item['title']} -- marked {len(blocks)} ads as chapters")
     return report
 
