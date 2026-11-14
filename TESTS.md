@@ -2478,6 +2478,93 @@ dynslots_floor_results.json, `combined_repro23/`,
 
 ---
 
+## 40. Pre-roll-only history voter (leave-one-out) — DISCARDED under the decision rule (2026-11-14)
+
+**Why it was a candidate:** the per-podcast history file (entry: built
+2026-11-14, 129 rows / 26 episodes / 8 shows) showed only two shows
+with a tight, threshold-met pre-roll: Huberman Lab (8 eps, slot 1 at
+9.9% ±2.12) and Security Now (5 eps, slot 1 at 3.06% ±2.39).
+Unsubscribe had the tightest grid (slots 1–9 std ≤3.88) but only 3
+episodes — below the 5-record gate. The full position prior was not
+supported; this was the narrowest viable first voter.
+
+**Design (frozen before the run, in `sb_eval/ab/history_preroll/NOTE.md`):**
+slot 1 only; gate ≥5 episodes in the show's history file; leave-one-out
+prior (slot-1 mean/std of start_pct from the loader, population std,
+the held-out episode's rows excluded by episode_id); window = mean ±
+max(2σ, 3.0 points), clipped to [0, 100]; one heat-map vote (method
+`history-preroll`, label `history-prior`, artifact-classed so it can
+never name a block, never in `_single_methods`, never a suspect —
+corroboration-only by construction). Implemented as a patched copy of
+the live pipeline (`sb_eval/ab/history_preroll/pipeline_patched/`, 3
+edits), driven by `run_variant.py`. Smoke-tested first: vote off,
+patched == frozen exactly; vote on, no block ever labeled
+`history-prior`.
+
+**Baseline reproduction (fresh `combined_repro25`, frozen copy of the
+live pipeline): exact** — recall 0.701 (75/107), FP 38, median 4.8s,
+mean 13.2s, within-1s 26.0%, identical to `merged_live` on every
+headline, per-show, and per-episode detect.json.
+
+**Results (full 25-episode SB set):** recall 0.701 → 0.701 (75/107),
+FP 38 → 38, median 4.8s → 4.8s, mean 13.2s → 13.1s, within-1s 26.0%
+→ 26.0%, within-2s 36.7% → 36.7%, max 84.9s → 79.3s. Huberman Lab:
+recall 0.75 flat, median 0.8s flat, mean 16.7 → 16.6s, within-1s
+52.1% flat. Security Now: every headline identical. Matched-edge
+deltas: 1 better / 1 worse / 74 unchanged. Silence verified: 12
+episodes below the gate (Unsubscribe 3, Modern Wisdom 4, Vergecast 3,
+99pi/Acquired/Lex 1 each) have block-identical variant output. The
+voter fired on 13 episodes (8 Huberman, leave-one-out n=7, slot-1 mean
+9.57–10.56%, std 1.29–2.26; 5 Security Now, n=4, mean 2.18–3.75%, std
+1.81–2.65); windows ran ~[5.3%, 14.5%] on Huberman and [0%, 5.8–8.2%]
+on Security Now. 9 of the 11 visibly affected episodes changed only
+in the method list (`history-preroll` joins, spans unchanged).
+
+**Adjudication of the two real changes (both Huberman, both inside SB
+labels that merge a back-to-back pair into one):** GAIN — Our Place on
+true-happiness (1056.0–1121.3), a real sponsor read the baseline
+missed; the history vote extended the Helix Sleep region's head and
+the split rescue split the Our Place head off. It counts as an SB
+false positive only because the label was already "used" by the Helix
+block (one-to-one matching) — the same measurement artifact as the
+split rescue's own test. LOSS — Rorra on neuroscience-of-emotions
+(1010.9–1097.3), a real sponsor read the baseline marked; the history
+vote bridged the 5-second vote dip between the Helix Sleep and Rorra
+heat-map regions (1039→1044), fusing them into one 926–1106s region,
+and the label picker named it Helix Sleep. The split rescue — built
+for exactly this fusion — could not fire: it is mention-gated, and
+Rorra has zero findable mentions (Whisper hears "Rora", the sponsor
+variants are `['rorra']`). Net adjudicated effect: +1 real ad, −1 real
+ad — a wash, with a new structural harm (the ~600–900s-wide prior
+window bridging inter-ad dips) that the existing rescue cannot always
+repair.
+
+**Conclusion: DISCARD.** Median flat and within-1s flat — fails the
+letter of the decision rule. More data would not resolve it: the harm
+is structural (window width vs. inter-ad dips), not sample size; the
+gain is real but small (1 ad in 13 fired episodes). The history file
+itself stands (the collector is merged; the data is sound) — only this
+voter in this form is discarded. Two paths forward: (1) narrow the
+window (±1σ instead of ±2σ, or cap the width) and re-test, to see
+whether the corroboration gain survives without the fusion harm; (2)
+fix the fusion interaction first (make the split rescue see
+URL-anchored sponsors like Rorra, or guard the history vote against
+bridging a vote dip between two different-sponsor regions), then
+re-test. Records: `sb_eval/ab/history_preroll/` (NOTE.md,
+run_variant.py, run_baseline.py, priors.json, priors_run.json,
+results.json, `combined_repro25/`).
+
+Caveats: the live pipeline md5 changed mid-build (collector merge,
+`6d19861772…` → `bc971d12f812…`); the frozen copy was diffed against
+the fold6 s7 tree and the only differences are the collector's
+additions — detection-identical. The first variant run wrote run-time
+priors to `priors.json`, clobbering the frozen table; restored from the
+pre-run copy, run-time file saved as `priors_run.json`, and the build
+script now dumps there. SN leave-one-out priors use 4 episodes (the
+gate is on the 5-episode file count).
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
