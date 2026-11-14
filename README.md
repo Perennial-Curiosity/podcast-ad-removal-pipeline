@@ -44,11 +44,22 @@ mechanism.
   below a dashes dividing line, each marked ad with its start time).
 - **Regenerated RSS feed** (`feeds/<Podcast-Name>` in the Clean-Podcasts
   repo) for Podcast Addict.
+- **Per-podcast history file** (2026-11-14) — after each processed
+  episode, its detected ads are appended to a CSV (one row per ad:
+  episode, ad index, sponsor, dynamic or host-read, start/end in
+  seconds and as a percentage of playtime, duration, boundary
+  sharpness, methods that voted). The file is local working data
+  (not published); it records what the detector found so ad-load
+  patterns per show can be learned from later. Collection only —
+  no history-based voting exists yet.
 
 ## Repository layout
 
 - `pipeline/run_pipeline.py` — the engine: fetch, transcribe, detect, mark
   ad chapters, generate feeds.
+- `pipeline/podcast_history.py` — per-podcast ad history: append each
+  processed episode's blocks to a CSV and compute per-slot averages
+  (used for learning ad-load patterns; collection only, no voter).
 - `pipeline/publish_github.py` — publish the newest marked episode:
   GitHub release + feed push to the Clean-Podcasts repo.
 - `pipeline/regen_feed.py` — regenerate a feed without processing episodes.
