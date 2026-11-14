@@ -2565,6 +2565,121 @@ gate is on the 5-episode file count).
 
 ---
 
+## 41. URL-anchored split rescue + history-vote bridging guard — FAILS THE LETTER, ADJUDICATED +2 REAL ADS, OWNER'S CALL (2026-11-14)
+
+**Why it was a candidate:** entry 40's pre-roll voter was discarded
+because of one structural harm — on neuroscience-of-emotions the
+history vote bridged a 5-second dip between the Helix Sleep and Rorra
+regions, fusing them, and the split rescue could not fire because
+Rorra has zero findable mentions (Whisper hears "Rora", the sponsor
+variants are `['rorra']`). Rorra's block did carry `cta/url` evidence.
+Two candidate fixes, both frozen in `sb_eval/ab/fusion_fix/NOTE.md`
+before any test run, both generic (evidence-driven, no hardcoded
+names):
+
+(a) **URL-anchored split rescue** (`split_rescue_url.py`, modified copy
+of live `split_rescue.py`): tried only when the mention-gated search
+finds no candidate. Per side, a stem X qualifies if a `url` candidate
+overlaps the extension by ≥30s AND a `cta` candidate with the same stem
+X overlaps by ≥30s, X fuzzy-matches a description sponsor
+(SequenceMatcher ≥0.85, so `rora` vs `rorra` = 0.889), the rescue
+sponsor differs from the block sponsor, and the block sponsor has no
+mentions inside the extension. Tail edges: start = block end, end =
+url segment end clipped to region end. Head edges: start = cta segment
+start clipped to region start, end = block start.
+
+(b) **History-vote bridging guard** (live copy + voter method + guard):
+inserted in `detect_ad_blocks` just before the heat-map build. It
+computes baseline regions (≥2 votes) from non-history candidates and
+their labels via the pipeline's own `_pick_label`; for each pair of
+adjacent baseline regions with DIFFERENT labels, if every second of
+the gap already carries ≥1 vote (so the history vote would connect
+them), it punches a hole in the history segment over the gap.
+Otherwise the history segment is untouched — the Our Place gain is
+safe because its evidence at 1055–1089 sits in a gap whose 1040–1054
+seconds carry 0 votes.
+
+**Baseline reproduction (fresh `combined_repro26`): exact** — recall
+0.701 (75/107), FP 38, median 4.8s, mean 13.2s, within-1s 26.0%
+(39/150), within-2s 36.7%, max 84.9s; identical to `merged_live` on
+every headline AND 0 episodes differing in blocks+suspects.
+
+**Fix (a) alone (`fusion_rescue_url`):** recall 0.701 flat, FP 38 →
+39 (+2.6%), median 4.8s flat, mean 13.2s flat, within-1s 26.0% flat,
+max 84.9s flat; every show identical to baseline on
+recall/median/within-1s. The URL anchor fired exactly once in 25
+episodes: Rorra tail rescue 919.7–999 on Huberman
+what-humans-animals-and-plants-tell-us-a (from the Eight Sleep block,
+region [832, 999], anchor `url`). Transcript-verified a REAL Rorra
+read ("Today's episode is also brought to us by Rora… Rora.com slash
+Huberman"), the same script as the neuroscience episode. SB counts it
+as an FP because the label 832.6–999.0 is one merged pair label
+already matched by Eight Sleep (rescue overlap 79.3s = 47.7%, below
+the 50% threshold). Rescue regression (stock vs URL rescue):
+synthetic 23/27 ≥50%, 19/27 ≥80%, FP 3, median 2.55s, Stop Box
+rescued 0.938 — identical; null 8 blocks — identical; TTS 9/9 ≥50%,
+8/9 ≥80%, FP 0, median 1.32s, Ridge rescued 0.978 — identical. The
+URL path adds nothing to the mention-anchored cases and breaks
+nothing. **Decision-rule verdict: FAILS the letter** (median and
+within-1s flat). Adjudicated: **+1 real ad, 0 lost, 0 false firings**
+— the same shape as the split-rescue precedent (entry 38).
+
+**Fix (b) + voter (`history_guard`):** recall 0.701 flat, FP 38 →
+39 (+2.6%), median 4.8s flat, mean 13.2 → 13.1s, within-1s 26.0%
+flat, max 84.9 → 79.3s; every show identical to baseline on
+recall/median/within-1s. Neuroscience: Helix 926.3–1018.9 AND Rorra
+1010.9–1097.3 — the Rorra block is identical to baseline; the fusion
+is prevented. Heat-map proof: the guard run has two regions 926–1040
+and 1044–1106 (hole punched over the 1040–1044 dip); the voter-alone
+run has one fused region 926–1106. True-happiness: Our Place
+1056.0–1121.3 AND Helix 1121.3–1241.2 — identical to the voter-alone
+run; the gain survives. All other block diffs vs baseline are
+label-string-only; the 12 silent episodes are byte-identical.
+**Decision-rule verdict: FAILS the letter.** Adjudicated: **+1 real
+ad (Our Place), 0 lost (Rorra kept).**
+
+**Combination (a) + (b) + voter (`history_guard_url`):** recall 0.701
+flat, FP 38 → 40 (+5.3%, within the ≤~10% allowance), median 4.8s
+flat, mean 13.2 → 13.1s, within-1s 26.0% flat, max 84.9 → 79.3s.
+Span diffs vs baseline are exactly three, nothing else: neuroscience
+Helix start 950 → 926.3 (voter head-extension) with Rorra kept at
+baseline edges; true-happiness Our Place added 1056.0–1121.3;
+what-humans-animals Rorra added 919.7–1001.0 (URL anchor fired; the
+2s past the 999 read end is the history vote extending the region
+end, not the url segment). **Decision-rule verdict: FAILS the
+letter.** Adjudicated: **+2 real ads (Our Place, Rorra on
+what-humans-animals), 0 lost, 0 false rescues.** SB counting cannot
+see any of the three gains: each is the second ad of a merged-pair SB
+label already matched by the first ad.
+
+**Conclusion: the numbers fail the letter of the decision rule on all
+three variants (median and within-1s flat), but the failure is the
+same SB measurement artifact as entry 38 — the gains are second ads
+of merged-pair labels. Adjudication shows +2 real ads, 0 lost, 0
+false rescues for the combination. This is the owner's call, same
+precedent as the split rescue.** Held patches, both verified (dry-run
++ real apply clean to a fresh copy of the live pipeline, compile,
+byte-identical to the tested files): `rescue_url.patch` (170 lines,
+fix (a) only, against live `pipeline/split_rescue.py`) and
+`voter_guard.patch` (140 lines, voter method + guard, against live
+`pipeline/run_pipeline.py` — the guard is part of the voter feature,
+never folded into the fix patch; the combination was tested as the two
+patches applied together). Records: `sb_eval/ab/fusion_fix/`
+(NOTE.md, split_rescue_url.py, rescue_url.patch, voter_guard.patch,
+run logs, synthetic_results.json, tts_results.json, null_results.json),
+`sb_eval/ab/fusion_rescue_url/`, `sb_eval/ab/history_guard/`,
+`sb_eval/ab/history_guard_url/`, `sb_eval/ab/combined_repro26/`.
+
+Correction recorded: the NOTE.md claim that the (a) Rorra rescue on
+neuroscience overlaps the SB label by 90.7% and matches at ≥50% was
+wrong — it used the truth block (86.4s) as the denominator. Against
+the SB label (925.9–1097.7, 171.8s) the overlap is 78.8s = 45.9%,
+below threshold; the Helix block (92.6s = 53.9%) takes the label
+instead. The rescue restores a real ad SB scoring cannot see. The
+NOTE.md is corrected.
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
