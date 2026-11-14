@@ -10,13 +10,6 @@ advertisement: detected and marked the same way, but titled
 the marked episodes to GitHub releases with a regenerated RSS feed for
 Podcast Addict.
 
-Chapters model since 2026-10-28 (per the owner): previously the pipeline
-cut ads out (with a swish at every splice) and published cleaned
-episodes plus a QA reel. On 2026-10-28 all previously published edited
-episodes were deleted, all three feeds were reverted to the original
-publisher audio, and every past episode was marked skipped — the
-chapters model applies forward only.
-
 This repo mirrors the live pipeline. A daily sync job pushes code and
 config changes from the working copy. If you change the pipeline, sync
 this repo in the same step (see "Keeping this repo in sync").
