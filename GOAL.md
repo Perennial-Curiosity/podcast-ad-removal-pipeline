@@ -28,6 +28,14 @@ That precision is the goal. Finding the ad is only step one.
 
    On feeds that serve different ads per download, a second pass downloads the episode again and compares the two transcripts: the regions that differ are inserted ads. A differing region is only marked when ad evidence backs it. Where a slot overlaps a detected block, the slot's edges replace the detector's edges. If the feed already supplies a transcript, no second download is made; the publisher transcript is the comparison instead.
 
+   Six more mechanisms, merged 2026-11-14:
+   - Short brand names need a word boundary — "aura" no longer matches "restaurant", "stop" no longer matches "stopping".
+   - Cross-episode recurrence — a sponsor that appears in the show's other episodes backs up a block.
+   - Publisher-transcript gaps — where the publisher supplies a transcript, the parts it leaves out are ad evidence; each gap is trimmed to the first and last ad word.
+   - Partial-overlap slots merge into the detected block instead of standing alone — this removes the false slot that used to appear inside a real ad.
+   - Back-to-back split — when two ads run with no gap between them, the second one is split out of the fused block.
+   - Density floor — a differing region is only marked when at least half its words differ between the two downloads; this removes a non-ad outro tail and keeps every real ad.
+
 4. **Refine the edges** — Move each start and end inward to the nearest real evidence: the first and last brand mention, call to action, or URL inside the block. Starts stay where the opening cue is — cues come before brand names. Each edge also gets a confidence score (see edge sharpness below).
 
 5. **Name the sponsor** — Attach the company or product the ad is for.
@@ -58,7 +66,8 @@ That precision is the goal. Finding the ad is only step one.
 ## Current status
 
 - Automatic marking is **paused**. The owner is marking new episodes by hand.
-- Dynamic-slot comparison integrated 2026-11-11: on feeds that serve different ads per download, a second download is transcribed and compared with the first; differing regions are inserted ads, marked only when ad evidence backs them. On the owner's two marked episodes it raised coverage at the strict scorer from 7/9 to 9/9 ads (episode 286) and 6/8 to 7/8 (episode 287), with dynamic-ad edges averaging 0.42 seconds of error. One open item: a false slot inside a real ad on 286 passes the gate — the owner decides whether to accept it or tighten the gate.
+- Dynamic-slot comparison integrated 2026-11-11: on feeds that serve different ads per download, a second download is transcribed and compared with the first; differing regions are inserted ads, marked only when ad evidence backs them. On the owner's two marked episodes it raised coverage at the strict scorer from 7/9 to 9/9 ads (episode 286) and 6/8 to 7/8 (episode 287), with dynamic-ad edges averaging 0.42 seconds of error. The false slot inside a real ad on 286 was fixed 2026-11-13 by tightening the gate: a slot overlapping a detected block by under half now merges into the block.
+- Six-mechanism merge live 2026-11-14: the substring guard, cross-episode recurrence, publisher-transcript differential, gate tightening, back-to-back split, and density floor are now in the pipeline. On the 25-episode test set: 75 of 107 ads found, 38 false blocks, median edge error 4.8 seconds, 26.0% of edges within 1 second. On the owner's two marked episodes, slot-flow scoring is 9/9 ads on 286 with no false blocks and 7/8 on 287 with one false block (the Pepperbox house plug).
 - Transcription model: still the fast base model. A larger model transcribes more accurately but does not improve edges; a hotwords switch was approved, then abandoned after three failed verifications.
 - Every marked edge now carries a sharpness score (added 2026-11-10). Moving flat edges to the nearest vote step was tested the same day and discarded — it pushed good edges out of place.
 
