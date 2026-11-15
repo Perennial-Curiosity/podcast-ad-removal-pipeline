@@ -43,13 +43,29 @@ and it is clipped against neighbouring blocks. A single stray
 mention (e.g. one 'Perfect Jean' mention inside the Ridge window)
 cannot fire it.
 
+URL-ANCHORED FALLBACK (fusion fix, 2026-11-14, A/B test — NOT merged):
+when the mention gate finds no candidate, try a cta+url pair for one
+stem inside the extension. Two independent methods agreeing on one
+sponsor is the same 2-vote evidence as the heat map, and it covers
+sponsors Whisper spells differently from the variants (Rorra: Whisper
+hears "Rora", variants are ['rorra'] — zero findable mentions, but
+cta 'rora' 1010.9-1109.7 + url 'rora' 1045.0-1105.7). The stem must
+fuzzy-match a description sponsor (>=0.85, the single-cluster anchor
+threshold), both segments must overlap the extension by >=30s, and
+the block sponsor must have no mentions inside the extension.
+Edges: tail -> block end .. url segment end (the URL is the closing
+evidence); head -> cta segment start .. block start (the CTA is the
+opening evidence).
+
 Usage (harness): rescue_fused_blocks(blocks, candidates, words,
 sponsors) -> (new_blocks, new_sources, rescue_log). blocks are the
 5-tuples from detect_ad_blocks; candidates are (s, e, label, method)
 from candidates_out; sponsors are the description sponsors (+ house
 plugs) passed to detect_ad_blocks.
 """
+import difflib
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.expanduser("~/workspace/podcast-ads/pipeline"))
@@ -101,6 +117,34 @@ def _raw_regions(candidates, duration):
 def _mention_times(nw, words, variants, lo, hi):
     hits = rp.find_mentions(nw, variants)
     return sorted(words[h][0] for h in hits if lo <= words[h][0] <= hi)
+
+
+_TLDS = {"com", "net", "org", "io", "tv", "co", "ai", "me", "tools",
+         "app", "dev", "xyz", "online", "store", "tech", "site",
+         "cloud", "cc", "gg", "life", "world", "news", "media"}
+
+
+def _stem_matches(stem, sponsor):
+    """Does a candidate stem (e.g. 'rora' from a spoken URL) name this
+    description sponsor? Same threshold as the single-cluster anchor
+    check in detect_ad_blocks: exact match or SequenceMatcher >= 0.85
+    against the sponsor's label, variants, and non-TLD components."""
+    stem = stem.lower().replace(" ", "").split(".")[0]
+    allowed = set()
+    for v in [sponsor["label"]] + list(sponsor.get("variants") or []):
+        norm = v.lower().replace(" ", "")
+        allowed.add(norm)
+        for comp in re.split(r"[.\s]+", v.lower()):
+            if comp and comp not in _TLDS:
+                allowed.add(comp)
+    if stem in allowed:
+        return True
+    return any(difflib.SequenceMatcher(None, stem, a).ratio() >= 0.85
+               for a in allowed)
+
+
+def _overlap(a0, a1, b0, b1):
+    return max(0.0, min(a1, b1) - max(a0, b0))
 
 
 def _segment_edge(cands, part, lo, hi, want_start):
@@ -223,8 +267,47 @@ def rescue_fused_blocks(blocks, candidates, words, sponsors, sources=None):
                 if best_ts is None or len(ts) > len(best_ts) or (
                         len(ts) == len(best_ts) and ts[-1] > best_ts[-1]):
                     best_a, best_ts = sp, ts
+            url_anchored = False
+            _url_seg = _cta_seg = None
             if best_a is None:
-                return
+                # URL-anchored fallback (see module docstring): a cta
+                # segment and a url segment for the same stem, both
+                # overlapping the extension by >=30s, the stem naming
+                # a description sponsor, and the block sponsor silent
+                # inside the extension.
+                _b_ext = mentions(bsp, ext_lo, ext_hi)
+                if not _b_ext:
+                    _best = None  # (url_overlap, cta_overlap, sp, url, cta)
+                    for _us, _ue, _ul, _um in candidates:
+                        if _um != "url":
+                            continue
+                        _stem = _part(_ul)
+                        if _stem in ("dry-island", "voice-anomaly"):
+                            continue
+                        _uov = _overlap(_us, _ue, ext_lo, ext_hi)
+                        if _uov < HEATMAP_MIN_AD_LEN:
+                            continue
+                        for _cs, _ce, _cl, _cm in candidates:
+                            if _cm != "cta" or _part(_cl) != _stem:
+                                continue
+                            _cov = _overlap(_cs, _ce, ext_lo, ext_hi)
+                            if _cov < HEATMAP_MIN_AD_LEN:
+                                continue
+                            for _sp in sponsors:
+                                if _sp["label"] == bsp["label"]:
+                                    continue
+                                if not _stem_matches(_stem, _sp):
+                                    continue
+                                _key = (_uov, _cov)
+                                if _best is None or _key > _best[0]:
+                                    _best = (_key, _sp, (_us, _ue),
+                                            (_cs, _ce))
+                    if _best is not None:
+                        best_a = _best[1]
+                        _url_seg, _cta_seg = _best[2], _best[3]
+                        url_anchored = True
+                if best_a is None:
+                    return
             apart = _part(best_a["label"])
             # The other sponsor must not already have a block
             # overlapping the extension.
@@ -232,12 +315,17 @@ def rescue_fused_blocks(blocks, candidates, words, sponsors, sources=None):
                 if _part(ol) == apart and os_ < ext_hi and oe > ext_lo:
                     return
             if is_head:
-                edge = _segment_edge(candidates, apart, ext_lo, ext_hi,
-                                     want_start=True)
-                start = edge if edge is not None else rs
-                # The pipeline's own cap bound: never start more than
-                # 30s before the other sponsor's first mention here.
-                start = max(start, best_ts[0] - 30.0)
+                if url_anchored:
+                    # CTA is the opening evidence; clip to the region.
+                    start = max(_cta_seg[0], rs)
+                else:
+                    edge = _segment_edge(candidates, apart, ext_lo, ext_hi,
+                                         want_start=True)
+                    start = edge if edge is not None else rs
+                    # The pipeline's own cap bound: never start more
+                    # than 30s before the other sponsor's first
+                    # mention here.
+                    start = max(start, best_ts[0] - 30.0)
                 end = bs
                 # Clip against a preceding block.
                 for (os_, oe, _ol, _ss, _es) in blocks:
@@ -248,10 +336,14 @@ def rescue_fused_blocks(blocks, candidates, words, sponsors, sources=None):
                 if end - start > MAX_AD_LEN:
                     return
             else:
-                edge = _segment_edge(candidates, apart, ext_lo, ext_hi,
-                                     want_start=False)
-                end = edge if edge is not None else re
-                end = min(end, best_ts[-1] + 30.0)
+                if url_anchored:
+                    # URL is the closing evidence; clip to the region.
+                    end = min(_url_seg[1], re)
+                else:
+                    edge = _segment_edge(candidates, apart, ext_lo, ext_hi,
+                                         want_start=False)
+                    end = edge if edge is not None else re
+                    end = min(end, best_ts[-1] + 30.0)
                 start = be
                 for (os_, oe, _ol, _ss, _es) in blocks:
                     if os_ >= be and os_ < end:
@@ -271,7 +363,9 @@ def rescue_fused_blocks(blocks, candidates, words, sponsors, sources=None):
                 "from_block": [round(bs, 1), round(be, 1), bl],
                 "rescued_sponsor": best_a["label"],
                 "rescue_block": [round(start, 2), round(end, 2), label],
-                "mentions_in_extension": [round(t, 1) for t in best_ts],
+                "mentions_in_extension": [round(t, 1) for t in best_ts]
+                if not url_anchored else [],
+                "anchor": ("url" if url_anchored else "mentions"),
                 "region": [rs, re],
             })
 
