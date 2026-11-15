@@ -6,3 +6,9 @@ podcasts/
 episodes/
 state.json
 *.mp3
+
+eval_work/
+regression_work/
+regression/
+.venv/
+.pytest_cache/
