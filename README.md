@@ -284,6 +284,29 @@ Notes:
   flow 286 9/9 at ≥80% (636.3/673s, 0 false), 287 7/8 (477.3/531s,
   1 false — Pepperbox house plug); SN 1101 still 6 blocks. Full
   numbers in `TESTS.md`.
+- **Fusion-fix merge (2026-11-14, live):** two held patches from the
+  pre-roll history-voter work (TESTS.md entries 40–41), merged on the
+  owner's direction. (7) URL-anchored split rescue: when the
+  mention-gated rescue finds no candidate, a second sponsor's ad can
+  still be split out on a spoken-URL anchor — a `url` segment and a
+  `cta` segment for the same stem, both overlapping the fused
+  extension by ≥30s, the stem fuzzy-matching a description sponsor
+  (≥0.85, so Whisper's "Rora" matches "Rorra"). Recovers a real Rorra
+  read the mention gate could never see. (8) Pre-roll history voter
+  with a bridging guard: a show with ≥5 episodes in its per-podcast
+  history file votes on the window where its first ad usually starts
+  (leave-one-out mean ± max(2σ, 3 points)); the vote is
+  corroboration-only and can never name a block, and the guard
+  punches a hole in the vote where it would connect two adjacent
+  regions carrying different sponsor labels, so it cannot fuse two
+  neighbouring ads. Post-merge numbers on the live pipeline:
+  25-episode set recall 0.701 (75/107), false blocks 40, median edge
+  error 4.8s, within 1s 26.0%; exactly three span changes vs the
+  six-mechanism baseline (a Helix head extension, an Our Place ad
+  and a Rorra ad recovered — adjudicated +2 real ads, 0 lost, 0
+  false rescues; the scoreboard cannot see them because each is the
+  second ad of a merged-pair SponsorBlock label). 286/287 detector
+  numbers unchanged. Full numbers in `TESTS.md`.
 - **Ollama / LLM reviewer: evaluated 2026-10-14, REJECTED.** It hallucinated
   sponsor reads, missed real ads, produced garbled timestamps, and was
   too slow and memory-hungry. Do not re-add without a fresh evaluation.
