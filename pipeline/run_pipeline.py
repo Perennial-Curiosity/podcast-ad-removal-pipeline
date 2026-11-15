@@ -45,7 +45,7 @@ from html import unescape
 # (broken-proxy) network is never touched.
 os.environ["HF_HUB_OFFLINE"] = "1"
 
-BASE_DIR = os.path.expanduser("~/workspace/podcast-ads")
+BASE_DIR = os.path.expanduser(os.environ.get("PODCAST_ADS_DIR", "~/workspace/podcast-ads"))
 MODEL_DIR = os.path.join(BASE_DIR, "model")
 CONFIG_PATH = os.path.join(BASE_DIR, "podcasts.yaml")
 
@@ -556,8 +556,24 @@ def probe_duration(path):
 
 def load_model():
     from faster_whisper import WhisperModel
-    return WhisperModel("base", device="cpu", compute_type="int8",
-                        local_files_only=True)
+    # local_files_only=True (and HF_HUB_OFFLINE=1 at import) made a
+    # fresh install fail (README promises an automatic first-run
+    # download). Use the cache when present, else download once;
+    # set WHISPER_LOCAL_ONLY=1 to forbid network access.
+    local_only = os.environ.get("WHISPER_LOCAL_ONLY") == "1"
+    try:
+        return WhisperModel("base", device="cpu", compute_type="int8",
+                            local_files_only=True)
+    except Exception:
+        if local_only:
+            raise
+        log("whisper 'base' model not cached; downloading")
+        saved = os.environ.pop("HF_HUB_OFFLINE", None)
+        try:
+            return WhisperModel("base", device="cpu", compute_type="int8")
+        finally:
+            if saved is not None:
+                os.environ["HF_HUB_OFFLINE"] = saved
 
 
 def transcribe_file(model, wav_path, **kwargs):
@@ -1051,6 +1067,9 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     must not overlap a marked block — an overhang of a marked ad is not a
     separate suspect.
     """
+    if not words:
+        return [], []
+
     # Run each method independently, collecting (start, end, label, method)
     candidates = []
     candidates.extend([(s, e, l, 'cta') for s, e, l in _method_cta(words, sponsors, silences, own_domains)])
@@ -1200,9 +1219,16 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     duration = int(words[-1][0]) + 1
     votes = [0] * duration
     vote_detail = [[] for _ in range(duration)]  # which methods voted
+    # Votes count DISTINCT METHODS per second, not candidate segments:
+    # one method emitting overlapping segments (e.g. cta firing once per
+    # repeated URL mention of the same brand) must not fake "2+ methods
+    # agree" on its own.
+    voted = [set() for _ in range(duration)]
     for s, e, label, method in candidates:
-        for sec in range(int(s), min(int(e) + 1, duration)):
-            votes[sec] += 1
+        for sec in range(max(0, int(s)), min(int(e) + 1, duration)):
+            if method not in voted[sec]:
+                voted[sec].add(method)
+                votes[sec] += 1
             vote_detail[sec].append((method, label))
 
     # High-confidence: 2+ methods agree. Merge contiguous.
@@ -1389,8 +1415,9 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
             # Skip if already covered by a heatmap block
             if any(s < be and e > bs for bs, be, _ in blocks):
                 continue
-            # Skip duplicates (same label already added)
-            if any(label == l for _, _, l in blocks):
+            # Skip duplicates (same label already added). Heat-map labels
+            # are 'methods:label', so compare the label part.
+            if any(label.split(':')[-1] == l.split(':')[-1] for _, _, l in blocks):
                 continue
             blocks.append((s, e, label))
             log(f"  single-method '{label}': {method} {s:.1f}s-{e:.1f}s ({dur:.0f}s)")
@@ -1547,6 +1574,17 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
         refined.append((s, e, l))
     blocks = refined
 
+    # Final boundary snap (2026-11-04): every step above works on raw
+    # method segments, integer-second heat-map runs, and +-30s mention
+    # caps, so final edges routinely landed mid-word / mid-sentence or
+    # skipped the opening cue and the sign-off. Snap each edge to a real
+    # sentence/pause break, pulling in a nearby opening cue and thanks
+    # sign-off, without ever cutting off an in-block brand mention.
+    # Runs last inside detect_ad_blocks so sharpness is scored on the
+    # snapped edges. Later process_episode steps (xep corroboration,
+    # dynamic slots, split rescue) may still move edges afterwards.
+    blocks = _snap_block_edges(words, nw, silences, sorted(blocks), sponsors)
+
     # Suspect reel (2026-10-22, per the owner): low-confidence candidates
     # that did not become marked blocks. Replaces the old cluster-popular
     # LOW-CONFIDENCE log lines — the suspect reel is now the surface
@@ -1598,6 +1636,123 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     if candidates_out is not None:
         candidates_out.extend(candidates)
     return scored, suspects
+
+
+SNAP_WINDOW = 6.0        # max distance an edge may move to reach a break
+CUE_LOOKBACK = 20.0      # pull start back to an opening cue this close
+SIGNOFF_LOOKAHEAD = 20.0  # push end out to a thanks sign-off this close
+
+
+def _word_breaks(words, silences):
+    """Clean break points between words: [(t_start_side, t_end_side, i)].
+    i = index of the word AFTER the break. A break is a sentence end
+    (.!?) or a gap >= 0.5s / silence. Times are placed inside the gap so
+    neither neighbouring word is clipped."""
+    sil = sorted(silences or [])
+    out = []
+    for i in range(1, len(words)):
+        a, b = words[i - 1], words[i]
+        gap = b[0] - a[1]
+        sentence = a[2].strip().endswith((".", "!", "?"))
+        in_sil = any(ss <= b[0] and se >= a[1] for ss, se in sil
+                     if ss <= b[0] + 1)
+        if sentence or gap >= 0.5 or in_sil:
+            out.append((max(a[1], b[0] - 0.15), min(b[0], a[1] + 0.15), i))
+    return out
+
+
+def _snap_block_edges(words, nw, silences, blocks, sponsors):
+    """Snap detected ad edges to opening cues, sign-offs, and pauses.
+
+    This is a cue/sign-off inclusion pass first, then a tight (±SNAP_WINDOW)
+    snap to the nearest sentence/pause break around that target. A broader
+    silence+sentence snap (±15s, and a ≤2s cap) was tested 2026-11-08/09
+    (TESTS.md entry 4) and discarded because unconditioned snaps added
+    noise around already-good edges. Constraints: never move an edge past
+    an in-block brand mention; never create overlaps; leave a block
+    unchanged if the snapped span would shrink below 5s.
+    """
+    if not words or not blocks:
+        return blocks
+    breaks = _word_breaks(words, silences)
+    if not breaks:
+        return blocks
+    out = []
+    for s, e, l in blocks:
+        sp_part = l.split(':')[-1].strip().lower()
+        variants = [sp_part]
+        for sp in sponsors:
+            if sp['label'].lower() == sp_part:
+                variants = sp['variants']
+                break
+        ments = [words[h] for h in find_mentions(nw, variants)
+                 if s <= words[h][0] <= e]
+        first_m = min((m[0] for m in ments), default=None)
+        last_m = max((m[1] for m in ments), default=None)
+
+        # --- start: include an opening cue just before/inside the edge
+        # Leading host-speech trim: an opening cue *inside* the block
+        # (before the first brand mention) is the true start — the
+        # content before it is host talk swept in by padding/caps.
+        target_s = s
+        cue_hi = s + SNAP_WINDOW
+        if first_m is not None:
+            cue_hi = max(cue_hi, first_m)
+        for j, w in enumerate(words):
+            if w[0] < s - CUE_LOOKBACK:
+                continue
+            if w[0] > cue_hi:
+                break
+            if any(" ".join(nw[j:j + 6]).startswith(c) for c in OPEN_CUES):
+                target_s = w[0]
+                break
+        cands = [b for b in breaks if abs(b[0] - target_s) <= SNAP_WINDOW
+                 and b[0] <= target_s + 0.5]  # prefer not to clip the cue
+        if not cands:
+            cands = [b for b in breaks if abs(b[0] - target_s) <= SNAP_WINDOW]
+        ns = min(cands, key=lambda b: abs(b[0] - target_s))[0] if cands else s
+        if first_m is not None and ns > first_m:
+            ns = min(s, first_m)
+
+        # --- end: include a thanks/support sign-off just after the edge
+        # Trailing host-speech trim: a thanks/support sign-off after the
+        # last brand mention ends the read, even when padding pushed the
+        # block well past it.
+        target_e = e
+        so_lo = e - 10
+        if last_m is not None:
+            so_lo = min(so_lo, last_m)
+        for j, w in enumerate(words):
+            if w[0] < so_lo:
+                continue
+            if w[0] > e + SIGNOFF_LOOKAHEAD:
+                break
+            win = " ".join(nw[j:j + 10])
+            if nw[j].startswith("thank") and ("support" in win or "sponsor" in win):
+                target_e = thanks_end(words, nw, j)
+                break
+        cands = [b for b in breaks if abs(b[1] - target_e) <= SNAP_WINDOW
+                 and b[1] >= target_e - 0.5]
+        if not cands:
+            cands = [b for b in breaks if abs(b[1] - target_e) <= SNAP_WINDOW]
+        ne = min(cands, key=lambda b: abs(b[1] - target_e))[1] if cands else e
+        if last_m is not None and ne < last_m:
+            ne = max(e, last_m)
+        if ne - ns < 5:
+            ns, ne = s, e
+        if (round(ns, 1), round(ne, 1)) != (round(s, 1), round(e, 1)):
+            log(f"  snap '{l}': {s:.1f}-{e:.1f}s -> {ns:.1f}-{ne:.1f}s")
+        out.append((ns, ne, l))
+    # never let snapping create overlaps between neighbours
+    out.sort()
+    for k in range(1, len(out)):
+        ps, pe, pl = out[k - 1]
+        cs, ce, cl = out[k]
+        if cs < pe:
+            mid = (pe + cs) / 2
+            out[k - 1] = (ps, mid, pl)
+            out[k] = (mid, ce, cl)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -3905,7 +4060,9 @@ def main():
             try:
                 process_episode(item, state, channel_link, pcfg)
             except Exception as exc:
+                import traceback
                 log(f"FAILED retry on {item['title']}: {exc!r}")
+                log(traceback.format_exc())
     new_items = [it for it in reversed(items)
                  if it["guid"] and it["guid"] not in state["processed"] and it["audio_url"]]
     if args.limit:
@@ -3918,7 +4075,9 @@ def main():
         try:
             process_episode(item, state, channel_link, pcfg)
         except Exception as exc:
+            import traceback
             log(f"FAILED on {item['title']}: {exc!r}")
+            log(traceback.format_exc())
             # leave unprocessed so a later run retries
     write_feed(state, SITE_DIR, xml)
     log("feed regenerated")
