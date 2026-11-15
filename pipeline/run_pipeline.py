@@ -56,6 +56,12 @@ MIN_AD_LEN = 45
 # 2026-10-26). Single-method blocks keep the 45s floor.
 HEATMAP_MIN_AD_LEN = 30
 MAX_AD_LEN = 12 * 60
+
+# History pre-roll voter (2026-11-14, A/B test — NOT merged): the
+# harness sets HISTORY_PREROLL_WINDOW to (start_s, end_s) or None
+# per episode. The window is where this show's first ad usually
+# starts (leave-one-out prior from the per-podcast history file).
+HISTORY_PREROLL_WINDOW = None
 # Chunk size for transcription (seconds) — keeps each job short
 TRANSCRIBE_CHUNK = 180
 
@@ -1058,6 +1064,7 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     if mp3_path:
         candidates.extend([(s, e, l, 'voice') for s, e, l in _method_voice(words, mp3_path)])
         candidates.extend([(s, e, l, 'reverb') for s, e, l in _method_reverb(words, mp3_path)])
+    candidates.extend([(s, e, l, 'history-preroll') for s, e, l in _method_history_preroll(words)])
 
     if not candidates:
         if candidates_out is not None:
@@ -1093,7 +1100,7 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
 
         def _artifact(l):
             p = _part(l)
-            return p in ('dry-island', 'voice-anomaly') or \
+            return p in ('dry-island', 'voice-anomaly', 'history-prior') or \
                 _re.fullmatch(r'duplicate-\d+', p) is not None
         for l in labels:
             if _artifact(l):
@@ -1116,6 +1123,78 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
             if not _artifact(l):
                 return l
         return labels[0] if labels else 'ad'
+
+    # History-vote bridging guard (fusion fix, 2026-11-14, A/B test):
+    # a corroborating vote must never CONNECT two baseline regions
+    # carrying different ad labels — that fuses two back-to-back ads
+    # into one block (Huberman neuroscience: the history vote bridged
+    # the 5s dip between the Helix Sleep and Rorra regions, 1039-1044,
+    # and the Rorra read was trimmed away). Compute the baseline
+    # regions (>=2 votes, contiguous) from the non-history candidates
+    # and their labels via _pick_label; where the history vote would
+    # connect two adjacent regions with different labels — i.e. every
+    # second of the gap between them already carries >=1 vote — punch
+    # a hole in the history segment over the gap. A gap containing a
+    # 0-vote second cannot be connected by a single vote anyway, so no
+    # hole is needed there; that is what leaves the vote working in
+    # open territory, where it extends a region or seeds a new one
+    # next to it (the Our Place gain). Same-label pairs are left
+    # alone: the pipeline's gap-merge already joins them (<20s).
+    _hist_pos = [i for i, c in enumerate(candidates)
+                 if c[3] == 'history-preroll']
+    if _hist_pos:
+        _gd = int(words[-1][0]) + 1
+        _bv = [0] * _gd
+        _bdet = [[] for _ in range(_gd)]
+        for _cs, _ce, _cl, _cm in candidates:
+            if _cm == 'history-preroll':
+                continue
+            for _sec in range(int(_cs), min(int(_ce) + 1, _gd)):
+                _bv[_sec] += 1
+                _bdet[_sec].append((_cm, _cl))
+        _gregs = []
+        _in_r = False
+        for _sec in range(_gd):
+            if _bv[_sec] >= 2 and not _in_r:
+                _in_r, _rbs = True, _sec
+            elif _bv[_sec] < 2 and _in_r:
+                _in_r = False
+                _gregs.append((_rbs, _sec))
+        if _in_r:
+            _gregs.append((_rbs, _gd))
+        _holes = []
+        for (_a0s, _a0e), (_a1s, _a1e) in zip(_gregs, _gregs[1:]):
+            _ent0 = sum([_bdet[_x] for _x in range(_a0s, _a0e)], [])
+            _ent1 = sum([_bdet[_x] for _x in range(_a1s, _a1e)], [])
+            _lab0 = _pick_label(_ent0, _a0s, _a0e)
+            _lab1 = _pick_label(_ent1, _a1s, _a1e)
+            if _lab0.split(':')[-1].strip().lower() == \
+                    _lab1.split(':')[-1].strip().lower():
+                continue
+            if all(_bv[_x] >= 1 for _x in range(_a0e, _a1s)):
+                _holes.append((_a0e, _a1s))
+        if _holes:
+            _new_cands = []
+            for _i, _c in enumerate(candidates):
+                if _i not in _hist_pos:
+                    _new_cands.append(_c)
+                    continue
+                _pieces = [(_c[0], _c[1])]
+                for _hs, _he in _holes:
+                    _out = []
+                    for _ps, _pe in _pieces:
+                        if _he <= _ps or _hs >= _pe:
+                            _out.append((_ps, _pe))
+                        else:
+                            if _ps < _hs:
+                                _out.append((_ps, _hs))
+                            if _he < _pe:
+                                _out.append((_he, _pe))
+                    _pieces = _out
+                for _ps, _pe in _pieces:
+                    if _pe - _ps >= 1:
+                        _new_cands.append((_ps, _pe, _c[2], _c[3]))
+            candidates = _new_cands
 
     # Build heat map: per-second vote counts
     duration = int(words[-1][0]) + 1
@@ -1718,6 +1797,28 @@ def _evidence_sentence_trim(words, nw, s, e, variants):
     if ne <= ns:
         return s, e
     return ns, ne
+
+
+
+def _method_history_preroll(words):
+    """Method 'history-preroll': one heat-map vote on the window where
+    this show's first ad usually starts (2026-11-14, A/B test).
+
+    Corroborating vote only: the method is not in _single_methods, not
+    in the suspect-method list, and its label is artifact-classed in
+    _pick_label, so it can never mark a block alone or name one. The
+    window comes from HISTORY_PREROLL_WINDOW, set by the harness from
+    the leave-one-out history prior; None means the voter is silent
+    (show below the 5-episode gate, or no slot-1 prior). The bridging
+    guard in detect_ad_blocks punches holes in this segment where it
+    would connect two different-label baseline regions.
+    """
+    if not HISTORY_PREROLL_WINDOW:
+        return []
+    ws, we = HISTORY_PREROLL_WINDOW
+    if we - ws < 1:
+        return []
+    return [(ws, we, 'history-prior')]
 
 
 def _method_cta(words, sponsors, silences, own_domains=None):
