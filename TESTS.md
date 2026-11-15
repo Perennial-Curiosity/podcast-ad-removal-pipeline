@@ -2656,8 +2656,22 @@ label already matched by the first ad.
 three variants (median and within-1s flat), but the failure is the
 same SB measurement artifact as entry 38 — the gains are second ads
 of merged-pair labels. Adjudication shows +2 real ads, 0 lost, 0
-false rescues for the combination. This is the owner's call, same
-precedent as the split rescue.** Held patches, both verified (dry-run
+false rescues for the combination. MERGED 2026-11-14 by the owner's
+direction ("merge both"), same precedent as the split rescue.**
+Post-merge verification on the live tree (`sb_eval/ab/merged_live_fusion/`,
+driver `sb_eval/ab/fusion_fix/run_live_verify.py`) reproduces the
+tested combination exactly: recall 0.701 (75/107), FP 40, median 4.8s,
+mean 13.1s, within-1s 26.0%, max 79.3s; the three span changes
+confirmed and no others; 286/287 unchanged (286 7/9 ≥80%, 606.7/673s,
+0 false; 287 6/8, 463.0/531s, 1 false); synthetic/TTS/null regression
+identical. New live md5s: run_pipeline.py `3ee571ba5d6fd4191ba130a4cd563cb8`
+(3,928 lines), split_rescue.py `1565b3253d7bf075bbb7abe5b7d294b4` (376
+lines). One verification lesson: the merge agent's first run scored FP
+39 not 40 because its driver imported the stock `split_rescue.py` from
+`sb_eval/ab/back_to_back_split/` instead of the live pipeline copy — a
+shadowed import fails silently with plausible-looking numbers, so a
+verification driver must assert which module file it imported (print
+`__file__`). Held patches, both verified (dry-run
 + real apply clean to a fresh copy of the live pipeline, compile,
 byte-identical to the tested files): `rescue_url.patch` (170 lines,
 fix (a) only, against live `pipeline/split_rescue.py`) and
@@ -2668,7 +2682,8 @@ patches applied together). Records: `sb_eval/ab/fusion_fix/`
 (NOTE.md, split_rescue_url.py, rescue_url.patch, voter_guard.patch,
 run logs, synthetic_results.json, tts_results.json, null_results.json),
 `sb_eval/ab/fusion_rescue_url/`, `sb_eval/ab/history_guard/`,
-`sb_eval/ab/history_guard_url/`, `sb_eval/ab/combined_repro26/`.
+`sb_eval/ab/history_guard_url/`, `sb_eval/ab/combined_repro26/`,
+`sb_eval/ab/merged_live_fusion/`.
 
 Correction recorded: the NOTE.md claim that the (a) Rorra rescue on
 neuroscience overlaps the SB label by 90.7% and matches at ≥50% was
