@@ -11,6 +11,7 @@ found, does snapping improve the edges? It does not measure recall.
 """
 
 import argparse
+import random
 import importlib.util
 import json
 import os
@@ -39,6 +40,30 @@ def sloppy_overshoot(gt_s, gt_e, outward=10.0, ep_end=None):
     return s, e
 
 
+def _jitter_edge(gt, side, rng, inward, outward, ep_end, dur):
+    """Per-edge jitter: inward, outward, or exact (seeded)."""
+    choice = rng.choice(("in", "out", "exact"))
+    if choice == "exact":
+        return gt
+    if side == "start":
+        if choice == "in":
+            return gt + min(inward, max(0.0, dur / 4))
+        return max(0.0, gt - outward)
+    # end
+    if choice == "in":
+        return gt - min(inward, max(0.0, dur / 4))
+    e = gt + outward
+    return min(e, ep_end) if ep_end is not None else e
+
+
+def sloppy_mixed(gt_s, gt_e, rng, inward=8.0, outward=10.0, ep_end=None):
+    dur = gt_e - gt_s
+    return (
+        _jitter_edge(gt_s, "start", rng, inward, outward, ep_end, dur),
+        _jitter_edge(gt_e, "end", rng, inward, outward, ep_end, dur),
+    )
+
+
 def score_pairs(preds, gts, episode="x"):
     r = score_episode(preds, gts)
     r["episode"] = episode
@@ -53,6 +78,8 @@ def main():
     ap.add_argument("--label", default="snap-diag")
     ap.add_argument("--inward", type=float, default=8.0)
     ap.add_argument("--outward", type=float, default=10.0)
+    ap.add_argument("--seed", type=int, default=42,
+                    help="RNG seed for the mixed per-edge jitter condition")
     args = ap.parse_args()
 
     if not hasattr(load_pipeline(args.pipeline), "_snap_block_edges"):
@@ -71,6 +98,7 @@ def main():
     conditions = {
         "mid_read": [],      # (pred_before, pred_after, gt, vid)
         "overshoot": [],
+        "mixed": [],
     }
     n_ads = 0
     n_skipped = 0
@@ -90,11 +118,16 @@ def main():
         silences = inferred_silences(words)
         ep_end = words[-1][1]
         n_ads += len(ads)
-        for cond, builder in (
-            ("mid_read", lambda s, e: sloppy_mid(s, e, args.inward)),
-            ("overshoot", lambda s, e: sloppy_overshoot(s, e, args.outward, ep_end)),
-        ):
-            before = [(builder(s, e)[0], builder(s, e)[1], "x:ad") for s, e in ads]
+        builders = [
+            ("mid_read", lambda s, e, i: sloppy_mid(s, e, args.inward)),
+            ("overshoot", lambda s, e, i: sloppy_overshoot(s, e, args.outward, ep_end)),
+            ("mixed", lambda s, e, i: sloppy_mixed(
+                s, e, random.Random(f"{args.seed}|{vid}|{i}|{round(s, 3)}|{round(e, 3)}"),
+                args.inward, args.outward, ep_end)),
+        ]
+        for cond, builder in builders:
+            before = [(builder(s, e, i)[0], builder(s, e, i)[1], "x:ad")
+                      for i, (s, e) in enumerate(ads)]
             after = mod._snap_block_edges(words, nw, silences, before, [])
             for b, a, g in zip(before, after, ads):
                 conditions[cond].append((b, a, g, vid))
@@ -160,7 +193,8 @@ def main():
         f"Pipeline: {os.path.abspath(args.pipeline)}",
         f"Transcript: BLAB word_timestamp. Silences: inter-word gaps >= 0.8s.",
         f"Sponsors: none (snap uses cues, sign-offs, and pauses only).",
-        f"Sloppy mid-read inward={args.inward}s; overshoot outward={args.outward}s.",
+        f"Sloppy mid-read inward={args.inward}s; overshoot outward={args.outward}s; "
+        f"mixed per-edge jitter seed={args.seed}.",
         "",
     ]
     for cond, rep in reports.items():
@@ -192,7 +226,7 @@ def main():
     with open(out_json, "w") as f:
         json.dump({"meta": {"pipeline": args.pipeline, "n_ads": n_ads,
                             "skipped": n_skipped, "inward": args.inward,
-                            "outward": args.outward},
+                            "outward": args.outward, "seed": args.seed},
                    "conditions": slim}, f, indent=2)
     print(f"wrote {out_md}\nwrote {out_json}")
 

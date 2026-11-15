@@ -191,8 +191,12 @@ OPEN_CUES = [
     "advertiser",
     "a word from",
     "this episode is brought",
+    "this episode is sponsored",
     "this portion of",
     "today's sponsor",
+    "our good friends at",
+    "good friends at",
+    "our friends at",
 ]
 RETURN_CUES = [
     "welcome back",
@@ -649,8 +653,19 @@ def find_silences(mp3_path, work_dir, min_dur=1.5):
 
 
 def norm_words(words):
-    """Whitespace-normalized lowercase words for matching (indices align)."""
-    return [re.sub(r"\s+", " ", w[2]).strip().lower() for w in words]
+    """Whitespace-normalized lowercase words for matching (indices align).
+
+    Leading '#' is stripped: BLAB word timestamps prefix many tokens
+    with a hash ('#thank', '#sponsors'), which otherwise hides opening
+    cues, CTAs, and brand variants from startswith / exact-token checks.
+    Trailing punctuation is kept so thanks_end can see '.!?'.
+    """
+    out = []
+    for w in words:
+        s = re.sub(r"\s+", " ", w[2]).strip().lower()
+        s = s.lstrip("#")
+        out.append(s)
+    return out
 
 
 def _boundary_match(v, w):
@@ -1639,8 +1654,38 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
 
 
 SNAP_WINDOW = 6.0        # max distance an edge may move to reach a break
-CUE_LOOKBACK = 20.0      # pull start back to an opening cue this close
-SIGNOFF_LOOKAHEAD = 20.0  # push end out to a thanks sign-off this close
+CUE_LOOKBACK = 20.0      # inward cue search (trim host talk already in the block)
+# Outward cue/sign-off search is capped so an already-early start cannot
+# be pulled 20–30s earlier (nIYX92DDbzs, ySyQ7VmlrBI on snap-diag-v2b).
+CUE_LOOKBACK_OUTWARD = 8.0
+SIGNOFF_LOOKAHEAD = 20.0  # inward sign-off search
+SIGNOFF_LOOKAHEAD_OUTWARD = 8.0
+ADISH_WINDOW = 6.0
+MID_SENTENCE_GAP = 0.4
+
+# CTA / promo / URL language used to tell "the ad continues just
+# outside this edge" from ordinary host talk (see find_url_mentions).
+ADISH_PHRASES = [
+    ("go", "to"), ("visit",), ("check", "out"), ("head", "to"),
+    ("head", "over", "to"), ("give", "it", "a", "try", "at"),
+    ("try", "at"), ("sign", "up", "at"), ("sign", "up"),
+    ("get", "it", "at"), ("available", "at"),
+    ("use", "code"), ("promo", "code"), ("coupon", "code"),
+    ("discount", "code"), ("use", "promo"),
+]
+ADISH_WORDS = {
+    "sponsor", "sponsored", "sponsors", "advertiser", "advertisement",
+    "promo", "promocode", "coupon", "discount",
+    "www", "http", "https", "dotcom",
+}
+ADISH_TLDS = (".com", ".net", ".org", ".io", ".co", ".tv", ".fm")
+# Return-to-content / topic-shift phrases: a block that already
+# contains one of these near an edge has overshot into host talk.
+TOPIC_SHIFT_PHRASES = [
+    "welcome back", "we're back", "we are back",
+    "now back", "back to the", "anyway",
+    "ok back", "okay back",
+]
 
 
 def _word_breaks(words, silences):
@@ -1662,35 +1707,267 @@ def _word_breaks(words, silences):
 
 
 
-def _avoid_mid_word(words, t, side):
-    """If t falls strictly inside a word, move it to the nearest word edge.
+def _avoid_mid_word(words, t, side, allow_outward=True):
+    """If t falls strictly inside a word, move it to a word edge.
 
-    Nearest-edge (not a systematic outward push) avoids turning a slightly
-    early start into an even earlier one. Edges already in a gap stay put.
+    Default: nearest edge (not a systematic outward push). When
+    allow_outward is False (already-wide edges), only the inward
+    edge is used: start moves to the word end, end to the word start.
+    Edges already in a gap stay put.
     """
     for w in words:
         if w[0] < t < w[1]:
+            if not allow_outward:
+                return w[1] if side == "start" else w[0]
             return w[0] if (t - w[0]) <= (w[1] - t) else w[1]
     return t
 
 
-def _snap_block_edges(words, nw, silences, blocks, sponsors):
-    """Snap detected ad edges to opening cues, sign-offs, and pauses.
+def _token_is_urlish(tok):
+    t = (tok or "").lower().strip(".,!?;:")
+    if t in ADISH_WORDS or t in ("dot", "slash"):
+        return True
+    if any(s in t for s in ADISH_TLDS):
+        return True
+    return False
 
-    This is a cue/sign-off inclusion pass first. A tight (±SNAP_WINDOW)
-    pause snap runs only around a cue or sign-off that actually moved
-    the target, or to pull an edge out of the middle of a word. A broader
-    silence+sentence snap (±15s, and a ≤2s cap) was tested 2026-11-08/09
-    (TESTS.md entry 4) and discarded because unconditioned snaps added
-    noise around already-good edges. Constraints: never move an edge past
-    an in-block brand mention; never create overlaps; leave a block
-    unchanged if the snapped span would shrink below 5s.
+
+def _adish_in_window(words, nw, t0, t1, variants=None):
+    """True if CTA / URL / promo / brand / cue language occurs in [t0, t1]."""
+    skip = {"ad", "x", ""}
+    variants = [v.lower() for v in (variants or []) if v and v not in skip]
+    for j, w in enumerate(words):
+        if w[1] < t0:
+            continue
+        if w[0] > t1:
+            break
+        tok = nw[j] if j < len(nw) else ""
+        if _token_is_urlish(tok):
+            return True
+        if any(v and len(v) >= 4 and (v == tok or v in tok or tok in v)
+               for v in variants):
+            return True
+        if any(" ".join(nw[j:j + 6]).startswith(c) for c in OPEN_CUES):
+            return True
+        for ph in ADISH_PHRASES:
+            n = len(ph)
+            if j + n <= len(nw) and tuple(nw[j:j + n]) == ph:
+                return True
+        win = " ".join(nw[j:j + 8])
+        if "percent off" in win or "off your" in win:
+            return True
+        if tok.startswith("thank") and ("support" in win or "sponsor" in win):
+            return True
+        if tok == "code" and j >= 1 and nw[j - 1] in ("use", "promo"):
+            return True
+        # 1-800 / 1-888 style toll-free CTAs
+        if tok == "1" and j + 1 < len(nw) and nw[j + 1].lstrip("-") in (
+                "800", "888", "877", "866", "855", "844", "833"):
+            return True
+    return False
+
+
+def _is_mid_word(words, t):
+    return any(w[0] < t < w[1] for w in words)
+
+
+def _is_mid_sentence(words, t, side):
+    """True if t sits inside a spoken sentence, not at a .!? or a pause."""
+    prev = nxt = None
+    for w in words:
+        if w[1] <= t + 1e-6:
+            prev = w
+        elif nxt is None:
+            nxt = w
+            if w[0] < t < w[1]:
+                # t is inside this word — treat it as the current token
+                if prev is None or w[0] >= (prev[1] if prev else 0):
+                    # keep prev as the previous word; nxt is the overlapping one
+                    pass
+            break
+    def _sent_end(w):
+        return bool(w) and w[2].strip().endswith((".", "!", "?"))
+
+    if side == "start":
+        if prev is None:
+            return False
+        if _sent_end(prev):
+            return False
+        if t - prev[1] >= MID_SENTENCE_GAP:
+            return False
+        if nxt is not None and (nxt[0] - prev[1]) >= MID_SENTENCE_GAP:
+            return False
+        return True
+    # end: mid-sentence if we have not yet reached a sentence-final
+    # word or a pause, and speech continues after t
+    cur = None
+    for w in words:
+        if w[0] < t <= w[1] or w[0] <= t < w[1]:
+            cur = w
+            break
+        if w[1] <= t:
+            cur = w
+        if w[0] >= t and cur is not w:
+            break
+    if cur is None:
+        return False
+    if _sent_end(cur) and t >= cur[1] - 0.05:
+        return False
+    # pause after the current word
+    after = None
+    for w in words:
+        if w[0] >= cur[1] - 1e-9 and w is not cur:
+            after = w
+            break
+    if after is not None and (after[0] - cur[1]) >= MID_SENTENCE_GAP and t >= cur[1] - 0.05:
+        return False
+    if not _sent_end(cur):
+        if after is None:
+            return t < cur[1]  # inside the last word of the transcript
+        return (after[0] - cur[1]) < MID_SENTENCE_GAP
+    return False
+
+
+def _clean_break_near(breaks, t, side, tol=0.4):
+    idx = 0 if side == "start" else 1
+    return any(abs(b[idx] - t) <= tol for b in breaks)
+
+
+def _sentence_boundary(breaks, t, side):
+    """Nearest sentence/pause break at or outward of t, if any."""
+    if side == "start":
+        cands = [b[0] for b in breaks if b[0] <= t]
+        return max(cands) if cands else None
+    cands = [b[1] for b in breaks if b[1] >= t]
+    return min(cands) if cands else None
+
+
+def _has_opening_cue(words, nw, t0, t1):
+    hits = []
+    for j, w in enumerate(words):
+        if w[0] < t0:
+            continue
+        if w[0] > t1:
+            break
+        if any(" ".join(nw[j:j + 6]).startswith(c) for c in OPEN_CUES):
+            hits.append((w[0], j))
+    return hits
+
+
+def _has_signoff(words, nw, t0, t1):
+    hits = []
+    for j, w in enumerate(words):
+        if w[0] < t0:
+            continue
+        if w[0] > t1:
+            break
+        win = " ".join(nw[j:j + 10])
+        if nw[j].startswith("thank") and ("support" in win or "sponsor" in win):
+            hits.append((thanks_end(words, nw, j), j))
+    return hits
+
+
+def _topic_shift_in(words, nw, t0, t1):
+    """True if a return-to-content phrase starts in [t0, t1].
+
+    'go/head back to ...' (a CTA) is not a topic shift.
+    """
+    for j, w in enumerate(words):
+        if w[0] < t0:
+            continue
+        if w[0] > t1:
+            break
+        if j and nw[j - 1] in ("go", "head", "jump"):
+            continue
+        win = " ".join(nw[j:j + 6])
+        if any(win.startswith(p) for p in TOPIC_SHIFT_PHRASES):
+            return True
+        # bare "back to" after a soft return ("ok, back to cooking")
+        if tuple(nw[j:j + 2]) == ("back", "to") and nw[j:j + 3] != ["back", "to", "you"]:
+            if j and nw[j - 1] in ("go", "head", "jump", "sign"):
+                continue
+            return True
+    return False
+
+
+def _classify_edge(words, nw, breaks, s, e, side, variants):
+    """Return (allow_outward, mode) for one edge.
+
+    mode is 'full' (cue/ad-ish just outside: pause-snap in SNAP_WINDOW),
+    'sentence' (mid-sentence/word only: extend to the current sentence
+    boundary), or 'wide' (already covers the read or sits in content:
+    inward snaps only).
+    """
+    t = s if side == "start" else e
+    mid = _is_mid_word(words, t) or _is_mid_sentence(words, t, side)
+    clean = _clean_break_near(breaks, t, side)
+    if side == "start":
+        ad_out = _adish_in_window(words, nw, t - ADISH_WINDOW, t, variants)
+        cues_out = _has_opening_cue(words, nw, t - CUE_LOOKBACK_OUTWARD, t - 1e-6)
+        cues_in = _has_opening_cue(words, nw, t + 1e-6, min(e, t + CUE_LOOKBACK))
+        topic_in = _topic_shift_in(words, nw, t, min(e, t + SNAP_WINDOW + 2.0))
+        strong_trunc = ad_out or bool(cues_out)
+        strong_wide = (bool(cues_in) or topic_in) and not strong_trunc
+    else:
+        ad_out = _adish_in_window(words, nw, t, t + ADISH_WINDOW, variants)
+        so_out = _has_signoff(words, nw, t + 1e-6, t + SIGNOFF_LOOKAHEAD_OUTWARD)
+        so_in = _has_signoff(words, nw, max(s, t - SIGNOFF_LOOKAHEAD), t - 1e-6)
+        topic_in = _topic_shift_in(
+            words, nw, max(s, t - SNAP_WINDOW - 2.0), t)
+        strong_trunc = ad_out or bool(so_out)
+        strong_wide = (bool(so_in) or topic_in) and not strong_trunc
+    if strong_wide:
+        return False, "wide"
+    if strong_trunc:
+        return True, "full"
+    # Mid-sentence / mid-word without a cue or ad-ish language just
+    # outside is ambiguous (ad body vs host talk). Treating it as
+    # truncated and extending to the sentence boundary recovered
+    # mid-read ≤5s 31.2% → 44.9% but raised overshoot mean
+    # 9.32s → 10.31s (snap-diag-trunc-v1), past the 0.3s keep
+    # budget. Outward stays limited to "full". Mid-word is still
+    # fixed when the mode is wide (inward-only).
+    return False, "wide"
+
+
+def _nearest_break(breaks, target, side, window=SNAP_WINDOW, prefer=None):
+    idx = 0 if side == "start" else 1
+    cands = [b for b in breaks if abs(b[idx] - target) <= window]
+    if prefer == "not_after" and side == "start":
+        pref = [b for b in cands if b[0] <= target + 0.5]
+        if pref:
+            cands = pref
+    elif prefer == "not_before" and side == "end":
+        pref = [b for b in cands if b[1] >= target - 0.5]
+        if pref:
+            cands = pref
+    if not cands:
+        return None
+    return min(cands, key=lambda b: abs(b[idx] - target))[idx]
+
+
+def _snap_block_edges(words, nw, silences, blocks, sponsors):
+    """Snap detected ad edges, truncation-aware.
+
+    Per edge, decide whether the block looks truncated (mid-sentence /
+    mid-word, opening cue or ad-ish language just outside, missed
+    sign-off) or already wide (edge in content-like talk, cue/sign-off
+    already inside). Extend outward only when truncated; when wide,
+    only inward snaps to a cue, sign-off, or a pause that does not
+    drop ad-ish language. Outward cue lookback is capped at
+    CUE_LOOKBACK_OUTWARD (8s) so an already-early start cannot be
+    pulled 20–30s earlier.
+
+    Unconditioned ±SNAP_WINDOW sentence snaps on already-wide edges
+    were measured and rejected (TESTS.md entry 4; snap-diag-v1b
+    overshoot median 10.00s → 10.24s, 612 worse / 326 better).
+    Constraints: never move an edge past an in-block brand mention;
+    never create overlaps; leave a block unchanged if the snapped
+    span would shrink below 5s.
     """
     if not words or not blocks:
         return blocks
     breaks = _word_breaks(words, silences)
-    if not breaks:
-        return blocks
     out = []
     for s, e, l in blocks:
         sp_part = l.split(':')[-1].strip().lower()
@@ -1699,22 +1976,35 @@ def _snap_block_edges(words, nw, silences, blocks, sponsors):
             if sp['label'].lower() == sp_part:
                 variants = sp['variants']
                 break
+        # "ad" / "x" are diagnostic placeholders, not brand names
+        if sp_part in ("ad", "x"):
+            variants = []
         ments = [words[h] for h in find_mentions(nw, variants)
-                 if s <= words[h][0] <= e]
+                 if s <= words[h][0] <= e] if variants else []
         first_m = min((m[0] for m in ments), default=None)
         last_m = max((m[1] for m in ments), default=None)
 
-        # --- start: include an opening cue just before/inside the edge
+        allow_out_s, mode_s = _classify_edge(
+            words, nw, breaks, s, e, "start", variants)
+        allow_out_e, mode_e = _classify_edge(
+            words, nw, breaks, s, e, "end", variants)
+
+        # --- start
         # Leading host-speech trim: an opening cue *inside* the block
-        # (before the first brand mention) is the true start — the
-        # content before it is host talk swept in by padding/caps.
+        # (before the first brand mention) is the true start.
         target_s = s
+        cue_lo = s - CUE_LOOKBACK_OUTWARD if allow_out_s else s
         cue_hi = s + SNAP_WINDOW
         if first_m is not None:
             cue_hi = max(cue_hi, first_m)
+        # inward cue search may look further into the block than SNAP_WINDOW
+        if not allow_out_s:
+            cue_hi = max(cue_hi, min(e, s + CUE_LOOKBACK))
+            if first_m is not None:
+                cue_hi = min(cue_hi, first_m) if first_m >= s else cue_hi
         found_cue = False
         for j, w in enumerate(words):
-            if w[0] < s - CUE_LOOKBACK:
+            if w[0] < cue_lo:
                 continue
             if w[0] > cue_hi:
                 break
@@ -1722,52 +2012,115 @@ def _snap_block_edges(words, nw, silences, blocks, sponsors):
                 target_s = w[0]
                 found_cue = True
                 break
-        # Pause-snap only when a cue moved the target, or the edge sits
-        # inside a word. Unconditioned ±SNAP_WINDOW sentence snaps on
-        # already-wide edges add noise (TESTS.md entry 4; snap-diag-v1b
-        # overshoot: median 10.00s -> 10.24s, 612 worse / 326 better).
-        if found_cue:
-            cands = [b for b in breaks if abs(b[0] - target_s) <= SNAP_WINDOW
-                     and b[0] <= target_s + 0.5]
-            if not cands:
-                cands = [b for b in breaks if abs(b[0] - target_s) <= SNAP_WINDOW]
-            ns = min(cands, key=lambda b: abs(b[0] - target_s))[0] if cands else target_s
+
+        ns = s
+        if found_cue or mode_s == "full":
+            snapped = _nearest_break(
+                breaks, target_s, "start", prefer="not_after")
+            ns = snapped if snapped is not None else target_s
+        elif mode_s == "sentence":
+            bound = _sentence_boundary(breaks, s, "start")
+            if bound is not None and s - SNAP_WINDOW <= bound <= s:
+                ns = bound
+            else:
+                ns = _avoid_mid_word(words, s, "start", allow_outward=True)
         else:
-            ns = _avoid_mid_word(words, s, "start")
+            # wide: nearest mid-word fix (not inward-only: that bias
+            # turned mid-read cuts mid-word into even later starts).
+            # Optional inward pause if the prefix is a return-to-content cue.
+            ns = _avoid_mid_word(words, s, "start", allow_outward=True)
+            pause_hi = s + SNAP_WINDOW
+            if first_m is not None:
+                pause_hi = min(pause_hi, first_m)
+            inward = [b[0] for b in breaks if s < b[0] <= pause_hi]
+            pick = None
+            for t_in in inward:
+                if _adish_in_window(words, nw, s, t_in, variants):
+                    continue
+                # only drop a prefix that already contains a return-to-content cue
+                if not _topic_shift_in(words, nw, s, t_in):
+                    continue
+                pick = t_in
+                break
+            if pick is not None:
+                ns = pick
+        # Already-wide starts never pause/cue earlier than s (a snap
+        # around an inward cue can otherwise pick a break just before
+        # s). A nearest mid-word fix of the original edge may sit
+        # slightly before s still on the same word — that is allowed.
+        if not allow_out_s:
+            floor = s
+            if _is_mid_word(words, s):
+                floor = next(w[0] for w in words if w[0] < s < w[1])
+            ns = max(ns, floor)
         if first_m is not None and ns > first_m:
             ns = min(s, first_m)
+        ns = _avoid_mid_word(words, ns, "start", allow_outward=True)
 
-        # --- end: include a thanks/support sign-off just after the edge
-        # Trailing host-speech trim: a thanks/support sign-off after the
-        # last brand mention ends the read, even when padding pushed the
-        # block well past it.
+        # --- end
         target_e = e
-        so_lo = e - 10
+        so_lo = e if not allow_out_e else e - 10
+        if not allow_out_e:
+            so_lo = e - SIGNOFF_LOOKAHEAD
         if last_m is not None:
             so_lo = min(so_lo, last_m)
+        so_hi = e + SIGNOFF_LOOKAHEAD_OUTWARD if allow_out_e else e
         found_signoff = False
         for j, w in enumerate(words):
             if w[0] < so_lo:
                 continue
-            if w[0] > e + SIGNOFF_LOOKAHEAD:
+            if w[0] > so_hi:
                 break
             win = " ".join(nw[j:j + 10])
             if nw[j].startswith("thank") and ("support" in win or "sponsor" in win):
                 target_e = thanks_end(words, nw, j)
                 found_signoff = True
                 break
-        if found_signoff:
-            cands = [b for b in breaks if abs(b[1] - target_e) <= SNAP_WINDOW
-                     and b[1] >= target_e - 0.5]
-            if not cands:
-                cands = [b for b in breaks if abs(b[1] - target_e) <= SNAP_WINDOW]
-            ne = min(cands, key=lambda b: abs(b[1] - target_e))[1] if cands else target_e
+
+        ne = e
+        if found_signoff or mode_e == "full":
+            snapped = _nearest_break(
+                breaks, target_e, "end", prefer="not_before")
+            ne = snapped if snapped is not None else target_e
+        elif mode_e == "sentence":
+            bound = _sentence_boundary(breaks, e, "end")
+            if bound is not None and e <= bound <= e + SNAP_WINDOW:
+                ne = bound
+            else:
+                ne = _avoid_mid_word(words, e, "end", allow_outward=True)
         else:
-            ne = _avoid_mid_word(words, e, "end")
+            ne = _avoid_mid_word(words, e, "end", allow_outward=True)
+            pause_lo = e - SNAP_WINDOW
+            if last_m is not None:
+                pause_lo = max(pause_lo, last_m)
+            inward = [b[1] for b in breaks if pause_lo <= b[1] < e]
+            pick = None
+            for t_in in reversed(inward):  # nearest to e, walking inward
+                if _adish_in_window(words, nw, t_in, e, variants):
+                    continue
+                if not _topic_shift_in(words, nw, t_in, e):
+                    continue
+                pick = t_in
+                break
+            if pick is not None:
+                ne = pick
+        if not allow_out_e:
+            ceil = e
+            if _is_mid_word(words, e):
+                ceil = next(w[1] for w in words if w[0] < e < w[1])
+            ne = min(ne, ceil)
         if last_m is not None and ne < last_m:
             ne = max(e, last_m)
-        if ne - ns < 5:
+        ne = _avoid_mid_word(words, ne, "end", allow_outward=True)
+        # Don't collapse a block to a stub, but don't undo a cue /
+        # sign-off / truncation snap just because the remaining read
+        # is under 5s (short ads + inward host-talk trim).
+        if ne - ns < 2.0:
             ns, ne = s, e
+        elif ne - ns < 5.0 and not (found_cue or found_signoff
+                                    or mode_s == "full" or mode_e == "full"):
+            if e - s >= 5.0:
+                ns, ne = s, e
         if (round(ns, 1), round(ne, 1)) != (round(s, 1), round(e, 1)):
             log(f"  snap '{l}': {s:.1f}-{e:.1f}s -> {ns:.1f}-{ne:.1f}s")
         out.append((ns, ne, l))
