@@ -49,3 +49,18 @@ def test_no_overlap_after_snap():
     nw = rp.norm_words(words)
     out = rp._snap_block_edges(words, nw, [], [(ad[0][0], ad[10][0], "x:A"), (ad[11][0], so[-1][1], "x:B")], [])
     assert out[0][1] <= out[1][0]
+
+def test_overshoot_without_cue_does_not_wander():
+    """A block that already covers the ad, with no opening cue or
+    sign-off in range, must not jump to a nearby unrelated sentence."""
+    a, ad, so, b = build()
+    words = a + ad + so + b
+    nw = rp.norm_words(words)
+    # Overshoot both edges by ~2s into adjacent content, starting on a gap.
+    s = ad[0][0] - 2.0
+    e = so[-1][1] + 2.0
+    (ns, ne, _), = rp._snap_block_edges(words, nw, [], [(s, e, "brand:AcmeWidget")], SP)
+    # Cue/sign-off may still pull inward toward the true ad, but the
+    # edges must stay close to the already-wide box (no long wander).
+    assert abs(ns - s) <= 6.5 and abs(ne - e) <= 6.5, (ns, ne, s, e)
+    assert ns <= ad[0][0] and ne >= so[-1][1]

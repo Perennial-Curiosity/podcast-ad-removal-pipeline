@@ -1661,11 +1661,25 @@ def _word_breaks(words, silences):
     return out
 
 
+
+def _avoid_mid_word(words, t, side):
+    """If t falls strictly inside a word, move it to the nearest word edge.
+
+    Nearest-edge (not a systematic outward push) avoids turning a slightly
+    early start into an even earlier one. Edges already in a gap stay put.
+    """
+    for w in words:
+        if w[0] < t < w[1]:
+            return w[0] if (t - w[0]) <= (w[1] - t) else w[1]
+    return t
+
+
 def _snap_block_edges(words, nw, silences, blocks, sponsors):
     """Snap detected ad edges to opening cues, sign-offs, and pauses.
 
-    This is a cue/sign-off inclusion pass first, then a tight (±SNAP_WINDOW)
-    snap to the nearest sentence/pause break around that target. A broader
+    This is a cue/sign-off inclusion pass first. A tight (±SNAP_WINDOW)
+    pause snap runs only around a cue or sign-off that actually moved
+    the target, or to pull an edge out of the middle of a word. A broader
     silence+sentence snap (±15s, and a ≤2s cap) was tested 2026-11-08/09
     (TESTS.md entry 4) and discarded because unconditioned snaps added
     noise around already-good edges. Constraints: never move an edge past
@@ -1698,6 +1712,7 @@ def _snap_block_edges(words, nw, silences, blocks, sponsors):
         cue_hi = s + SNAP_WINDOW
         if first_m is not None:
             cue_hi = max(cue_hi, first_m)
+        found_cue = False
         for j, w in enumerate(words):
             if w[0] < s - CUE_LOOKBACK:
                 continue
@@ -1705,12 +1720,20 @@ def _snap_block_edges(words, nw, silences, blocks, sponsors):
                 break
             if any(" ".join(nw[j:j + 6]).startswith(c) for c in OPEN_CUES):
                 target_s = w[0]
+                found_cue = True
                 break
-        cands = [b for b in breaks if abs(b[0] - target_s) <= SNAP_WINDOW
-                 and b[0] <= target_s + 0.5]  # prefer not to clip the cue
-        if not cands:
-            cands = [b for b in breaks if abs(b[0] - target_s) <= SNAP_WINDOW]
-        ns = min(cands, key=lambda b: abs(b[0] - target_s))[0] if cands else s
+        # Pause-snap only when a cue moved the target, or the edge sits
+        # inside a word. Unconditioned ±SNAP_WINDOW sentence snaps on
+        # already-wide edges add noise (TESTS.md entry 4; snap-diag-v1b
+        # overshoot: median 10.00s -> 10.24s, 612 worse / 326 better).
+        if found_cue:
+            cands = [b for b in breaks if abs(b[0] - target_s) <= SNAP_WINDOW
+                     and b[0] <= target_s + 0.5]
+            if not cands:
+                cands = [b for b in breaks if abs(b[0] - target_s) <= SNAP_WINDOW]
+            ns = min(cands, key=lambda b: abs(b[0] - target_s))[0] if cands else target_s
+        else:
+            ns = _avoid_mid_word(words, s, "start")
         if first_m is not None and ns > first_m:
             ns = min(s, first_m)
 
@@ -1722,6 +1745,7 @@ def _snap_block_edges(words, nw, silences, blocks, sponsors):
         so_lo = e - 10
         if last_m is not None:
             so_lo = min(so_lo, last_m)
+        found_signoff = False
         for j, w in enumerate(words):
             if w[0] < so_lo:
                 continue
@@ -1730,12 +1754,16 @@ def _snap_block_edges(words, nw, silences, blocks, sponsors):
             win = " ".join(nw[j:j + 10])
             if nw[j].startswith("thank") and ("support" in win or "sponsor" in win):
                 target_e = thanks_end(words, nw, j)
+                found_signoff = True
                 break
-        cands = [b for b in breaks if abs(b[1] - target_e) <= SNAP_WINDOW
-                 and b[1] >= target_e - 0.5]
-        if not cands:
-            cands = [b for b in breaks if abs(b[1] - target_e) <= SNAP_WINDOW]
-        ne = min(cands, key=lambda b: abs(b[1] - target_e))[1] if cands else e
+        if found_signoff:
+            cands = [b for b in breaks if abs(b[1] - target_e) <= SNAP_WINDOW
+                     and b[1] >= target_e - 0.5]
+            if not cands:
+                cands = [b for b in breaks if abs(b[1] - target_e) <= SNAP_WINDOW]
+            ne = min(cands, key=lambda b: abs(b[1] - target_e))[1] if cands else target_e
+        else:
+            ne = _avoid_mid_word(words, e, "end")
         if last_m is not None and ne < last_m:
             ne = max(e, last_m)
         if ne - ns < 5:

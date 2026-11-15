@@ -10,8 +10,9 @@ Limitations (documented in every report):
 - No audio: voice/reverb votes are off, and silences are inferred from
   inter-word gaps (>= 0.8s) rather than ffmpeg silencedetect.
 - Sponsors/chapters come from a cached yt-dlp info.json if present;
-  otherwise description sponsors are empty (popular-brand / CTA / URL
-  methods still run).
+  otherwise description sponsors are empty except for an eval-only
+  YouTube URL+CTA supplement (eval/youtube_sponsors.py) applied equally
+  to every pipeline under test.
 
 Usage:
   python3 eval/run_word_eval.py --pipeline pipeline/run_pipeline.py \\
@@ -33,6 +34,7 @@ sys.path.insert(0, HERE)
 from score_segments import (  # noqa: E402
     load_blab_gt, score_episode, aggregate, format_report, _video_id,
 )
+from youtube_sponsors import supplement_youtube_sponsors  # noqa: E402
 
 
 def load_pipeline(path):
@@ -92,6 +94,10 @@ def detect_one(mod, words, silences, info):
             sponsors = mod.extract_sponsors(description)
         except Exception as exc:
             print(f"    extract_sponsors failed: {exc!r}", file=sys.stderr)
+        # Same sponsor list for every pipeline under test (PR #1 YouTube
+        # blurb parser). See eval/youtube_sponsors.py.
+        if description:
+            sponsors = supplement_youtube_sponsors(description, sponsors)
         try:
             if hasattr(mod, "extract_own_domains"):
                 own_domains = mod.extract_own_domains(
@@ -169,8 +175,8 @@ def main():
                   + ", ".join(f"{s:.0f}-{e:.0f}" for s, e, _ in spans))
         predictions[vid] = {
             "blocks": [[round(s, 2), round(e, 2), l] for s, e, l in spans],
-            "suspects": [[round(*block_span(s)[:2], 2), block_span(s)[2]]
-                         for s in suspects],
+            "suspects": [[round(block_span(s)[0], 2), round(block_span(s)[1], 2),
+                          block_span(s)[2]] for s in suspects],
             "n_words": len(words),
             "n_sponsors": len(sponsors),
             "has_description": bool(info.get("description")),
