@@ -1,0 +1,21 @@
+{
+  "meta": {
+    "source": "TESTS.md entry 18 (dynamic-slot integration, 2026-11-11). These are the owner's hand-marked DYNAMIC ad times only. Unsubscribe 286 has 9 ads totaling 673s; 287 has 8 ads totaling 531s. The remaining host-read ads and all Security Now 1101 times are not published in this repo — they live in the live working copy the owner will share later.",
+    "complete": false
+  },
+  "unsubscribe-286-dynamic": {
+    "ads": [
+      [0, 56, "Progressive"],
+      [1421, 1452, "Got Junk"],
+      [2419, 2449, "Ozempic"],
+      [3589, 3620, "Leaf Filter"]
+    ]
+  },
+  "unsubscribe-287-dynamic": {
+    "ads": [
+      [0, 57, "Progressive"],
+      [1571, 1600, "Leaf Filter"],
+      [2651, 2710, "Leaf Filter"]
+    ]
+  }
+}
