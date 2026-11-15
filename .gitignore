@@ -12,3 +12,9 @@ regression_work/
 regression/
 .venv/
 .pytest_cache/
+data/
+dataset/
+.venv/
+.pad_base/
+__pycache__/
+*.log
