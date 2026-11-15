@@ -184,3 +184,49 @@ def test_hash_prefixed_cue_is_recognized():
     e = ad[-1][1]
     (ns, ne, _), = rp._snap_block_edges(words, nw, [], [(s, e, "x:ad")], [])
     assert ns <= ad[0][0] + 0.2, (ns, ad[0][0], nw[len(pre):len(pre)+6])
+
+
+def test_truncated_start_not_pulled_inward_to_late_cue():
+    """A mid-read start must not jump >12s inward to a later opening cue."""
+    pre = seq("that was a long story about the router today.", 0)
+    ad = seq("acmewidget makes really great durable widgets for home cooks "
+             "and working professionals everywhere you look today honestly "
+             "and more clearly than before in every kitchen around this "
+             "country this year without a doubt my friends. "
+             "this episode is brought to you by acmewidget go to "
+             "acmewidget dot com today.",
+             pre[-1][1] + 1.0)
+    words = pre + ad
+    nw = rp.norm_words(words)
+    s = ad[4][0] + 0.05
+    e = ad[-1][1]
+    cue_t = [w[0] for w, n in zip(words, nw)
+             if n == "brought" and "episode" in " ".join(
+                 nw[max(0, words.index(w)-3):words.index(w)+1])]
+    # fallback: first "brought" in the ad
+    if not cue_t:
+        cue_t = [w[0] for w in ad if "brought" in w[2]]
+    cue_t = cue_t[0]
+    assert cue_t - s > 12.0, (cue_t, s)
+    (ns, ne, _), = rp._snap_block_edges(words, nw, [], [(s, e, "x:ad")], [])
+    assert ns < cue_t - 1.0, (ns, cue_t, s)
+    assert ns <= s + 12.0, (ns, s, cue_t)
+
+
+def test_truncated_end_not_pulled_inward_to_early_signoff():
+    """A mid-read end must not jump back to an earlier thanks/sponsor."""
+    pre = seq("ok now a short word from a partner.", 0)
+    ad = seq("thanks acmewidget for supporting the show. acmewidget makes "
+             "durable widgets for home cooks and working professionals "
+             "everywhere you look around today.",
+             pre[-1][1] + 1.0)
+    post = seq("welcome back to the show everyone.", ad[-1][1] + 1.0)
+    words = pre + ad + post
+    nw = rp.norm_words(words)
+    thanks_t = [w[0] for w in ad if "thanks" in w[2]][0]
+    # end is late in the second sentence, >6s after the sign-off
+    s = ad[0][0]
+    e = ad[-3][0] + 0.05
+    assert e - thanks_t > 6.0
+    (ns, ne, _), = rp._snap_block_edges(words, nw, [], [(s, e, "x:ad")], [])
+    assert ne >= e - 6.0, (ne, e, thanks_t)

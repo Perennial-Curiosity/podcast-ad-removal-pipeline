@@ -253,16 +253,154 @@ A production port of that parser, plus a tighter vote rule for
 brand-orphans that already sit on a CTA/cue, is the cheapest
 plausible recall lift. Smashed-domain URL recovery is the other.
 
-## Next ideas (not yet measured)
+## Experiment 6 — inward-snap cap, orphan promotion, show-notes
+parser, smashed URLs, 48-ep eval
 
-- Don't snap a start inward to a cue far past the current edge when
-  the block already looks truncated (the 20–23s mid-read inward jumps).
-- Promote single-vote brand-orphans when the span also has a CTA or
-  opening cue (several 12-ep suspects already look like true ads).
-- Port the PR #1 YouTube description parser onto main, then re-score
-  detect+score (mentions exist; votes often don't).
-- Recover smashed spoken URLs (`xmondohaircom`) as url-method anchors.
+Local branch `grok/boundary-work` only. Nothing pushed. 2026-11-15 CST.
+Baseline is truncation-aware snap v1d (commit `24a7d34`) plus the `#`
+strip. Official detect scorer remains coverage overlap ≥50% of GT
+duration. Snap keep-rule unchanged: mid-read and overshoot both
+improve, or mixed clearly improves without either mean regressing
+>0.3s vs the kept version (then v1d).
+
+### 6a. Don't snap a truncated start inward to a far-later cue
+
+v1d had three mid-read edges that jumped ~20–23s inward to a cue well
+past the current edge (`1QMZ1Mht27k` start 507.4→522.8, GT 499.4;
+`HtUYwmvaUd8` start 3869.65→3881.89; `B33Xbmu1CBk` end 967.38→951.98).
+
+Tried and reverted before the kept cap:
+
+- v3: hard 6s mid-like inward cap. Overshoot mean 8.60→9.11s, over the
+  0.3s budget.
+- v3b: only allow a large inward cue snap when a ≥0.8s pause sits
+  beside the cue. Overshoot mean 9.14s, still over budget (the 10s
+  overshoot diagnostic's legitimate cue trims were blocked).
+
+Kept (v3c snap): refuse an inward cue/sign-off snap larger than
+`CUE_INWARD_WHEN_UNCERTAIN = 12s` unless a long pause (≥0.8s) marks a
+real opening/ending. Far interior cues no longer classify a mid-sentence
+edge as "wide". Truncated starts no longer extend `cue_hi` to the first
+brand mention.
+
+Paired snap diagnostic, 579 ads, no sponsors (same harness as exp. 4).
+v3c vs v1d:
+
+| Condition | | mean | median | ≤1s / ≤2s / ≤5s | worst | better/worse/same |
+|---|---|---|---|---|---|---|
+| mid-read | v1d | 5.51s | 6.53s | 9.9/20.8/41.9% | 23.40s | 376/234/548 |
+| mid-read | v3c | 5.46s | 6.51s | 10.0/20.9/42.0% | 22.12s | 379/232/547 |
+| overshoot | v1d | 8.60s | 10.00s | 5.2/8.5/16.1% | 15.90s | 343/162/653 |
+| overshoot | v3c | 8.75s | 10.00s | 4.6/7.9/14.3% | 15.90s | 327/168/663 |
+| mixed | v1d | 4.86s | 4.70s | 35.7/41.2/51.4% | 22.12s | 235/173/750 |
+| mixed | v3c | 4.91s | 4.86s | 35.4/40.9/50.7% | 22.12s | 231/176/751 |
+
+Overshoot mean +0.15s, mixed +0.05s, both within 0.3s. Mid-read slightly
+better; the 20–23s *start* jumps are gone. One 22.12s *end* remains on
+`B33Xbmu1CBk` (a "thanks to our sponsor" 15s early still looks
+ending-like). Snap change kept. `test_truncated_start_not_pulled_inward_to_late_cue`
+and `test_truncated_end_not_pulled_inward_to_early_signoff` lock this in.
+
+### 6b–6d. Detect changes, measured on 12 and 48 episodes
+
+The official 12-episode set is too small to judge (35 GT ads, 3–5 TPs).
+Expanded detect+score to 48 BLAB episodes with cached YouTube
+descriptions (12 official + 36 extras; 4 of 40 fetches failed). 135 GT
+ads, 8101s of labeled ad time. Same harness as exp. 5: BLAB words,
+inferred silences ≥0.8s, no audio/voice/reverb.
+
+A first detect pass (untightened "v3c") that put smashed stems into
+bare `find_url_positions` and promoted uncapped brand-orphans was **not
+kept**: 12-ep coverage P collapsed 75.0%→54.5% (garbage stems `inter`,
+`oppo`, `para`, `what`, `usa`; a 441s `seed` orphan; the ACZr chapter
+TP was lost). Tightened before the keep decision:
+
+- Smashed spoken URLs (`xmondohaircom`, `mphormonesdotcom`) are
+  recovered only in `find_url_mentions`, CTA-gated, stem length ≥6.
+  They are *not* fed to the bare URL method. Short leftover stems
+  (`paracom`, `intercom`, `welcome`) stay out.
+- Brand-orphan promotion: a single-vote SUSPECT is marked if a
+  CTA/cue/promo/URL/sign-off (not the brand mention itself) lands
+  within 15s of a mention. Promoted duration is capped at 150s; a
+  mention span wider than that is skipped (`seed` 441s).
+- `extract_sponsors` now parses YouTube / show-notes blurbs in
+  production: URL + promo/CTA in the same blank-line paragraph,
+  "brought to you by" / "presented by", "Sponsors:" headers, `#ad`,
+  and affiliate `?ref=` links. CTAs are attributed forward to the
+  URL they introduce (`Visit Butcher Box\nURL`), not to a closer
+  related-article link (pubmed, nypost, ncbi). Generic word variants
+  (`news`, `plan`, `eats`) are not added. The loose PR #1 150-char
+  window is intentionally *not* copied; it was claiming footer and
+  article links. Eval `--no-supplement` scores this production path
+  alone; on 48 episodes it matches the supplement-on run and drops
+  one FP.
+
+### Detect+score (coverage ≥50% of GT is official)
+
+12-episode official set (35 GT ads, 2072s), supplement on (fair vs v1d):
+
+| | Cov P | Cov R | Cov F1 | Time P | Time R | Time F1 | mean \|err\| | ≤5s | matched edges |
+|---|---|---|---|---|---|---|---|---|---|
+| v1d (`24a7d34`) | 75.0% (3 TP / 1 FP) | 8.6% (3/35) | 15.4% | 71.1% | 19.4% | 30.5% | 30.21s | 50.0% | 6 |
+| v3e (kept) | 83.3% (5 TP / 1 FP) | 14.3% (5/35) | 24.4% | 70.5% | 24.3% | 36.1% | 20.25s | 50.0% | 10 |
+| v3e production, no supplement | 83.3% (5/1) | 14.3% (5/35) | 24.4% | 70.5% | 24.3% | 36.1% | 20.25s | 50.0% | 10 |
+
+New 12-ep TPs are promoted `bitbox` orphans on `1m1ye7pTgs0` and
+`LXB0d_3WntM`. The ACZr chapter match is restored (253.0–371.1 vs GT
+252.2–371.1). The one FP is still `xAlaCKk2UWg` Sheath Underwear
+(620–668s covers only 22s of a 79s GT ad at 646–725s). USAA was not
+promoted (no CTA in the corroboration window).
+
+48-episode expanded set (135 GT ads, 8101s):
+
+| | Cov P | Cov R | Cov F1 | Time P | Time R | Time F1 | mean \|err\| | ≤5s | matched edges |
+|---|---|---|---|---|---|---|---|---|---|
+| v1d (`24a7d34`) | 50.0% (9 TP / 9 FP) | 6.7% (9/135) | 11.8% | 74.9% | 14.7% | 24.6% | 23.19s | 44.4% | 18 |
+| v3e, supplement on | 62.2% (23 TP / 14 FP) | 17.0% (23/135) | 26.7% | 74.7% | 28.4% | 41.2% | 20.67s | 41.3% | 46 |
+| v3e production, no supplement | 63.9% (23 TP / 13 FP) | 17.0% (23/135) | 26.9% | 75.5% | 28.2% | 41.0% | 20.67s | 41.3% | 46 |
+
+Coverage F1 more than doubles (11.8%→26.9%). Time recall nearly
+doubles while time precision holds. Mean boundary error on matched
+ads improves slightly; ≤5s dips 44.4%→41.3% because the matched set
+is larger (18→46 edges), including harder mid-roll reads. Worst edge
+is the same 144.34s overshoot already present in v1d (`cAgxuqGMUYg`).
+
+### What stuck, what was reverted
+
+Kept, as v3e (this commit):
+
+1. Snap v3c (12s inward cap + long-pause exception).
+2. CTA-corroborated brand-orphan promotion, duration capped at 150s.
+3. Production `extract_sponsors` show-notes / YouTube parser (not
+   eval-only). Production path equals or slightly beats the old
+   eval supplement.
+4. CTA-gated smashed-URL recovery with min stem length 6.
+5. 48-episode eval ID list and `--no-supplement` eval flag.
+
+Reverted or tightened before keep:
+
+- Snap v3 and v3b (overshoot mean exceeded the 0.3s budget).
+- Smash recovery inside bare `find_url_positions` (12-ep P 75%→54.5%,
+  lost the ACZr chapter TP).
+- Uncapped orphan promotion (`seed` 441s).
+- Nearest-URL-only 150-char context (claimed pubmed / nypost /
+  "News" from "today's sponsors:").
+- Copying the supplement's related-link FPs (`ncbi`, `fastcompany`,
+  `mindpumpfree` footer, etc.).
+
+Unit tests: 31 passed (`tests/test_boundaries.py`,
+`tests/test_sponsors_and_urls.py`, `tests/test_detect_smoke.py`,
+`tests/test_score_segments.py`).
+
+### Next ideas (not yet measured)
+
+- The remaining 22.12s mid-read end jump on `B33Xbmu1CBk`, and the
+  144s end overshoot on `cAgxuqGMUYg`.
+- USAA-style orphans that have a description sponsor but no spoken
+  CTA in the corroboration window.
+- The cheap cue/CTA window from exp. 5 is still too noisy (R 34.3%,
+  P 12.4%) to add as a standalone method.
 - After Tuesday: score Unsubscribe 286/287 and SN 1101 against the
   owner's full marks, with real Whisper transcripts (no `#` prefixes).
-- Later process_episode steps (xep, dynamic slots, split rescue) can
-  still move edges after detect_ad_blocks; not exercised here.
+- Later `process_episode` steps (xep, dynamic slots, split rescue)
+  can still move edges after `detect_ad_blocks`; not exercised here.

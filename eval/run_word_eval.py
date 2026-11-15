@@ -85,7 +85,7 @@ def block_span(b):
     return float(b[0]), float(b[1]), b[2] if len(b) > 2 else "ad"
 
 
-def detect_one(mod, words, silences, info):
+def detect_one(mod, words, silences, info, use_supplement=True):
     description = info.get("description") or ""
     sponsors = []
     own_domains = None
@@ -94,9 +94,10 @@ def detect_one(mod, words, silences, info):
             sponsors = mod.extract_sponsors(description)
         except Exception as exc:
             print(f"    extract_sponsors failed: {exc!r}", file=sys.stderr)
-        # Same sponsor list for every pipeline under test (PR #1 YouTube
-        # blurb parser). See eval/youtube_sponsors.py.
-        if description:
+        # Optional PR #1 supplement. Default on so older runs stay
+        # comparable; pass --no-supplement to score the production
+        # extract_sponsors path alone.
+        if description and use_supplement:
             sponsors = supplement_youtube_sponsors(description, sponsors)
         try:
             if hasattr(mod, "extract_own_domains"):
@@ -134,6 +135,8 @@ def main():
     ap.add_argument("--all", action="store_true", help="score every BLAB episode")
     ap.add_argument("--label", default="run")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--no-supplement", action="store_true",
+                    help="use only pipeline extract_sponsors")
     args = ap.parse_args()
 
     with open(args.gt) as f:
@@ -167,7 +170,9 @@ def main():
         words = blab_words(ep)
         silences = inferred_silences(words)
         info = load_info(args.info_dir, vid)
-        blocks, suspects, sponsors = detect_one(mod, words, silences, info)
+        blocks, suspects, sponsors = detect_one(
+            mod, words, silences, info,
+            use_supplement=not args.no_supplement)
         spans = [block_span(b) for b in blocks]
         if not args.quiet:
             print(f"  {vid}: {len(words)} words, {len(sponsors)} sponsors, "
