@@ -1814,7 +1814,7 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     for s, e, l in blocks:
         sp_part = l.split(':')[-1].strip().lower()
         match = None
-        for sp in sponsors:
+        for sp in listed_sponsors:
             if sp['label'].lower() == sp_part:
                 match = sp
                 break
@@ -1859,22 +1859,31 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     refined = []
     for s, e, l in blocks:
         sp_part = l.split(':')[-1].strip().lower()
-        match = None
-        for sp in sponsors:
+        listed_match = None
+        for sp in listed_sponsors:
             if sp['label'].lower() == sp_part:
-                match = sp
+                listed_match = sp
                 break
+        match = listed_match
+        if match is None:
+            for sp in sponsors:
+                if sp['label'].lower() == sp_part:
+                    match = sp
+                    break
         variants = match['variants'] if match else [sp_part]
         hits = find_mentions(nw, variants)
         inblock = [words[h][0] for h in hits if s <= words[h][0] <= e]
         if inblock:
             ev_start, ev_end = min(inblock), max(inblock)
-            starts = [cs for cs, _ in edge_cands if s <= cs <= ev_start]
-            if starts:
-                ns = max(starts)
-                if ns != s:
-                    log(f"  refine start '{l}': {s:.0f}s -> {ns:.0f}s")
-                    s = ns
+            # Starts stay raw for auto / unlisted brands: inward refine
+            # walks up to a method segment at the closing URL.
+            if listed_match is not None:
+                starts = [cs for cs, _ in edge_cands if s <= cs <= ev_start]
+                if starts:
+                    ns = max(starts)
+                    if ns != s:
+                        log(f"  refine start '{l}': {s:.0f}s -> {ns:.0f}s")
+                        s = ns
             ends = [ce for _, ce in edge_cands if ev_end <= ce <= e]
             if ends:
                 ne = min(ends)
@@ -1894,9 +1903,11 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     # snapped edges. Later process_episode steps (xep corroboration,
     # dynamic slots, split rescue) may still move edges afterwards.
     blocks = _snap_block_edges(words, nw, silences, sorted(blocks), sponsors)
-    # Multi-brand mid-roll pods are often two short URL-end hits a
-    # minute apart and fail the 50% coverage rule unless joined.
-    blocks = _merge_lexical_pods(blocks, max_gap=90.0)
+    # Grow a confirmed URL/CTA fragment out to the full read, then join
+    # multi-brand pods (including gaps up to 180s when the in-between
+    # text is still ad-like).
+    blocks = _grow_confirmed_fragments(words, nw, silences, sorted(blocks))
+    blocks = _merge_lexical_pods(blocks, max_gap=90.0, words=words, nw=nw)
 
     # Suspect reel (2026-10-22, per the owner): low-confidence candidates
     # that did not become marked blocks. Replaces the old cluster-popular
@@ -3482,27 +3493,244 @@ def _expand_url_tail(words, silences, url_idx, lookback=75.0, lookahead=15.0):
     return start, end
 
 
-def _merge_lexical_pods(blocks, max_gap=90.0):
+def _is_lexical_label(label):
+    lab = (label or "").lower()
+    return any(k in lab for k in ("cta", "url", "brand", "chapter", "cluster"))
+
+
+def _brand_stem_from_label(label):
+    stem = re.sub(r"[^a-z0-9]", "", (label or "").split(":")[-1].lower())
+    return stem if len(stem) >= 4 else ""
+
+
+def _growth_brand_blocked(stem):
+    if not stem or stem in _AUTO_SPONSOR_SKIP:
+        return True
+    return any(s in stem for s in ("meetup", "donation", "donate", "boostagram"))
+
+
+# Extra produced-spot openings that OPEN_CUES misses ("what's up nerds",
+# "I'm here with the CEO of Fly").
+_GROW_OPEN_EXTRA = (
+    "what's up", "whats up", "i'm here", "im here",
+    "co-founder", "co founder", "ceo of", "founder of",
+    "this episode",
+)
+_GROW_YOU = {"you", "your", "you're", "youre", "you'll", "yours"}
+_GROW_MAX = 240.0
+
+
+def _sentence_spans(words, nw):
+    """Sentence-like spans: (start, end, tokens, first_idx)."""
+    out, cur = [], []
+    for i, w in enumerate(words):
+        cur.append(i)
+        endish = w[2].strip().rstrip("\"'").endswith((".", "!", "?"))
+        gap = (i + 1 < len(words) and words[i + 1][0] - w[1] >= 0.8)
+        if endish or gap:
+            toks = [nw[j] if j < len(nw) else "" for j in cur]
+            out.append((words[cur[0]][0], words[cur[-1]][1], toks, cur[0]))
+            cur = []
+    if cur:
+        toks = [nw[j] if j < len(nw) else "" for j in cur]
+        out.append((words[cur[0]][0], words[cur[-1]][1], toks, cur[0]))
+    return out
+
+
+def _bow(tokens):
+    bag = {}
+    for t in tokens:
+        if len(t) >= 3:
+            bag[t] = bag.get(t, 0) + 1
+    return bag
+
+
+def _cosine_bow(a, b):
+    if not a or not b:
+        return 0.0
+    num = sum(va * b.get(k, 0) for k, va in a.items())
+    da = sum(v * v for v in a.values()) ** 0.5
+    db = sum(v * v for v in b.values()) ** 0.5
+    if da == 0 or db == 0:
+        return 0.0
+    return num / (da * db)
+
+
+def _span_has_open(tokens):
+    win = " ".join(tokens)
+    if any(c in win for c in OPEN_CUES) or any(c in win for c in _GROW_OPEN_EXTRA):
+        return True
+    return False
+
+
+def _span_has_shift(tokens):
+    win = " ".join(tokens)
+    return any(p in win for p in TOPIC_SHIFT_PHRASES) or any(
+        p in win for p in RETURN_CUES)
+
+
+def _span_has_brand(tokens, brands):
+    return any(b and len(b) >= 4 and b in tokens for b in brands)
+
+
+def _span_has_commercial(tokens):
+    for i, tok in enumerate(tokens):
+        for ph in ADISH_PHRASES:
+            if tuple(tokens[i:i + len(ph)]) == ph:
+                return True
+        if tok in ADISH_WORDS or tok == "slash":
+            return True
+    return False
+
+
+def _span_is_adlike(tokens, brands, frag_bow, bg_bow):
+    """True if this sentence still looks like the confirmed ad, not show talk.
+
+    Combines lexical sales language with a cheap bag-of-words comparison
+    to the fragment vs the episode's far-away (non-block) text. No
+    embedding model: ~0.3s for 20 hour-long episodes in the synth set.
+    """
+    if not tokens:
+        return False
+    if (_span_has_brand(tokens, brands) or _span_has_open(tokens)
+            or _span_has_commercial(tokens)):
+        return True
+    you = sum(1 for t in tokens if t in _GROW_YOU) / max(len(tokens), 1)
+    cf = _cosine_bow(_bow(tokens), frag_bow)
+    cb = _cosine_bow(_bow(tokens), bg_bow)
+    return cf >= cb + 0.08 and (you >= 0.08 or cf >= 0.15)
+
+
+def _background_bow(words, nw, blocks, pad=60.0):
+    avoid = [(b[0], b[1]) for b in blocks]
+    toks = []
+    for i, w in enumerate(words):
+        if any(s - pad <= w[0] <= e + pad for s, e in avoid):
+            continue
+        toks.append(nw[i] if i < len(nw) else "")
+    return _bow(toks)
+
+
+def _grow_confirmed_fragments(words, nw, silences, blocks, max_grow=_GROW_MAX):
+    """Grow a confirmed cta/url/brand fragment out to the full read.
+
+    Walk sentence-by-sentence from the fragment while the text stays
+    ad-like, stopping at an opening cue, a topic shift back to show
+    content, V4V donation vocabulary, or `max_grow` seconds. Growth is
+    kept only when a stop signal was seen — hitting the cap with no
+    opening or shift is not a real boundary.
+    """
+    if not blocks or not words:
+        return blocks
+    sents = _sentence_spans(words, nw)
+    bg_bow = _background_bow(words, nw, blocks)
+    grown = []
+    for s, e, l in blocks:
+        if not _is_lexical_label(l) or _growth_brand_blocked(_brand_stem_from_label(l)):
+            grown.append((s, e, l))
+            continue
+        brands = set()
+        stem = _brand_stem_from_label(l)
+        if stem:
+            brands.add(stem)
+        frag_toks = [nw[i] if i < len(nw) else ""
+                     for i, w in enumerate(words) if s <= w[0] <= e]
+        frag_bow = _bow(frag_toks)
+        ns, ne = s, e
+        # Walk back
+        before = [z for z in sents if z[1] <= s + 0.05 and z[0] >= s - max_grow]
+        accepted, rejects, saw_stop = [], 0, False
+        for z in reversed(before):
+            if _span_has_shift(z[2]) or _v4vish_near(nw, z[3]):
+                saw_stop = True
+                break
+            if _span_is_adlike(z[2], brands, frag_bow, bg_bow):
+                accepted.append(z)
+                rejects = 0
+                if _span_has_open(z[2]):
+                    saw_stop = True
+                    break
+                if _span_has_brand(z[2], brands):
+                    saw_stop = True  # keep walking toward the first mention
+            else:
+                rejects += 1
+                if rejects >= 2:
+                    saw_stop = True
+                    break
+        if accepted and saw_stop:
+            ns = min(z[0] for z in accepted)
+        # Walk forward
+        after = [z for z in sents if z[0] >= e - 0.05 and z[1] <= e + max_grow]
+        accepted_f, rejects, saw_stop_f = [], 0, False
+        for z in after:
+            if _span_has_shift(z[2]) or _v4vish_near(nw, z[3]):
+                saw_stop_f = True
+                break
+            if _span_is_adlike(z[2], brands, frag_bow, bg_bow):
+                accepted_f.append(z)
+                rejects = 0
+            else:
+                rejects += 1
+                if rejects >= 2:
+                    saw_stop_f = True
+                    break
+        if accepted_f and saw_stop_f:
+            ne = max(z[1] for z in accepted_f)
+        if ne - ns > MAX_AD_LEN:
+            ne = ns + MAX_AD_LEN
+        if (ns, ne) != (s, e):
+            log(f"  grow '{l}': {s:.0f}s-{e:.0f}s -> {ns:.0f}s-{ne:.0f}s")
+        grown.append((ns, ne, l))
+    return grown
+
+
+def _gap_is_adlike(words, nw, sents, bg_bow, pe, s, brands):
+    gap_s = [z for z in sents if z[0] >= pe - 1 and z[1] <= s + 1]
+    if not gap_s:
+        return False
+    toks = [t for z in gap_s for t in z[2]]
+    if _span_has_commercial(toks) or _span_has_brand(toks, brands) or _span_has_open(toks):
+        return True
+    if any(_v4vish_near(nw, z[3]) or _span_has_shift(z[2]) for z in gap_s):
+        return False
+    frag_toks = [nw[i] if i < len(nw) else ""
+                 for i, w in enumerate(words) if pe - 40 <= w[0] <= pe]
+    fb = _bow(frag_toks)
+    ok = sum(1 for z in gap_s if _span_is_adlike(z[2], brands, fb, bg_bow))
+    return ok >= 0.5 * len(gap_s)
+
+
+def _merge_lexical_pods(blocks, max_gap=90.0, words=None, nw=None, soft_gap=180.0):
     """Join nearby cta/url/brand blocks (multi-sponsor mid-roll pods).
 
     Voice/reverb/duplicate-only blocks are left alone so dry-island
-    false hits do not get glued into a huge marked region.
+    false hits do not get glued into a huge marked region. Gaps longer
+    than `max_gap` (up to `soft_gap`) merge only when the in-between
+    text still looks like ad language.
     """
     if not blocks:
         return blocks
-    lexical = ("cta", "url", "brand", "chapter", "cluster")
-
-    def is_lex(label):
-        lab = (label or "").lower()
-        return any(k in lab for k in lexical)
-
     blocks = sorted(blocks, key=lambda b: (b[0], b[1]))
+    sents = _sentence_spans(words, nw) if words is not None and nw is not None else []
+    bg_bow = _background_bow(words, nw, blocks) if sents else {}
     out = [blocks[0]]
     for b in blocks[1:]:
         s, e, l = b[0], b[1], b[2]
         ps, pe, pl = out[-1][0], out[-1][1], out[-1][2]
         gap = s - pe
-        if is_lex(pl) and is_lex(l) and gap <= max_gap and (e - ps) <= MAX_AD_LEN:
+        can = (_is_lexical_label(pl) and _is_lexical_label(l)
+               and (e - ps) <= MAX_AD_LEN)
+        merge = False
+        if can and gap <= max_gap:
+            merge = True
+        elif can and sents and 0 < gap <= soft_gap:
+            brands = set()
+            for lab in (pl, l):
+                st = _brand_stem_from_label(lab)
+                if st and not _growth_brand_blocked(st):
+                    brands.add(st)
+            merge = _gap_is_adlike(words, nw, sents, bg_bow, pe, s, brands)
+        if merge:
             out[-1] = (ps, max(pe, e), pl)
         else:
             out.append(b)

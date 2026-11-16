@@ -241,3 +241,88 @@ def test_cta_tail_does_not_mark_v4v_donation_url():
     words = pre + mid + post
     blocks, sus = rp.detect_ad_blocks(words, [], [], None, None)
     assert not any("donation" in (b[2] or "").lower() for b in blocks), blocks
+
+
+def test_grow_fragment_walks_back_to_opening():
+    pre = _unique(80, 0, "pre")
+    # Produced-spot opening well before the closing URL.
+    ad = _mk(
+        "what is this intro. what's up nerds I am here with the ceo of fly. "
+        "clouds are not magic and you can build better features. "
+        "go to fly dot io slash changelog and use code SHOW to get started",
+        pre[-1][0] + 1)
+    post = _unique(80, ad[-1][0] + 1, "post")
+    words = pre + ad + post
+    nw = rp.norm_words(words)
+    # A short fragment around the closing URL, like the current detector.
+    url_t = [w[0] for w in ad if "fly" in w[2].lower() and w[0] > ad[0][0] + 5]
+    url_t = url_t[-1]
+    frag = [(url_t - 8.0, url_t + 12.0, "cta/url:fly")]
+    grown = rp._grow_confirmed_fragments(words, nw, [], frag)
+    assert grown[0][0] <= ad[0][0] + 6.0, grown
+    assert grown[0][1] >= url_t
+    # Must not eat the unique pre-roll content
+    assert grown[0][0] >= pre[0][0] + 20
+
+
+def test_merge_pods_when_gap_is_adlike_over_90s():
+    pre = _unique(40, 0, "pre")
+    a = _mk("go to hostinger dot com slash and use code practical today", 200)
+    mid = _mk(
+        "this episode is also brought to you by our friends at buildkite. "
+        "run your CI on your own agents and scale your builds.",
+        a[-1][0] + 5)
+    # pad so the gap is ~120s
+    pad = _mk("your pipeline stays fast with buildkite runners and agents. " * 25,
+              mid[-1][0] + 1)
+    b = _mk("go to buildkite dot com slash changelog and get started today",
+            pad[-1][0] + 1)
+    post = _unique(40, b[-1][0] + 1, "post")
+    words = pre + a + mid + pad + b + post
+    nw = rp.norm_words(words)
+    b1 = (a[0][0], a[-1][1], "cta/url:hostinger")
+    b2 = (b[0][0], b[-1][1], "cta/url:buildkite")
+    gap = b2[0] - b1[1]
+    assert gap > 90, gap
+    out = rp._merge_lexical_pods([b1, b2], max_gap=90.0, words=words, nw=nw)
+    assert len(out) == 1, (gap, out)
+    assert out[0][0] == b1[0] and out[0][1] == b2[1]
+
+
+def test_auto_sponsor_block_is_not_capped_to_closing_url():
+    """A long read that names the brand early must stay long once marked."""
+    pre = _unique(80, 0, "pre")
+    body = (
+        "our friends at tailscale keep your devices connected securely. "
+        "with tailscale you can reach your lab from anywhere. "
+    ) * 8
+    cta = "go to tailscale dot com slash podcast and use code POD to get started today"
+    ad = _mk(body + cta, pre[-1][0] + 1)
+    post = _unique(80, ad[-1][0] + 1, "post")
+    words = pre + ad + post
+    first = [w[0] for w in ad if "tailscale" in w[2].lower()][0]
+    last = [w[0] for w in ad if "tailscale" in w[2].lower()][-1]
+    blocks, sus = rp.detect_ad_blocks(words, [], [], None, None)
+    covering = [b for b in blocks if b[0] <= last <= b[1]]
+    assert covering, (blocks, sus)
+    # Must include the early mention, not just last-30s around the URL
+    assert any(b[0] <= first + 5 for b in covering), (first, covering)
+
+
+def test_v4v_donation_fragment_does_not_grow():
+    pre = _unique(80, 0, "pre")
+    # Donation CTA with no commercial corroborators; growing this would
+    # mark thank-you / fan-mail as ads.
+    body = _mk(
+        "thank you to everyone who sent a donation this week. "
+        "we appreciate every boostagram and every bit of support. "
+        "if you want to help go to donations dot com and send value",
+        pre[-1][0] + 1)
+    post = _unique(80, body[-1][0] + 1, "post")
+    words = pre + body + post
+    nw = rp.norm_words(words)
+    url_t = [w[0] for w in body if "donations" in w[2].lower()][-1]
+    frag = [(url_t - 6.0, url_t + 8.0, "cta/url:donations")]
+    grown = rp._grow_confirmed_fragments(words, nw, [], frag)
+    # Blocked brand stem, or v4vish stop: must not walk back through thank-yous
+    assert grown[0][0] >= frag[0][0] - 0.01, grown

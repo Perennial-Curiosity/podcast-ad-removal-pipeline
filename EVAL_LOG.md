@@ -503,3 +503,137 @@ Unit tests: 37 passed.
 - Cross-episode duplicate audio/text for ads that repeat across shows.
 - After Tuesday: score Unsubscribe 286/287 and SN 1101 against the
   owner's full marks, with real Whisper transcripts (no `#` prefixes).
+
+## Experiment 8 — grow confirmed URL/CTA fragments to the full read (v5a, kept)
+
+Goal: the biggest leftover miss after v4b is not "no signal" —
+27 of the no-notes spliced misses were already marked as a 20–50s
+fragment around the closing URL inside a 100–250s read, and failed
+the 50% coverage rule. Also fix two v4b regressions: description-span
+capping / start-refinement shrinking good TPs toward the closing
+mention (`granola` 2573–2694 → 2659–2694; a notion+deepgram pod),
+and lexical pods whose fragments sit >90s apart
+(`synth-000` hostinger 3238–3257 and buildkite 3380–3421, 123s gap).
+
+Baseline: `6e34fe0` (v4b). Branch `grok/boundary-work`. Local only;
+no GitHub writes.
+
+### What landed (v5a)
+
+1. Mention-span cap now loops `listed_sponsors` only. Auto-sponsors
+   were included in `sponsors`, so a late `granulah` hit pulled the
+   start in by 30s and dropped the ad under 50% coverage. The earlier
+   v4b patch fixed this check in the sponsor-anchor loop, not in the
+   cap itself.
+2. Inward *start* refinement is skipped unless the brand is
+   description-listed. Auto / unlisted brands live at the closing
+   URL, so refining the start to the latest method-segment before
+   that mention was the other shrink path (notion+deepgram). End
+   refinement is unchanged.
+3. `_grow_confirmed_fragments`, after snap, walks sentence-by-sentence
+   backward and forward from a confirmed cta/url/brand/chapter/cluster
+   block while the text stays ad-like, capped at 240s per edge.
+   Ad-like = brand (len≥4), an opening cue (`OPEN_CUES` plus "what's
+   up", "I'm here", "ceo of", "founder of", "this episode"), or
+   commercial / `ADISH` language; otherwise a second-person "you/your"
+   rate ≥0.08 and bag-of-words cosine to the fragment ≥ cosine to the
+   episode background (tokens >60s from any current block) + 0.08,
+   or fragment cosine ≥0.15. Stops at a topic-shift / `RETURN_CUES`,
+   nearby V4V vocabulary, two consecutive non-ad-like sentences, or
+   an opening cue (included). Growth is kept only when a stop signal
+   was seen — hitting the cap with no opening or shift is rejected.
+   Skip-list / meetup / donation / boostagram stems are not grown.
+   Voice/reverb/duplicate-only blocks are left alone.
+4. `_merge_lexical_pods` still joins gaps ≤90s. Gaps of 90–180s join
+   only when the in-between text is commercial, brand, or opening,
+   or ≥50% of gap sentences are ad-like, and is not V4V-ish / a
+   topic shift.
+
+Embedding model: not used. The pipeline venv has no numpy / sklearn /
+sentence-transformers, and no MiniLM (or similar) weights are cached.
+A post-process simulation of the same lexical + bag-of-words cosine
+rules scored 20 spliced episodes in 0.3s on CPU. That is fast enough
+and stays Android-portable, so no new dependency was added.
+
+### Results
+
+Snap diagnostic (579 ads): identical to v3c / v4b. Mid-read after
+5.46s, overshoot 8.75s, mixed 4.91s. Growth runs after snap, so the
+diagnostic (which scores `_snap_block_edges` only) is unchanged.
+
+Spliced set, show-notes-only (71 GT ads, 20 episodes):
+
+| | Cov P | Cov R | Cov F1 | Time P | Time R | Time F1 | mean \|err\| | ≤5s |
+|---|---|---|---|---|---|---|---|---|
+| v4b (`6e34fe0`) | 26.0% (13 TP / 37 FP) | 18.3% (13/71) | 21.5% | 94.1% | 26.7% | 41.6% | 11.20s | 50.0% |
+| v5a (kept) | 55.3% (26 TP / 21 FP) | 36.6% (26/71) | 44.1% | 85.4% | 38.2% | 52.8% | 20.94s | 36.5% |
+
+Targeted fixes held: `granola` is 2573–2694 again (was 2659–2694).
+The `synth-000` hostinger+buildkite pod is one block, 3170–3421,
+against GT 3173–3427. The notion pod grew 1081–1164 → 1041–1175 and
+the following perplexity+coder fragments merged to 2196–2389.
+
+Segment (IoU 0.5) is 25 TP / 22 FP, F1 42.4% — coverage and IoU now
+differ slightly because a few grown blocks clear 50% of GT time but
+not IoU 0.5. Official scorer remains coverage.
+
+Mean |err| and ≤5s look worse because the new TPs are long reads whose
+starts were still a bit late or, in one case, over-grown
+(`synth-006` end +210s, two adjacent mid-rolls glued). Time precision
+94%→85% is the same over-growth. Coverage F1 more than doubled and
+precision rose, so the gate passes; tightening the cap / requiring
+an opening cue for growth past ~60s is the follow-up.
+
+BLAB 48-ep production path (`--no-supplement`):
+
+| | Cov P | Cov R | Cov F1 | Time P | Time R | Time F1 | mean \|err\| | ≤5s |
+|---|---|---|---|---|---|---|---|---|
+| v4b (`6e34fe0`) | 58.1% (25/18) | 18.5% (25/135) | 28.1% | 77.3% | 27.7% | 40.8% | 14.86s | 48.0% |
+| v5a (kept) | 79.1% (34/9) | 25.2% (34/135) | 38.2% | 70.0% | 36.3% | 47.8% | 23.04s | 41.2% |
+
+Coverage F1 28.1%→38.2% (25→34 TPs), precision up, false-positive
+blocks down 18→9. Signed mean start is −17.5s (was −10.8s): some
+BLAB starts walk too far back (worst 132s on `u7ecuuwssic`). Same
+over-growth tradeoff as the spliced set; coverage F1 is the keep
+gate and it passed.
+
+V4V hard negatives (16 uncut hosts):
+
+| | CTA-segment FP time | Clean FP time | Clean blocks / hour |
+|---|---|---|---|
+| v4b (`6e34fe0`) | 3.1% (597s / 19034s) | 1.8% (1177s) | 1.00 (18 blocks) |
+| v5a (kept) | 3.7% (712s) | 1.9% (1228s) | 1.00 (18) |
+
+No new clean or CTA blocks. The +0.6pp donation-segment share and
++51s of clean time are existing FPs growing a little: No Agenda
+1911 `code-itm20` 33s→84s, `noahgenderrings` +15s, `mortalspodcast`
++19s, `bunny` +18s, and a garbage `reverb/url:-words` stem on
+Moe Factz (+35s clean). `meetups` did not grow (substring veto).
+Treated as not a meaningful FP-rate regression — same block counts,
+unlike reverted v4a (CTA 2.7%→4.9%). A follow-up can refuse to grow
+generic / `code-*` / `-words` stems.
+
+Reverted this batch: nothing. v5a passed every gate against v4b
+(spliced coverage F1 up, BLAB coverage F1 up, V4V clean FP not up
+meaningfully, snap unchanged).
+
+Audio voice/room-change cues were not started; growth used the
+batch's time. Judge those primarily on BLAB if they are next.
+
+Unit tests: 41 passed, including growth to "what's up nerds / ceo
+of fly", ad-like 120s pod merge, auto-sponsor blocks not capped to
+the closing URL, and a donations.com fragment that must not grow.
+
+### Next ideas (not yet measured)
+
+- Tighten growth that overshoots: require an opening cue (not just
+  two non-ad-like sentences) before accepting >60s of backward
+  walk; refuse generic stems (`-words`, `code-*`) so V4V donation
+  CTAs and BLAB starts do not walk as far.
+- Split or refuse a merge when two GT-adjacent mid-rolls get glued
+  into a 300s block (`synth-006` end +210s).
+- Audio voice/room-change at insertion boundaries, scored primarily
+  on BLAB (splices make this too easy).
+- Cross-episode duplicate audio/text for ads that repeat across shows.
+- After Tuesday: score Unsubscribe 286/287 and SN 1101 against the
+  owner's full marks, with real Whisper transcripts (no `#` prefixes).
