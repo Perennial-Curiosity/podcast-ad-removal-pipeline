@@ -982,3 +982,100 @@ def test_run_on_sentence_does_not_mark_show_talk_before_sponsored_cue():
             assert s >= cue_t - 8.5, (blocks, cue_t)
         if e <= cue_t - 1:
             assert "edge" not in methods, (blocks, cue_t)
+
+
+def test_cross_promo_listen_now_and_podcast_from():
+    """A URL-less 'podcast from X ... listen now' read must be marked."""
+    pre = _unique(80, 0.0, "pre")
+    read = _mk(
+        "What's driving the markets this week? What's on investors minds as they look ahead. "
+        "Find out on the markets podcast from Goldman Sachs. "
+        "A breakdown of market moves and macro signals in 10 minutes or less. "
+        "The markets podcast from Goldman Sachs. Listen now.",
+        pre[-1][1] + 1.0,
+    )
+    pad = _unique(300, read[-1][1] + 2.0, "pad")
+    words = pre + read + pad
+    assert words[-1][1] > 180
+    blocks, _ = rp.detect_ad_blocks(words, sponsors=[], silences=[])
+    gs, ge = read[0][0], read[-1][1]
+    dur = ge - gs
+    best = max((max(0.0, min(e, ge) - max(s, gs)) for s, e, *_ in blocks), default=0.0)
+    assert best / dur >= 0.5, (blocks, best, dur)
+
+
+def test_listen_now_alone_is_not_an_ad():
+    """'continue to listen now two days a week' is show talk, not a CTA."""
+    pre = _unique(80, 0.0, "pre")
+    talk = _mk(
+        "We've been listening since before John's passing. "
+        "We'll continue to listen now two days a week I will use this time.",
+        pre[-1][1] + 1.0,
+    )
+    pad = _unique(300, talk[-1][1] + 2.0, "pad")
+    words = pre + talk + pad
+    blocks, _ = rp.detect_ad_blocks(words, sponsors=[], silences=[])
+    ts, te = talk[0][0], talk[-1][1]
+    for s, e, *_ in blocks:
+        ov = max(0.0, min(e, te) - max(s, ts))
+        assert ov < 5.0, blocks
+
+
+def test_podcast_from_alone_is_not_an_ad():
+    """'best podcast from West Virginia' is show talk, not a cross-promo."""
+    pre = _unique(80, 0.0, "pre")
+    talk = _mk(
+        "Yes you do absolutely the hands down best podcast from West Virginia "
+        "as far as music is concerned.",
+        pre[-1][1] + 1.0,
+    )
+    pad = _unique(300, talk[-1][1] + 2.0, "pad")
+    words = pre + talk + pad
+    blocks, _ = rp.detect_ad_blocks(words, sponsors=[], silences=[])
+    ts, te = talk[0][0], talk[-1][1]
+    for s, e, *_ in blocks:
+        ov = max(0.0, min(e, te) - max(s, ts))
+        assert ov < 5.0, blocks
+
+
+def test_thats_why_we_built_url_is_an_auto_sponsor():
+    """A mid-spot 'that's why we built ... at brand.com' promotes the URL."""
+    pre = _unique(80, 0.0, "pre")
+    read = _mk(
+        "Because great ambitious people power great ambitious growth. "
+        "That's why we built a new kind of AI powered HR platform at BambooHR .com. "
+        "Find the tools your team actually wants to use at BambooHR .com.",
+        pre[-1][1] + 1.0,
+    )
+    pad = _unique(300, read[-1][1] + 2.0, "pad")
+    words = pre + read + pad
+    assert words[-1][1] > 180
+    auto = rp.discover_autosponsors(words)
+    stems = {rp._alnum_tok(a["label"]) for a in auto} | {
+        rp._alnum_tok(v) for a in auto for v in a.get("variants") or []
+    }
+    assert "bamboohr" in stems, auto
+    blocks, _ = rp.detect_ad_blocks(words, sponsors=[], silences=[])
+    gs, ge = read[0][0], read[-1][1]
+    dur = ge - gs
+    best = max((max(0.0, min(e, ge) - max(s, gs)) for s, e, *_ in blocks), default=0.0)
+    assert best / dur >= 0.5, (blocks, best, dur)
+
+
+def test_thats_why_we_built_without_url_is_not_an_ad():
+    """'that's why we built a pyramid' in show talk must not mark."""
+    pre = _unique(80, 0.0, "pre")
+    talk = _mk(
+        "Figures struggling below represent the conquered titans and "
+        "that's why we built a pyramid made from excavated alpine boulders.",
+        pre[-1][1] + 1.0,
+    )
+    pad = _unique(300, talk[-1][1] + 2.0, "pad")
+    words = pre + talk + pad
+    auto = rp.discover_autosponsors(words)
+    assert auto == [] or all("pyramid" not in a["label"].lower() for a in auto)
+    blocks, _ = rp.detect_ad_blocks(words, sponsors=[], silences=[])
+    ts, te = talk[0][0], talk[-1][1]
+    for s, e, *_ in blocks:
+        ov = max(0.0, min(e, te) - max(s, ts))
+        assert ov < 5.0, blocks

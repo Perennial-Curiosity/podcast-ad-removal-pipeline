@@ -1217,3 +1217,82 @@ stay >= 44.3%.
   short BetUS end, FP 5276–5397, still outstanding from earlier.
 - After Tuesday (Nov 17): ingest Muse's zip, score Unsubscribe
   286/287 and SN 1101, then push only when the owner says so.
+
+## Experiment 13 — generic cross-promo and URL body corroboration (v5o)
+
+Date: 2026-11-15 CST. Local only, no GitHub writes.
+
+Follow-up to v5n (`2034b79`). Inspected batch2 show-notes-only comedy
+(0/4), business (0/5), and post-roll (1/6) misses and tried a
+generic, non-genre-specific signal. Commit gate: all 6 official
+gates must pass vs v5n, and batch1 show-notes-only F1 must stay
+>= v5f's 44.3%.
+
+### Miss survey (notes-only, 14 focus ads)
+
+10 of 14 have little or no usable transcript in the GT window
+(word coverage 0–12%): Whisper/VAD skipped the produced DAI bed.
+A lexical cue cannot recover those (State Street / Bose / Bombas
+gaps, Carvana / Lowe's / Made / Open Door post-rolls, etc.). A
+few have a single-vote `reverb:dry-island` suspect; promoting
+dry-islands was not tried (high FP risk).
+
+Of the four with real text:
+
+- Goldman Sachs: network cross-promo, no URL or promo code.
+  "Find out on the markets podcast from Goldman Sachs. … Listen
+  now."
+- BambooHR: spoken URL ("at BambooHR.com") but no directional
+  CTA; already a single-vote `url:bamboohr` suspect. Body language
+  is "that's why we built a new … at …".
+- Coca-Cola and Daily Show "that deserves a…": brand- or
+  slogan-only, no URL. Left alone (too easy to FP on show talk).
+
+### What changed (on top of v5n `2034b79`)
+
+Detector work in `pipeline/run_pipeline.py` (unit tests in
+`tests/test_sponsors_and_urls.py`):
+
+- New `_method_cross_promo` (single method `xpromo`): marks a
+  short mid-roll only when BOTH "podcast from" and "listen now"
+  occur within 30s. Either phrase alone is common in show talk
+  ("continue to listen now two days a week", "best podcast from
+  West Virginia") and is not enough. Lookback includes preceding
+  teaser sentences inside 20s, and stops at a >=0.8s gap or a
+  host-boundary/topic-shift so show talk just before the splice
+  is not pulled in. The 15s edge floor is used instead of the
+  45s single-method floor because these DAI reads are often
+  15–35s.
+- "that's why we built" is a mid-spot URL body corroborator
+  (`_URL_BODY_CORROBORATORS`, also added to `_COMMERCIAL_NEAR`
+  and `_STRONG_COMMERCIAL_PHRASES`). A bare spoken URL next to
+  that phrase becomes an auto-sponsor and a CTA segment even
+  without "go to" / "visit", so the existing URL vote can mark
+  (BambooHR). The same phrase without a URL ("that's why we
+  built a pyramid") does not mark.
+
+79 unit tests pass.
+
+### Official gates vs v5n (iteration baseline); batch1 also vs v5f
+
+| Gate | v5n | v5o | Verdict vs v5n |
+|---|---|---|---|
+| Spliced batch1 show-notes-only coverage F1 | 44.3% (27 TP / 24 FP) | 44.3% (27 TP / 24 FP) | **PASS** (identical, still equals v5f's 44.3% floor). Signed start 5.11s, mean \|start\| 22.73s, ≤5s 42.6% unchanged. |
+| BLAB 48 coverage F1 | 37.9% (40 TP / 36 FP) | 37.9% (40 TP / 36 FP) | **PASS** (identical, −0.8pp vs v5f, within the 2pp budget). Signed start −5.14s, mean \|start\| 16.77s unchanged. |
+| V4V clean FP time | 1201s (1.9%, 18 blocks, 1.00/h) | 1201s (1.9%, 18 blocks, 1.00/h) | **PASS** (identical). The noagenda "listen now two days a week" line did not fire. |
+| Snap diagnostic (after, mid / overshoot / mixed) | 5.44 / 8.78 / 4.86s | 5.44 / 8.78 / 4.86s | **PASS** (identical). |
+| DAI overall F1 / recall / signed start | 77.3% / 100% / −10.57s | 77.3% / 100% / −10.57s | **PASS** (identical). All per-genre F1 held vs v5f. |
+| batch2 show-notes-only coverage F1 | 40.3% (24 TP / 20 FP) | 43.0% (26 TP / 20 FP) | **PASS** (+2.7pp). New TPs: Goldman (synth-001, 68% coverage) and BambooHR (synth-017, 94% coverage). Business 0/5 → 2/5. Comedy still 0/4; post-rolls still 1/6 (those misses have no usable transcript). |
+| batch2 brands-listed signed start (overall / news / worst \|edge\|) | +8.67s / +3.3s / 81.4s | +7.85s / +3.3s / 81.4s | **PASS** (overall moved toward 0; news and worst unchanged). mean \|start\| 15.24s → 14.80s. Brands coverage F1 46.4% → 48.8% (29 → 31 TP, 21 FP) is not the gate. |
+
+### Next
+
+- Comedy and most post-rolls in batch2 still miss because the
+  produced DAI bed was not transcribed. Needs an audio-only path
+  that does not promote every dry island.
+- Slogan-only spots (Coca-Cola, "that deserves a…") still have
+  no generic lexical hook that is safe on show talk.
+- Leftover mid-pod fragments (Hostinger+Buildkite, cubcon),
+  short BetUS end, FP 5276–5397, still outstanding from earlier.
+- After Tuesday (Nov 17): ingest Muse's zip, score Unsubscribe
+  286/287 and SN 1101, then push only when the owner says so.

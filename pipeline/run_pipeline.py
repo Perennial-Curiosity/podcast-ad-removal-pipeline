@@ -1612,6 +1612,7 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     candidates.extend([(s, e, l, 'history-preroll') for s, e, l in _method_history_preroll(words)])
     candidates.extend([(s, e, l, 'underwrite') for s, e, l in _method_underwrite(words, silences)])
     candidates.extend([(s, e, l, 'edge') for s, e, l in _method_edge_adlike(words, silences)])
+    candidates.extend([(s, e, l, 'xpromo') for s, e, l in _method_cross_promo(words, silences)])
 
     if not candidates:
         if candidates_out is not None:
@@ -1856,14 +1857,17 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     # segment must corroborate another method's vote in the heat map
     # to mark. Removing it cut false blocks 67 -> 45 on the 25-episode
     # SB eval at a cost of 1 matched label.
-    _single_methods = ('cta', 'cluster', 'brand', 'chapter')
+    _single_methods = ('cta', 'cluster', 'brand', 'chapter', 'xpromo')
     # Indices of blocks whose start the same-label merge moved (2026-11-09,
     # brand-orphan test): the orphan pass below must not double-extend them.
     _merge_extended = set()
     for s, e, label, method in candidates:
         if method in _single_methods:
             dur = e - s
-            if not (MIN_AD_LEN <= dur <= MAX_AD_LEN):
+            # Cross-promos are short DAI reads (often 15-35s) and
+            # would be dropped by the 45s single-method floor.
+            _min = EDGE_MIN_AD_LEN if method == 'xpromo' else MIN_AD_LEN
+            if not (_min - 0.6 <= dur <= MAX_AD_LEN):
                 continue
             # Single-method cluster blocks need a spoken URL for that
             # sponsor nearby (2026-10-28): dense mentions alone can be
@@ -3541,6 +3545,32 @@ def _method_cta(words, sponsors, silences, own_domains=None):
                 seg = tail
         if seg:
             results.append((seg[0], seg[1], brand))
+    # Bare spoken URL + mid-spot body language, no directional CTA
+    # ("that's why we built a new platform at bamboohr.com").
+    already = {l.lower() for _, _, l in results}
+    for brand, url_idx in find_bare_urls(nw, own_domains):
+        if (brand or "").lower() in already:
+            continue
+        if _v4vish_near(nw, url_idx):
+            continue
+        if not _window_has_phrase_alnum(nw, url_idx, _URL_BODY_CORROBORATORS, radius=25):
+            continue
+        brand_variants = {brand, brand.replace(" ", "")}
+        hits = find_mentions(nw, brand_variants)
+        url_t = words[url_idx][0]
+        hits = [h for h in hits if abs(words[h][0] - url_t) < 8 * 60]
+        if not hits:
+            hits = [url_idx]
+        seg = _expand_segment(words, nw, silences, hits, brand)
+        if seg is None:
+            seg = _expand_tight_cluster(words, nw, silences, hits)
+        if seg is None:
+            tail = _expand_url_tail(words, silences, url_idx)
+            if tail:
+                seg = tail
+        if seg:
+            results.append((seg[0], seg[1], brand))
+            already.add((brand or "").lower())
     return results
 
 
@@ -4281,6 +4311,16 @@ _COMMERCIAL_NEAR = (
     ("this", "message", "comes"),
     ("messages", "from", "our", "sponsors"),
     ("supporters", "include"),
+    ("thats", "why", "we", "built"),
+    ("that's", "why", "we", "built"),
+    ("that", "is", "why", "we", "built"),
+)
+# Mid-spot body language next to a spoken URL, used when there is no
+# directional CTA ("go to" / "visit"). Generic across genres.
+_URL_BODY_CORROBORATORS = (
+    ("thats", "why", "we", "built"),
+    ("that's", "why", "we", "built"),
+    ("that", "is", "why", "we", "built"),
 )
 _V4VISH_NEAR = (
     "donation", "donations", "donate", "boostagram", "boostagrams",
@@ -4298,6 +4338,99 @@ def _window_has_phrase(nw, i, phrases, radius=25):
             if j + n <= hi and tuple(nw[j:j + n]) == ph:
                 return True
     return False
+
+
+def _alnum_tok(tok):
+    return re.sub(r"[^a-z0-9]", "", (tok or "").lower())
+
+
+def _window_has_phrase_alnum(nw, i, phrases, radius=25):
+    """Like _window_has_phrase, but ignores punctuation (thats == that's)."""
+    keys = [_alnum_tok(t) for t in nw]
+    lo = max(0, i - radius)
+    hi = min(len(keys), i + radius + 1)
+    for j in range(lo, hi):
+        for ph in phrases:
+            n = len(ph)
+            if j + n <= hi and keys[j:j + n] == [_alnum_tok(x) for x in ph]:
+                return True
+    return False
+
+
+def _phrase_hits(words, nw, phrases):
+    """Return (start, end, index) for every alnum phrase hit in nw."""
+    keys = [_alnum_tok(t) for t in nw]
+    out = []
+    for i in range(len(keys)):
+        for ph in phrases:
+            n = len(ph)
+            if i + n <= len(keys) and keys[i:i + n] == [_alnum_tok(x) for x in ph]:
+                out.append((words[i][0], words[i + n - 1][1], i))
+                break
+    return out
+
+
+def _method_cross_promo(words, silences):
+    """Network / show cross-promos that have no URL or promo code.
+
+    Produced reads often name another show ('the X podcast from Y')
+    and close with 'listen now'. Either phrase alone is common in
+    show talk ('continue to listen now two days a week', 'best
+    podcast from West Virginia'); both within 30s is the ad. Short
+    mid-roll DAI spots (15-35s) are allowed as a high-precision
+    single method.
+    """
+    if not words:
+        return []
+    nw = norm_words(words)
+    listens = _phrase_hits(words, nw, (("listen", "now"),))
+    pods = _phrase_hits(words, nw, (("podcast", "from"),))
+    if not listens or not pods:
+        return []
+    sents = _sentence_spans(words, nw)
+    results = []
+    used = set()
+    for ls, le, li in listens:
+        if _v4vish_near(nw, li):
+            continue
+        best = None
+        for ps, pe, pi in pods:
+            if abs(ls - ps) <= 30.0:
+                if best is None or abs(ps - ls) < abs(best[0] - ls):
+                    best = (ps, pe, pi)
+        if best is None:
+            continue
+        start = min(ls, best[0])
+        end = max(le, best[1])
+        window_lo = start - 20.0
+        cue_i = None
+        for i, z in enumerate(sents):
+            if z[0] <= start <= z[1] + 0.05:
+                cue_i = i
+                break
+        if cue_i is not None:
+            ns = sents[cue_i][0]
+            prev_start = sents[cue_i][0]
+            for z in reversed(sents[:cue_i]):
+                if z[0] < window_lo - 1.0:
+                    break
+                # Stop at a splice/pause so show talk just before the
+                # spot is not pulled in.
+                if prev_start - z[1] >= 0.8:
+                    break
+                if _span_has_host_boundary(z[2]) or _span_has_shift(z[2]):
+                    break
+                ns = z[0]
+                prev_start = z[0]
+            start = ns
+        if end - start < EDGE_MIN_AD_LEN - 0.6:
+            continue
+        key = (round(start, 1), round(end, 1))
+        if key in used:
+            continue
+        used.add(key)
+        results.append((start, end, "cross-promo"))
+    return results
 
 
 def _v4vish_near(nw, i, radius=40):
@@ -4346,6 +4479,25 @@ def discover_autosponsors(words, own_domains=None, existing=None):
         if _v4vish_near(nw, idx):
             continue
         if not _window_has_phrase(nw, idx, _COMMERCIAL_NEAR, radius=25):
+            continue
+        variants = {brand.lower(), stem}
+        seen |= variants
+        out.append({"label": brand, "variants": variants, "source": "auto"})
+    # Bare spoken URL next to mid-spot body language ("that's why we
+    # built ... at bamboohr.com") has no directional CTA, so it never
+    # enters find_url_mentions. Still an auto-sponsor when the
+    # corroborator is present and V4V vocabulary is not.
+    for brand, idx in find_bare_urls(nw, own_domains):
+        stem = re.sub(r"[^a-z0-9]", "", (brand or "").lower())
+        if not stem or len(stem) < 4 or stem in _AUTO_SPONSOR_SKIP:
+            continue
+        if any(s in stem for s in ("meetup", "donation", "donate", "boostagram")):
+            continue
+        if stem in seen or brand.lower() in seen:
+            continue
+        if _v4vish_near(nw, idx):
+            continue
+        if not _window_has_phrase_alnum(nw, idx, _URL_BODY_CORROBORATORS, radius=25):
             continue
         variants = {brand.lower(), stem}
         seen |= variants
@@ -4439,6 +4591,7 @@ _STRONG_COMMERCIAL_PHRASES = (
     "percent off", "learn more at", "this message comes",
     "messages from our sponsors", "supporters include",
     "for a limited time", "presented by",
+    "that's why we built", "thats why we built",
 )
 
 
