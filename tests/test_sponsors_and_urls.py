@@ -160,3 +160,84 @@ def test_extract_sponsors_affiliate_ref_query():
     variants = {v for b in brands for v in b["variants"]}
     assert "coinvigilante" in variants
     assert "example-blog" not in variants
+
+
+def test_discover_autosponsors_from_commercial_url():
+    pre = _unique(80, 0, "pre")
+    ad = _mk("go to tailscale dot com slash podcast and use code POD to get started",
+             pre[-1][0] + 1)
+    post = _unique(80, ad[-1][0] + 1, "post")
+    words = pre + ad + post
+    found = rp.discover_autosponsors(words, None, [])
+    variants = {v for b in found for v in b["variants"]}
+    assert any(b.get("source") == "auto" for b in found)
+    assert "tailscale" in variants
+
+
+def test_discover_autosponsors_skips_plain_go_to_and_v4v():
+    # content "go to walmart.com" with no commercial corroborator
+    words = _unique(40, 0, "a") + _mk("we had to go to walmart dot com and buy milk", 200) + _unique(40, 280, "b")
+    found = rp.discover_autosponsors(words, None, [])
+    variants = {v for b in found for v in b["variants"]}
+    assert "walmart" not in variants
+    # V4V donation URL even with a slash path
+    v4v = _unique(40, 0, "c") + _mk(
+        "please send a donation go to noagendadonations dot com slash support thank you",
+        200) + _unique(40, 280, "d")
+    found = rp.discover_autosponsors(v4v, None, [])
+    variants = {v for b in found for v in b["variants"]}
+    assert "noagendadonations" not in variants
+    assert "donations" not in variants
+
+
+def test_expand_url_tail_looks_back_from_closing_url():
+    words = _unique(40, 0, "p") + _mk(
+        "this product is great really great go to acmewidget dot com today",
+        200)
+    nw = rp.norm_words(words)
+    mentions = rp.find_url_mentions(nw)
+    assert mentions, "expected a URL mention"
+    brand, idx = mentions[0]
+    seg = rp._expand_url_tail(words, [], idx)
+    assert seg is not None
+    s, e = seg
+    assert e - s >= 30
+    assert s < words[idx][0] - 10  # looks back past the URL
+
+
+def test_merge_lexical_pods_joins_nearby_brand_blocks_only():
+    blocks = [
+        (100.0, 140.0, "cta/url:hostinger"),
+        (200.0, 240.0, "reverb/url:buildkite"),
+        (400.0, 450.0, "reverb/voice:dry-island"),
+        (520.0, 560.0, "reverb/voice:dry-island"),
+    ]
+    out = rp._merge_lexical_pods(blocks, max_gap=90.0)
+    # first two lexical, gap 60s, should merge
+    assert any(s == 100.0 and e >= 240.0 for s, e, _ in out)
+    # dry-island pair is not lexical-only in the sense... wait, labels have
+    # only reverb/voice, should NOT merge
+    assert any(s == 400.0 and e == 450.0 for s, e, _ in out)
+    assert any(s == 520.0 and e == 560.0 for s, e, _ in out)
+
+
+def test_autosponsor_helps_detect_without_show_notes():
+    pre = _unique(80, 0, "pre")
+    ad = _mk(
+        "our friends at acmewidget made this possible. go to acmewidget dot com slash show and use code SHOW to get started today",
+        pre[-1][0] + 1)
+    post = _unique(80, ad[-1][0] + 1, "post")
+    words = pre + ad + post
+    blocks, sus = rp.detect_ad_blocks(words, [], [], None, None)
+    mention = [w[0] for w in ad if "acmewidget" in w[2].lower()][0]
+    assert any(b[0] <= mention <= b[1] for b in blocks), (blocks, sus)
+
+
+def test_cta_tail_does_not_mark_v4v_donation_url():
+    pre = _unique(80, 0, "pre")
+    mid = _mk("please go to noagendadonations dot com and send a donation thank you",
+              pre[-1][0] + 1)
+    post = _unique(80, mid[-1][0] + 1, "post")
+    words = pre + mid + post
+    blocks, sus = rp.detect_ad_blocks(words, [], [], None, None)
+    assert not any("donation" in (b[2] or "").lower() for b in blocks), blocks

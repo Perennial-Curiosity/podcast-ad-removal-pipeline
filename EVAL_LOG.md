@@ -392,15 +392,114 @@ Unit tests: 31 passed (`tests/test_boundaries.py`,
 `tests/test_sponsors_and_urls.py`, `tests/test_detect_smoke.py`,
 `tests/test_score_segments.py`).
 
+### Next ideas (not yet measured) were taken up in experiment 7.
+
+## Experiment 7 — transcript-only recall without show-notes sponsors
+
+Local branch `grok/boundary-work` only. Nothing pushed. 2026-11-15 CST.
+Baseline is `0280e17` (v3e). Official detect scorer remains coverage
+≥50% of GT. Snap keep-rule unchanged (0.3s). New eval resource: the
+spliced-ad set at `/workspace/pad-dataset` (20 V4V hosts, 71 GT spans,
+cached Whisper transcripts). Dataset was not modified; evals were run
+read-only via `PAD_PIPELINE` snapshots. Goal: raise recall when show
+notes list no sponsors, without hurting BLAB coverage F1, V4V FP, or
+snap.
+
+Diagnosis on the 0280e17 spliced baseline: 27 of 59 misses already had
+a `find_url_mentions` hit, but the marked block was a 20–50s fragment
+around the closing URL inside a 100–250s read, so it failed 50%
+coverage and scored as FP+miss. 48 of 71 ads contain a commercial
+signal (slash-path, use code, brought to you, get started, …).
+
+### What was tried
+
+Kept (v4b):
+
+1. `discover_autosponsors`: spoken URL + a *commercial* corroborator
+   (slash, use code, sponsored, free trial, get started, learn more,
+   percent off, brought to you) becomes a `source=auto` sponsor and is
+   fed into brand / brand-orphan / cluster. The mention-span cap still
+   applies only to description-listed sponsors, so auto brands do not
+   shrink a long read down to the closing URL.
+2. CTA fallback `_expand_url_tail`: if there is no opening cue, look
+   back ~75s from the closing URL. Gated on the same commercial
+   corroborator and vetoed when V4V donation vocabulary sits nearby.
+3. `_merge_lexical_pods`: join nearby cta/url/brand blocks with a gap
+   ≤90s (multi-sponsor mid-roll pods). Voice/reverb/duplicate-only
+   blocks are not merged.
+4. Auto-sponsor skip list plus substring veto (`meetup`, `donation`,
+   `donate`, `boostagram`) and a nearby V4V-vocab veto, so "go to
+   donations.com" / meetup URLs are not promoted.
+
+Reverted (v4a, unfiltered URL-tail expand): applying `_expand_url_tail`
+to every CTA+URL, including plain "go to X.com", raised spliced F1
+20.2%→23.4% and BLAB coverage F1 26.9%→40.2%, but V4V donation-segment
+FP time share went 2.7%→4.9% (`donations`, `meetups`, `podcastindex`,
+`fountain`). Clean-content FP was unchanged; the gate still failed.
+Tightened to v4b before keep.
+
+Not measured in this batch (deferred): audio voice/room-change
+detectors (splices make this artificially easy; BLAB should lead),
+and cross-episode duplicate matching of repeated ads.
+
+### Results
+
+Snap diagnostic (579 ads): identical to v3c / `0280e17`. Mid-read
+after 5.46s, overshoot 8.75s, mixed 4.91s. No regression.
+
+Spliced set, show-notes-only (71 GT ads, 20 episodes):
+
+| | Seg/Cov P | Seg/Cov R | Seg/Cov F1 | Time P | Time R | Time F1 | mean \|err\| | ≤5s |
+|---|---|---|---|---|---|---|---|---|
+| `0280e17` | 25.0% (12 TP / 36 FP) | 16.9% (12/71) | 20.2% | 95.0% | 24.3% | 38.7% | 10.87s | 54.2% |
+| v4a (reverted) | 26.3% (15/42) | 21.1% (15/71) | 23.4% | 90.4% | 29.2% | 44.1% | 13.15s | 46.7% |
+| v4b (kept) | 26.0% (13/37) | 18.3% (13/71) | 21.5% | 94.1% | 26.7% | 41.6% | 11.20s | 50.0% |
+
+Oracle / show-notes-listed condition was not re-run; the goal was
+recall *without* listed brands.
+
+BLAB 48-ep production path (`--no-supplement`):
+
+| | Cov P | Cov R | Cov F1 | Time P | Time R | Time F1 | mean \|err\| | ≤5s |
+|---|---|---|---|---|---|---|---|---|
+| `0280e17` | 63.9% (23/13) | 17.0% (23/135) | 26.9% | 75.5% | 28.2% | 41.0% | 20.67s | 41.3% |
+| v4a (reverted) | 62.5% (40/24) | 29.6% (40/135) | 40.2% | 61.2% | 33.8% | 43.5% | 19.77s | 35.0% |
+| v4b (kept) | 58.1% (25/18) | 18.5% (25/135) | 28.1% | 77.3% | 27.7% | 40.8% | 14.86s | 48.0% |
+
+V4V hard negatives (16 uncut hosts):
+
+| | CTA-segment FP time | Clean FP time | Clean blocks / hour |
+|---|---|---|---|
+| `0280e17` | 2.7% (513s / 19034s) | 1.8% (1177s) | 1.00 (18 blocks) |
+| v4a (reverted) | 4.9% (943s) | 1.8% (1177s) | 1.00 (18) |
+| v4b (kept) | 3.1% (597s) | 1.8% (1177s) | 1.00 (18) |
+
+v4b clean-content FP is unchanged. The +0.4pp donation-segment share
+is mostly a real "use code" coffee ad that sits inside a No Agenda
+donation cut, plus one extra CTA-touch. Treated as not a meaningful
+clean-content regression.
+
+Gates: spliced F1 up, BLAB coverage F1 up, V4V clean FP unchanged,
+snap unchanged. Kept v4b.
+
+Known leftover misses: long multi-brand pods whose URL fragments are
+>90s apart still fail 50% coverage (`synth-000` 123s gap). Two
+previously-good spliced TPs shrink when an auto-sponsor label pulls
+refinement toward the closing mention (`granola`, a notion+deepgram
+pod). Worth a follow-up: merge-then-don't-refine-to-one-brand, or a
+slightly wider lexical-pod gap.
+
+Unit tests: 37 passed.
+
 ### Next ideas (not yet measured)
 
-- The remaining 22.12s mid-read end jump on `B33Xbmu1CBk`, and the
-  144s end overshoot on `cAgxuqGMUYg`.
-- USAA-style orphans that have a description sponsor but no spoken
-  CTA in the corroboration window.
-- The cheap cue/CTA window from exp. 5 is still too noisy (R 34.3%,
-  P 12.4%) to add as a standalone method.
+- Wider or post-refinement lexical-pod merge so 120–150s gaps in
+  multi-brand mid-rolls count as one ad, without shrinking to the
+  first brand's mention span.
+- Do not let auto-sponsor refinement shrink a wider cta/reverb block
+  that already covered the ad (`granola` 2573–2694 → 2659–2694).
+- Audio voice/room-change at insertion boundaries, scored primarily
+  on BLAB (splices make this too easy).
+- Cross-episode duplicate audio/text for ads that repeat across shows.
 - After Tuesday: score Unsubscribe 286/287 and SN 1101 against the
   owner's full marks, with real Whisper transcripts (no `#` prefixes).
-- Later `process_episode` steps (xep, dynamic slots, split rescue)
-  can still move edges after `detect_ad_blocks`; not exercised here.

@@ -1319,6 +1319,14 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     if not words:
         return [], []
 
+    listed_sponsors = list(sponsors or [])
+    auto = discover_autosponsors(words, own_domains, listed_sponsors)
+    if auto:
+        log("  auto-sponsors: " + ", ".join(a["label"] for a in auto))
+        sponsors = listed_sponsors + auto
+    else:
+        sponsors = listed_sponsors
+
     # Run each method independently, collecting (start, end, label, method)
     candidates = []
     candidates.extend([(s, e, l, 'cta') for s, e, l in _method_cta(words, sponsors, silences, own_domains)])
@@ -1540,7 +1548,7 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     for bs, be, l in blocks:
         sp_part = l.split(':')[-1].strip().lower()
         match = None
-        for sp in sponsors:
+        for sp in listed_sponsors:
             if sp['label'].lower() == sp_part:
                 match = sp
                 break
@@ -1886,6 +1894,9 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     # snapped edges. Later process_episode steps (xep corroboration,
     # dynamic slots, split rescue) may still move edges afterwards.
     blocks = _snap_block_edges(words, nw, silences, sorted(blocks), sponsors)
+    # Multi-brand mid-roll pods are often two short URL-end hits a
+    # minute apart and fail the 50% coverage rule unless joined.
+    blocks = _merge_lexical_pods(blocks, max_gap=90.0)
 
     # Suspect reel (2026-10-22, per the owner): low-confidence candidates
     # that did not become marked blocks. Replaces the old cluster-popular
@@ -2720,6 +2731,15 @@ def _method_cta(words, sponsors, silences, own_domains=None):
         seg = _expand_segment(words, nw, silences, hits, brand)
         if seg is None:
             seg = _expand_tight_cluster(words, nw, silences, hits)
+        # Only look back from a closing URL when the same commercial
+        # corroborators used for auto-sponsors are present. Plain
+        # "go to donations.com" / meetup URLs are common in V4V
+        # content and must not become marked blocks.
+        if seg is None and not _v4vish_near(nw, url_idx) and _window_has_phrase(
+                nw, url_idx, _COMMERCIAL_NEAR, radius=25):
+            tail = _expand_url_tail(words, silences, url_idx)
+            if tail:
+                seg = tail
         if seg:
             results.append((seg[0], seg[1], brand))
     return results
@@ -3353,6 +3373,139 @@ def find_bare_urls(nw, own_domains=None):
     out = [(url_at[i], i) for i in sorted(url_at)]
     if own_domains:
         out = [(b, i) for b, i in out if b.replace(" ", "") not in own_domains]
+    return out
+
+
+
+# Brands discovered from the transcript itself, not show notes. "go to
+# donations.com" is not enough (V4V shows say that); a commercial
+# corroborator (slash-path, use code, sponsored, free trial, …) is
+# required, and V4V donation vocabulary nearby is a veto.
+_AUTO_SPONSOR_SKIP = {
+    "donation", "donations", "donate", "meetup", "meetups", "fountain",
+    "podcastindex", "boost", "boosts", "boostagram", "wallet", "patreon",
+    "discord", "instagram", "twitter", "facebook", "youtube", "spotify",
+    "subscribestar", "value4value", "v4v", "this", "that", "with", "from",
+    "code", "http", "https", "www", "support", "podcast",
+}
+_COMMERCIAL_NEAR = (
+    ("use", "code"), ("promo", "code"), ("coupon", "code"),
+    ("discount", "code"), ("free", "trial"), ("first", "month"),
+    ("percent", "off"), ("brought", "to", "you"), ("sponsored", "by"),
+    ("our", "sponsor"), ("get", "started"), ("learn", "more"),
+    ("slash",),
+)
+_V4VISH_NEAR = (
+    "donation", "donations", "donate", "boostagram", "boostagrams",
+    "boost", "boosts", "sats", "satoshis", "sat", "patreon",
+    "value4value",
+)
+
+
+def _window_has_phrase(nw, i, phrases, radius=25):
+    lo = max(0, i - radius)
+    hi = min(len(nw), i + radius + 1)
+    for j in range(lo, hi):
+        for ph in phrases:
+            n = len(ph)
+            if j + n <= hi and tuple(nw[j:j + n]) == ph:
+                return True
+    return False
+
+
+def _v4vish_near(nw, i, radius=40):
+    lo = max(0, i - radius)
+    hi = min(len(nw), i + radius + 1)
+    span = nw[lo:hi]
+    if any(tok in _V4VISH_NEAR for tok in span):
+        return True
+    for j in range(len(span) - 2):
+        if tuple(span[j:j + 3]) in (("value", "for", "value"),
+                                    ("time", "talent", "treasure"),
+                                    ("executive", "producer"),
+                                    ("associate", "producer")):
+            return True
+    return False
+
+
+def discover_autosponsors(words, own_domains=None, existing=None):
+    """Sponsor dicts discovered from spoken URL + commercial CTA context.
+
+    Fed into brand / brand-orphan / cluster so detection can work when
+    show notes list no sponsors. Entries are tagged source='auto' so the
+    mention-span cap (written for description sponsors) does not shrink
+    a long read down to the closing URL.
+    """
+    nw = norm_words(words)
+    existing = existing or []
+    seen = {v for b in existing for v in b.get("variants", [])}
+    seen |= {b.get("label", "").lower() for b in existing}
+    out = []
+    for brand, idx in find_url_mentions(nw, own_domains):
+        stem = re.sub(r"[^a-z0-9]", "", (brand or "").lower())
+        if not stem or len(stem) < 4 or stem in _AUTO_SPONSOR_SKIP:
+            continue
+        if any(s in stem for s in ("meetup", "donation", "donate", "boostagram")):
+            continue
+        if stem in seen or brand.lower() in seen:
+            continue
+        if _v4vish_near(nw, idx):
+            continue
+        if not _window_has_phrase(nw, idx, _COMMERCIAL_NEAR, radius=25):
+            continue
+        variants = {brand.lower(), stem}
+        seen |= variants
+        out.append({"label": brand, "variants": variants, "source": "auto"})
+    return out
+
+
+def _expand_url_tail(words, silences, url_idx, lookback=75.0, lookahead=15.0):
+    """When a CTA/URL has no opening cue, treat the URL as a closing
+    anchor and look back (ads typically name the site at the end)."""
+    if not words or url_idx >= len(words):
+        return None
+    t = words[url_idx][0]
+    te = words[url_idx][1]
+    start = max(0.0, t - lookback)
+    end = te + lookahead
+    pauses = get_pauses(words, silences)
+    for ps, pe in pauses:
+        if start <= pe <= t - 20.0:
+            start = pe
+            break
+    for ps, pe in reversed(pauses):
+        if te <= ps <= end:
+            end = ps
+            break
+    if not (30.0 <= end - start <= 180.0):
+        return None
+    return start, end
+
+
+def _merge_lexical_pods(blocks, max_gap=90.0):
+    """Join nearby cta/url/brand blocks (multi-sponsor mid-roll pods).
+
+    Voice/reverb/duplicate-only blocks are left alone so dry-island
+    false hits do not get glued into a huge marked region.
+    """
+    if not blocks:
+        return blocks
+    lexical = ("cta", "url", "brand", "chapter", "cluster")
+
+    def is_lex(label):
+        lab = (label or "").lower()
+        return any(k in lab for k in lexical)
+
+    blocks = sorted(blocks, key=lambda b: (b[0], b[1]))
+    out = [blocks[0]]
+    for b in blocks[1:]:
+        s, e, l = b[0], b[1], b[2]
+        ps, pe, pl = out[-1][0], out[-1][1], out[-1][2]
+        gap = s - pe
+        if is_lex(pl) and is_lex(l) and gap <= max_gap and (e - ps) <= MAX_AD_LEN:
+            out[-1] = (ps, max(pe, e), pl)
+        else:
+            out.append(b)
     return out
 
 
