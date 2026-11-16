@@ -811,8 +811,12 @@ def test_whats_up_theme_song_is_not_an_edge_preroll():
 
 def test_look_back_is_not_a_topic_shift():
     assert not rp._span_has_shift(["let's", "look", "back", "at", "the", "notes"])
+    assert not rp._span_has_shift(
+        ["if", "i", "really", "want", "to", "go", "back", "to", "the", "actual", "transcript"])
+    assert not rp._span_has_shift(["look", "back", "to", "the", "notes"])
     assert rp._span_has_shift(["ok", "back", "to", "the", "topic"])
     assert rp._span_has_shift(["okay", "back", "to", "cooking"])
+    assert rp._span_has_shift(["and", "now", "back", "to", "the", "show"])
 
 
 def test_generic_oracle_stems_are_dropped():
@@ -906,3 +910,75 @@ def test_go_to_google_is_not_an_edge_postroll():
     blocks, _ = rp.detect_ad_blocks(words, sponsors=[], silences=[])
     for s, e, *_ in blocks:
         assert s < body[-1][1] - 1 or e < talk[0][0], blocks
+
+
+def test_sponsored_this_episode_by_grows_host_read():
+    """A host-read after 'sponsored this episode by X' must cover the body, not just the opener."""
+    body = _unique(80, 0.0, "pre")
+    # Place the read at t=0 so it is a preroll, but pad the episode
+    # past 180s so edge methods run.
+    read = _mk(
+        "We are sponsored this episode by Claude. I've been using Claude a lot more recently. "
+        "Let me just tell you some things I've been doing with it more recently. "
+        "So first, I had it build me a financial dashboard. So that's amazing. "
+        "I also have it now monitoring feedback channels for my apps. "
+        "It's been amazing. I do so much with Claude now. "
+        "Claude is the AI for problem solvers. "
+        "Discover what's possible. Try Claude at claude dot ai slash atp. "
+        "That's claude dot ai slash atp. Thank you to Claude for sponsoring the show.",
+        0.4,
+    )
+    pad = _unique(300, read[-1][1] + 2.0, "pad")
+    words = read + pad
+    assert words[-1][1] > 180
+    blocks, _ = rp.detect_ad_blocks(words, sponsors=[], silences=[])
+    gs, ge = read[0][0], read[-1][1]
+    dur = ge - gs
+    best = max((max(0.0, min(e, ge) - max(s, gs)) for s, e, *_ in blocks), default=0.0)
+    assert best / dur >= 0.5, (blocks, best, dur)
+    # The opener alone (first ~4s) must not be a leftover fragment.
+    for s, e, *_ in blocks:
+        if e <= gs + 30 and s < ge:
+            # A short leftover opener with no body is the regression.
+            assert e - s > 30 or any(ss <= s + 1 and ee >= ge - 15 for ss, ee, *_ in blocks), blocks
+
+
+def test_run_on_sentence_does_not_mark_show_talk_before_sponsored_cue():
+    """A mid-roll cue glued onto unpunctuated show talk must not create a preroll FP."""
+    pre = _unique(80, 0.0, "pre")
+    # One long period-free sentence: ~70s of show talk, then the cue.
+    talk = _mk(
+        "and so this is the fundamental thing that the long tailors were saying "
+        "there's a very long range of products of creations which are available "
+        "and this is where you see in this long tail where it's essentially a graph "
+        "x axis is some metric and the y axis will be of the amount of things "
+        "and it's a really born graph because essentially it just hugs the y "
+        "and then hugs the x so forms this kind of reverse L shape and this is "
+        "where we see okay my technology with changes we can actually open up a "
+        "lot new products but I won't just give you my words for it we're going "
+        "to read from the book of chris anderson we are sponsored this week by "
+        "tail scale let me throw a hypothetical at you suppose you're the kind "
+        "of person that would listen to a podcast and tail scale is freaking magic "
+        "visit tailscale dot com slash atp thank you to tail scale for sponsoring the show.",
+        pre[-1][1] + 1.0,
+    )
+    pad = _unique(300, talk[-1][1] + 2.0, "pad")
+    words = pre + talk + pad
+    assert words[-1][1] > 180
+    # Locate the cue time
+    cue_t = None
+    for s, e, w in words:
+        if "sponsored" in str(w).lower():
+            cue_t = s
+            break
+    assert cue_t is not None and cue_t > 80
+    blocks, _ = rp.detect_ad_blocks(words, sponsors=[], silences=[])
+    for s, e, l, *_ in blocks:
+        methods = l.split(":")[0]
+        # The regression is an edge preroll over the show-talk prefix
+        # (synth-014 was 60–90s edge:edge-ad). Brand/URL lookback is
+        # a separate, pre-existing pad and is allowed near the cue.
+        if "edge" in methods:
+            assert s >= cue_t - 8.5, (blocks, cue_t)
+        if e <= cue_t - 1:
+            assert "edge" not in methods, (blocks, cue_t)

@@ -2358,7 +2358,8 @@ ADISH_TLDS = (".com", ".net", ".org", ".io", ".co", ".tv", ".fm")
 # contains one of these near an edge has overshot into host talk.
 TOPIC_SHIFT_PHRASES = [
     "welcome back", "we're back", "we are back",
-    "now back", "back to the", "anyway",
+    "now back", "back to the show", "back to the topic",
+    "back to our", "anyway",
     "ok back", "okay back",
 ]
 
@@ -3376,6 +3377,30 @@ def _method_edge_adlike(words, silences):
                     return True
             return False
 
+        def _cue_in_region(z):
+            if not _span_has_open(z[2], extras=False):
+                return None
+            cue_t = _opening_cue_time(words, z)
+            return cue_t if rs - 0.05 <= cue_t <= re + 0.05 else None
+
+        def _in_region_produced(z):
+            """Produced evidence that actually sits in this edge region.
+
+            A mid-roll 'we are sponsored by…' glued onto a 100s unpunctuated
+            show-talk sentence will overlap the first 90s (Tailscale on
+            synth-014) — only the in-region prefix may seed a preroll.
+            """
+            toks = []
+            i = z[3]
+            ntok = len(z[2])
+            while i < len(words) and (i - z[3]) < ntok and words[i][0] <= re + 0.05:
+                if words[i][0] >= rs - 0.05:
+                    toks.append(z[2][i - z[3]])
+                i += 1
+            if not toks:
+                return False
+            return _edge_sentence_is_produced(toks)
+
         seeds = []
         for z in sents:
             in_reg = z[1] >= rs and z[0] <= re
@@ -3384,6 +3409,11 @@ def _method_edge_adlike(words, silences):
                         and not _span_has_host_boundary(z[2])
                         and not _v4vish_near(nw, z[3])
                         and not _v4v_just_behind(z))
+            # Run-on sentence starting in the first 90s whose only
+            # opening cue is a mid-roll after the edge region.
+            if produced and (z[0] < rs or z[1] > re):
+                if _cue_in_region(z) is None and not _in_region_produced(z):
+                    produced = False
             # A guest show-URL just before "tune in next time" is an
             # outro plug, not a post-roll (V4V roundtable).
             if produced and not _produced_beyond_url(z[2]) and _host_outro_ahead(z):
@@ -3447,6 +3477,13 @@ def _method_edge_adlike(words, silences):
                 else:
                     break
             s, e = max(cluster[0][0], rs), min(cluster[-1][1], re)
+            # Don't pull the start back through a long unpunctuated
+            # show-talk prefix just because the cue shares a sentence
+            # (Tailscale mid-sentence splice at 132s in a 60–164s run-on).
+            if _span_has_open(cluster[0][2], extras=False):
+                cue_t = _opening_cue_time(words, cluster[0])
+                if cue_t - s > 8.0:
+                    s = max(s, cue_t - 8.0, rs)
             if ep_end - e <= 30.0 and e < ep_end:
                 e = ep_end
             # Music bed after the host sign-off (Science Vs post-roll).
@@ -4574,11 +4611,18 @@ def _opening_cue_time(words, z):
 
 def _span_has_shift(tokens):
     """Topic-shift phrases with a word boundary, so 'ok back' does not
-    match 'look back' (that false hit split the Granola mid-roll)."""
+    match 'look back' and 'back to the show' does not match 'go back
+    to the actual transcript' (that false hit split the Granola tail)."""
     import re as _re
-    win = " ".join(tokens)
+    clean = [tok.strip('.,!?;:\'"').lower() for tok in tokens]
+    win = " ".join(clean)
     for p in list(TOPIC_SHIFT_PHRASES) + list(RETURN_CUES):
-        if _re.search(r"(^|[^a-z])" + _re.escape(p) + r"([^a-z]|$)", win):
+        for m in _re.finditer(r"(^|[^a-z])" + _re.escape(p) + r"([^a-z]|$)", win):
+            prefix = win[:m.start()].rstrip()
+            last = prefix.split(" ")[-1] if prefix else ""
+            if last in ("go", "going", "look", "looking", "come", "comes",
+                        "coming", "want", "wanted", "wanna"):
+                continue
             return True
     return False
 
@@ -4722,6 +4766,63 @@ def _cap_growth(accepted, origin, side, saw_strong, soft=_GROW_SOFT):
     return max(z[1] for z in kept) if kept else origin
 
 
+
+_SPONSOR_OPEN_BY = (
+    "sponsored this episode by",
+    "sponsored this week by",
+    "this episode is sponsored by",
+    "this week is sponsored by",
+    "we are sponsored by",
+    "we're sponsored by",
+    "sponsored by",
+)
+
+
+def _brand_after_sponsored_by(tokens):
+    """Brand stems spoken after 'sponsored … by' in this span."""
+    clean = [tok.strip('.,!?;:\'"').lower() for tok in tokens]
+    win = " ".join(clean)
+    brands = set()
+    for cue in _SPONSOR_OPEN_BY:
+        idx = win.find(cue)
+        if idx < 0:
+            continue
+        rest = win[idx + len(cue):].strip().split()
+        for tok in rest[:3]:
+            stem = "".join(ch for ch in tok if ch.isalnum())
+            if len(stem) >= 4 and stem not in {
+                    "this", "that", "their", "them", "from", "with",
+                    "today", "week", "show", "episode"}:
+                brands.add(stem)
+        break
+    return brands
+
+
+def _fragment_has_sponsor_open(tokens):
+    win = " ".join(tok.strip('.,!?;:\'"').lower() for tok in tokens)
+    return any(p in win for p in _SPONSOR_OPEN_BY)
+
+
+def _host_read_lookahead_ok(sents, current, brands, max_look=6):
+    """True if a brand mention, cue, or CTA resumes shortly.
+
+    Host-read bodies after 'sponsored this episode by X' are anecdotal
+    and fail the generic ad-like check, but they keep naming X and end
+    on a URL (Claude preroll on synth-007).
+    """
+    try:
+        idx = sents.index(current)
+    except ValueError:
+        return False
+    for z in sents[idx + 1:idx + 1 + max_look]:
+        if _span_has_host_boundary(z[2]) or _span_has_shift(z[2]):
+            return False
+        if (_span_has_brand(z[2], brands) or _span_has_open(z[2])
+                or _span_has_commercial(z[2]) or _span_has_signoff(z[2])):
+            return True
+    return False
+
+
 def _grow_confirmed_fragments(words, nw, silences, blocks, max_grow=_GROW_MAX):
     """Grow a confirmed cta/url/brand fragment out to the full read.
 
@@ -4748,8 +4849,19 @@ def _grow_confirmed_fragments(words, nw, silences, blocks, max_grow=_GROW_MAX):
         frag_toks = [nw[i] if i < len(nw) else ""
                      for i, w in enumerate(words) if s <= w[0] <= e]
         frag_bow = _bow(frag_toks)
+        # A heatmap island often starts on the first body sentence
+        # just after 'sponsored this episode by X.' Include a short
+        # lookback so the opener still turns on host-read growth
+        # (synth-007 Claude: block started at 3.92s, opener ended 3.92s).
+        look_toks = [nw[i] if i < len(nw) else ""
+                     for i, w in enumerate(words) if s - 8.0 <= w[0] <= e]
+        brands |= _brand_after_sponsored_by(frag_toks)
+        brands |= _brand_after_sponsored_by(look_toks)
         ns, ne = s, e
         uw = "underwrite" in l.lower()
+        host_read = (_fragment_has_sponsor_open(frag_toks)
+                     or _fragment_has_sponsor_open(look_toks))
+        loose = uw or host_read
         # Walk back
         before = [z for z in sents if z[1] <= s + 0.05 and z[0] >= s - max_grow]
         accepted, rejects, saw_stop = [], 0, False
@@ -4761,7 +4873,8 @@ def _grow_confirmed_fragments(words, nw, silences, blocks, max_grow=_GROW_MAX):
                 saw_stop = True
                 break
             is_ad = (_span_is_adlike(z[2], brands, frag_bow, bg_bow)
-                     or (uw and _span_is_underwrite_body(z[2])))
+                     or (uw and _span_is_underwrite_body(z[2]))
+                     or (host_read and _span_has_brand(z[2], brands)))
             if is_ad:
                 if _span_has_open(z[2]):
                     cue_t = _opening_cue_time(words, z)
@@ -4777,11 +4890,16 @@ def _grow_confirmed_fragments(words, nw, silences, blocks, max_grow=_GROW_MAX):
                 # Do not look ahead when walking backward: a teaser or
                 # later cue would pull show talk into the start.
                 rejects += 1
-                if rejects >= 2:
+                if rejects >= (4 if loose else 2):
                     saw_stop = True
                     break
         if accepted:
             ns = _cap_growth(accepted, s, "back", saw_open or saw_shift)
+            if saw_open or any(_fragment_has_sponsor_open(z[2]) for z in accepted):
+                host_read = True
+                loose = True
+                for z in accepted:
+                    brands |= _brand_after_sponsored_by(z[2])
         # Walk forward. Stop at a sign-off (include it) or at a new
         # opening cue after we have already left the fragment — that
         # opening belongs to the next mid-roll, not this one.
@@ -4808,7 +4926,8 @@ def _grow_confirmed_fragments(words, nw, silences, blocks, max_grow=_GROW_MAX):
                 saw_stop_f = True
                 break
             is_ad = (_span_is_adlike(z[2], brands, frag_bow, bg_bow)
-                     or (uw and _span_is_underwrite_body(z[2])))
+                     or (uw and _span_is_underwrite_body(z[2]))
+                     or (host_read and _span_has_brand(z[2], brands)))
             if is_ad:
                 accepted_f.append(z)
                 rejects = 0
@@ -4817,11 +4936,12 @@ def _grow_confirmed_fragments(words, nw, silences, blocks, max_grow=_GROW_MAX):
                     saw_stop_f = True
                     break
             else:
-                if uw and _underwrite_lookahead_ok(sents, z):
+                if ((uw and _underwrite_lookahead_ok(sents, z))
+                        or (host_read and _host_read_lookahead_ok(sents, z, brands))):
                     accepted_f.append(z)
                     continue
                 rejects += 1
-                if rejects >= (4 if uw else 2):
+                if rejects >= (4 if loose else 2):
                     saw_stop_f = True
                     break
         if accepted_f:

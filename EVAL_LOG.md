@@ -1109,3 +1109,111 @@ to 18 clean blocks.
   are 1/6.
 - After Tuesday (Nov 17): ingest Muse's zip, score Unsubscribe
   286/287 and SN 1101, then push only when the owner says so.
+
+## Experiment 12 — host-read growth after sponsor openers (v5n)
+
+Date: 2026-11-15 CST. Local only, no GitHub writes.
+
+Cleared the batch1 near-miss left by v5m (`d7107a8`): grow host-read
+bodies after "sponsored this episode by…" openers (synth-007 Claude
+preroll), join the split Granola tail, and keep Tailscale mid-sentence
+glue from pulling in show talk. Commit gate: all 6 official gates
+must pass vs v5m, and batch1 show-notes-only F1 must be >= v5f's
+44.3%.
+
+### What changed (on top of v5m `d7107a8`)
+
+Detector work in `pipeline/run_pipeline.py` (unit tests in
+`tests/test_sponsors_and_urls.py`):
+
+- Topic-shift phrases no longer treat bare "back to the" as a
+  return cue. Matches are now "back to the show/topic", "back to
+  our". `_span_has_shift` also ignores a match whose preceding
+  token is go/going/look/looking/come/comes/coming/want/wanted/
+  wanna, so "go back to the actual transcript" on the Granola
+  mid-roll is not a topic shift (this was the 2395–2411 leftover
+  tail).
+- Host-read growth: `_fragment_has_sponsor_open` and
+  `_brand_after_sponsored_by` recognize "sponsored this episode/week
+  by", "we are/we're sponsored by", and similar openers. A short
+  8s lookback on the growth fragment is included so a heatmap island
+  that starts on the first body sentence (synth-007: block started
+  at 3.92s, exactly the end of "we are sponsored this episode by
+  Claude.") still sees the opener and the brand. Forward growth
+  then uses the same loose reject budget and
+  `_host_read_lookahead_ok` as underwriting. After a backward walk
+  that accepted an opener, host-read is also turned on for the
+  forward walk.
+- Edge seeding for run-on sentences: `_cue_in_region` /
+  `_in_region_produced` so a mid-roll "we are sponsored by…" glued
+  onto a 100s unpunctuated show-talk sentence that merely overlaps
+  the first 90s cannot seed a preroll (synth-014 Tailscale 60–90
+  `edge:edge-ad`). If the first sentence has an opening cue more
+  than 8s after sentence start, the cluster start is capped at
+  cue_t − 8s.
+
+74 unit tests pass.
+
+Clarification vs the v5m "next" note: Claude 0–123 was already a
+coverage TP in v5m via 46–117 (57%). The 4–25 opener/body fragment
+was a leftover FP, not a missing TP. Growing 4–25 into 46–117
+dropped that FP (now one 3.9–116.5 block, 91.6% coverage) and,
+with the Granola join and Tailscale edge removal, put batch1 at
+27 TP / 24 FP = 44.3%.
+
+### Official gates vs v5m (iteration baseline); batch1 also vs v5f
+
+| Gate | v5f | v5m | v5n | Verdict vs v5m |
+|---|---|---|---|---|
+| Spliced batch1 show-notes-only coverage F1 | 44.3% (27 TP / 24 FP) | 43.2% (27 TP / 27 FP) | 44.3% (27 TP / 24 FP) | **PASS**. Equals v5f's 44.3% floor. Same 27 TPs, −3 FPs (Claude 4–25 merged, Granola tail joined, Tailscale 60–90 edge gone). Signed start 7.34s → 5.11s; mean \|start\| 23.64s → 22.73s; ≤5s 38.9% → 42.6%. Claude coverage 57% → 91.6%. |
+| BLAB 48 coverage F1 | 38.7% (35 TP / 11 FP) | 37.4% (40 TP / 39 FP) | 37.9% (40 TP / 36 FP) | **PASS** (+0.5pp vs v5m, −0.8pp vs v5f, within the 2pp budget). Same 40 TPs, −3 FPs. Signed start −8.06s → −5.14s; mean \|start\| 19.68s → 16.77s. |
+| V4V clean FP time | 1189s (1.8%, 18 blocks, 1.00/h) | 1201s (1.9%, 18 blocks, 1.00/h) | 1201s (1.9%, 18 blocks, 1.00/h) | **PASS** (identical to v5m). |
+| Snap diagnostic (after, mid / overshoot / mixed) | 5.44 / 8.78 / 4.86s | 5.44 / 8.78 / 4.86s | 5.44 / 8.78 / 4.86s | **PASS** (identical). |
+| DAI overall F1 / recall / signed start | 50.0% / 47.1% / −23.86s | 77.3% / 100% / −10.57s | 77.3% / 100% / −10.57s | **PASS** (identical to v5m). All per-genre F1 held vs v5f. |
+| batch2 show-notes-only coverage F1 | 33.9% (19 TP / 18 FP) | 40.0% (24 TP / 21 FP) | 40.3% (24 TP / 20 FP) | **PASS** (+0.3pp). Same 24 TPs, −1 FP. Per-ad genre/slot hits unchanged (business 0/5, comedy 0/4, post-rolls 1/6, pre-rolls 4/13). |
+| batch2 brands-listed signed start (overall / news / worst \|edge\|) | −11.96s / −95.7s / 373.6s | +9.92s / +3.3s / 113.3s | +8.67s / +3.3s / 81.4s | **PASS** (overall and worst moved toward 0; news unchanged). mean \|start\| 16.50s → 15.24s. Brands coverage F1 46.0% → 46.4% (same 29 TP, −1 FP) is not the gate. |
+
+### batch2 comedy / business / post-roll miss survey (notes-only)
+
+Inspected the 14 v5m/v5n notes-only misses in comedy (0/4),
+business (0/5), and post-roll (1/6; the one hit is Throughline
+Open Door on synth-013). Shared pattern:
+
+- 10 of 14 have little or no usable transcript in the GT window
+  (word coverage 0–12%). Whisper/VAD skipped the produced DAI
+  bed (music or a voice the transcriber dropped). Examples:
+  State Street / Bose / Bombas on synth-003, Carvana and Lowe's
+  and Made / Open Door post-rolls, Bose on synth-019, State
+  Street on synth-012. A lexical cue cannot recover these.
+- Of the four with real text: Goldman Sachs is a network
+  cross-promo ("Find out on the markets podcast from Goldman
+  Sachs. Listen now.") with no URL or promo code. Coca-Cola is
+  a brand-only slogan ("celebrate with an ice-cold Coca-Cola").
+  Daily Show "that deserves a…" is slogan-only, no brand or URL
+  in the window. BambooHR has a spoken URL ("at BambooHR.com")
+  but only six words were transcribed; it is already a single-
+  vote `url:bamboohr` suspect (617–664) and is not promoted.
+- A few empty-transcript misses do have a single-vote
+  `reverb:dry-island` suspect (Bose mid, Lowe's+Deepgram post).
+  Promoting dry-islands is not a safe generic signal (high FP
+  risk on V4V and BLAB).
+
+A generic, non-genre-specific lexical follow-up worth trying:
+treat "listen now" / "podcast from {name}" as a commercial cue
+for cross-promos, and treat "that's why we built" + a spoken
+URL as corroboration so a mid-roll URL suspect like BambooHR
+can be promoted. Do not add slogan-only or dry-island promotion
+without a tighter audio gate. Same 6 gates vs v5n, batch1 must
+stay >= 44.3%.
+
+### Next
+
+- Try the generic cross-promo / URL-corroboration signal above
+  for the batch2 misses that actually have text.
+- Remaining transcription-gap DAI (comedy/business/post-rolls
+  with no words) needs an audio-only path that does not promote
+  every dry island.
+- Leftover mid-pod fragments (Hostinger+Buildkite, cubcon),
+  short BetUS end, FP 5276–5397, still outstanding from earlier.
+- After Tuesday (Nov 17): ingest Muse's zip, score Unsubscribe
+  286/287 and SN 1101, then push only when the owner says so.
