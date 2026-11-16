@@ -1235,6 +1235,105 @@ def _edge_sharpness(starts, ends, votes, t, side):
     return sum(inside) / len(inside) - sum(outside) / len(outside)
 
 
+
+def _refine_tail_is_adlike(words, nw, ev_end, e):
+    """True if the span after the last mention's sentence still looks like ad copy.
+
+    The sign-off sentence itself often contains 'sponsoring' ("thank you to
+    granola for sponsoring the show") and must not be treated as mid-pod
+    sales talk, or a real ending will not be trimmed.
+    """
+    start_after = ev_end
+    for st, en, toks, _ in _sentence_spans(words, nw):
+        if st <= ev_end <= en:
+            start_after = en
+            break
+    toks = []
+    for i, w in enumerate(words):
+        if start_after < w[0] <= e:
+            toks.append(nw[i] if i < len(nw) else "")
+    if not toks:
+        return False
+    if _span_has_commercial(toks) or _span_has_open(toks):
+        return True
+    # A later brand.com / slash URL with no phrase wrapper.
+    if any(any(s in t for s in ADISH_TLDS) for t in toks):
+        return True
+    return False
+
+
+def _should_inward_refine_end(e, ev_end, words, nw):
+    """Whether to pull a block end in toward the last mention's evidence.
+
+    Short tails are always refined. Long tails are refined only when
+    they no longer look like the same ad (show talk after a sign-off),
+    so mid-pod promo codes do not cut off a later brand in the same read.
+    """
+    if e < ev_end:
+        return False
+    if (e - ev_end) <= 30.0:
+        return True
+    return not _refine_tail_is_adlike(words, nw, ev_end, e)
+
+
+def _last_adlike_end(words, nw, ev_end, e):
+    """End of the last still-commercial sentence at or after ev_end, else ev_end.
+
+    Used when method-segment ends are missing, so a post-growth show-talk
+    tail can still be trimmed back to the read.
+    """
+    last = ev_end
+    for st, en, toks, _ in _sentence_spans(words, nw):
+        if en <= ev_end or st >= e:
+            continue
+        adlike = (
+            _span_has_commercial(toks)
+            or _span_has_open(toks)
+            or any(any(s in t for s in ADISH_TLDS) for t in toks)
+        )
+        if adlike or st <= ev_end:
+            last = max(last, min(en, e))
+        elif st > ev_end:
+            break
+    return last
+
+
+def _block_ev_end(s, e, l, words, nw, listed_sponsors, sponsors):
+    sp_part = l.split(":")[-1].strip().lower()
+    match = None
+    for group in (listed_sponsors, sponsors):
+        for sp in group or []:
+            if sp["label"].lower() == sp_part:
+                match = sp
+                break
+        if match is not None:
+            break
+    variants = match["variants"] if match else [sp_part]
+    hits = find_mentions(nw, variants)
+    inblock = [words[h][0] for h in hits if s <= words[h][0] <= e]
+    return max(inblock) if inblock else None
+
+
+def _inward_refine_ends(blocks, words, nw, edge_cands, listed_sponsors, sponsors, tag="refine end"):
+    """Pull block ends in when the tail after the last mention is show talk."""
+    out = []
+    for s, e, l in blocks:
+        ev_end = _block_ev_end(s, e, l, words, nw, listed_sponsors, sponsors)
+        if ev_end is None or not _should_inward_refine_end(e, ev_end, words, nw):
+            out.append((s, e, l))
+            continue
+        ends = [ce for _, ce in edge_cands if ev_end <= ce <= e]
+        if ends:
+            ne = min(ends)
+        else:
+            ne = _last_adlike_end(words, nw, ev_end, e)
+        if ne < e and ne > s:
+            log(f"  {tag} '{l}': {e:.0f}s -> {ne:.0f}s")
+            e = ne
+        out.append((s, e, l))
+    return out
+
+
 def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
                      own_domains=None, candidates_out=None):
     # words: list of (start, end, word) from Whisper (may contain duplicates).
@@ -1884,8 +1983,16 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
                     if ns != s:
                         log(f"  refine start '{l}': {s:.0f}s -> {ns:.0f}s")
                         s = ns
+            # Inward end refine: always pull in when the last mention
+            # is near the current end (<=30s). A longer tail is kept
+            # only when it is still ad-like (another brand, CTA, or
+            # sales talk in a multi-brand pod — e.g. code robin at
+            # 1970s in a 1894–2076 Bitbox + CoinVigilante read). A
+            # long tail of show talk is trimmed even past 30s, so a
+            # grown granola/SerpAPI end cannot sit 40–100s past the
+            # sign-off.
             ends = [ce for _, ce in edge_cands if ev_end <= ce <= e]
-            if ends:
+            if ends and _should_inward_refine_end(e, ev_end, words, nw):
                 ne = min(ends)
                 if ne != e:
                     log(f"  refine end '{l}': {e:.0f}s -> {ne:.0f}s")
@@ -1911,6 +2018,18 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     blocks = _grow_confirmed_fragments(words, nw, silences, sorted(blocks))
     blocks = _merge_lexical_pods(blocks, max_gap=90.0, words=words, nw=nw)
     blocks = _split_glued_midrolls(words, nw, blocks)
+    blocks = _snap_block_edges(words, nw, silences, sorted(blocks), sponsors)
+    # Snap can pull a grown end back to a mid-pod sign-off and leave
+    # the next brand in the same read unmerged (synth-015 Base44 +
+    # KubeCon). Re-merge after snap; the content-boundary check
+    # prevents re-gluing a split-off overgrowth (u7ecuuwssic).
+    blocks = _merge_lexical_pods(blocks, max_gap=90.0, words=words, nw=nw)
+    # Growth can walk past a sign-off after the earlier end-refine has
+    # already run (granola +39s / +99s on spliced). Trim show-talk tails
+    # now, then re-snap so the new end still sits on a sentence/pause.
+    blocks = _inward_refine_ends(
+        sorted(blocks), words, nw, edge_cands, listed_sponsors, sponsors,
+        tag="post-grow refine end")
     blocks = _snap_block_edges(words, nw, silences, sorted(blocks), sponsors)
 
     # Suspect reel (2026-10-22, per the owner): low-confidence candidates
@@ -3517,16 +3636,27 @@ _GENERIC_STEMS = {
 
 
 def _growth_brand_blocked(stem, label=""):
+    """Hard block: do not grow this fragment at all."""
     raw = (label or "").split(":")[-1].lower().strip()
-    # Garbage auto-stems: "-words", promo-code labels ("code-itm20",
-    # "code-practical"), and bare "code123".
-    if raw.startswith("-") or raw.startswith("code-") or re.match(r"^code\d", raw):
-        return True
-    if stem and stem.startswith("code") and re.search(r"\d", stem):
+    # Garbage auto-stems like "-words". Promo-code labels (code-youtube,
+    # code-itm20) are a soft block: they may still grow with the 60s
+    # cap, but the stem is not used as a brand (see
+    # `_growth_stem_is_generic`).
+    if raw.startswith("-"):
         return True
     if not stem or stem in _AUTO_SPONSOR_SKIP or stem in _GENERIC_STEMS:
         return True
     return any(s in stem for s in ("meetup", "donation", "donate", "boostagram"))
+
+
+def _growth_stem_is_generic(stem, label=""):
+    """Promo-code stems: grow with the 60s cap, but don't treat 'codeyoutube' as a brand."""
+    raw = (label or "").split(":")[-1].lower().strip()
+    if raw.startswith("code-") or re.match(r"^code\d", raw):
+        return True
+    if stem and stem.startswith("code") and re.search(r"\d", stem):
+        return True
+    return False
 
 
 # Extra produced-spot openings that OPEN_CUES misses ("what's up nerds",
@@ -3699,7 +3829,7 @@ def _grow_confirmed_fragments(words, nw, silences, blocks, max_grow=_GROW_MAX):
     to show content, V4V donation vocabulary, or `max_grow` seconds.
     Growth past `_GROW_SOFT` (60s) is kept only when the walk hit an
     opening cue (backward), a sign-off (forward), or a topic shift.
-    Hitting the cap with no stop is not a real boundary.
+    A walk with no opening, sign-off, or topic shift is clipped to `_GROW_SOFT` (60s); only a strong stop may exceed that.
     """
     if not blocks or not words:
         return blocks
@@ -3707,13 +3837,12 @@ def _grow_confirmed_fragments(words, nw, silences, blocks, max_grow=_GROW_MAX):
     bg_bow = _background_bow(words, nw, blocks)
     grown = []
     for s, e, l in blocks:
-        if not _is_lexical_label(l) or _growth_brand_blocked(
-                _brand_stem_from_label(l), l):
+        stem = _brand_stem_from_label(l)
+        if not _is_lexical_label(l) or _growth_brand_blocked(stem, l):
             grown.append((s, e, l))
             continue
         brands = set()
-        stem = _brand_stem_from_label(l)
-        if stem:
+        if stem and not _growth_stem_is_generic(stem, l):
             brands.add(stem)
         frag_toks = [nw[i] if i < len(nw) else ""
                      for i, w in enumerate(words) if s <= w[0] <= e]
@@ -3744,7 +3873,7 @@ def _grow_confirmed_fragments(words, nw, silences, blocks, max_grow=_GROW_MAX):
                 if rejects >= 2:
                     saw_stop = True
                     break
-        if accepted and saw_stop:
+        if accepted:
             ns = _cap_growth(accepted, s, "back", saw_open or saw_shift)
         # Walk forward. Stop at a sign-off (include it) or at a new
         # opening cue after we have already left the fragment — that
@@ -3772,7 +3901,7 @@ def _grow_confirmed_fragments(words, nw, silences, blocks, max_grow=_GROW_MAX):
                 if rejects >= 2:
                     saw_stop_f = True
                     break
-        if accepted_f and saw_stop_f:
+        if accepted_f:
             ne = _cap_growth(accepted_f, e, "fwd", saw_signoff or saw_shift_f)
         if ne - ns > MAX_AD_LEN:
             ne = ns + MAX_AD_LEN
@@ -3844,7 +3973,10 @@ def _gap_is_adlike(words, nw, sents, bg_bow, pe, s, brands):
     while inner and _span_has_open(inner[-1][2]):
         inner = inner[:-1]
     if not inner:
-        return True
+        # Tight handoff: sign-off immediately followed by an opening.
+        # An opening alone is the start of the next ad, not a merge reason.
+        return any(_span_has_signoff(z[2]) for z in gap_s) and any(
+            _span_has_open(z[2]) for z in gap_s)
     toks = [t for z in inner for t in z[2]]
     if _span_has_commercial(toks) or _span_has_brand(toks, brands) or _span_has_open(toks):
         return True
@@ -3881,17 +4013,17 @@ def _merge_lexical_pods(blocks, max_gap=90.0, words=None, nw=None, soft_gap=180.
         brands = set()
         for lab in (pl, l):
             st = _brand_stem_from_label(lab)
-            if st and not _growth_brand_blocked(st, lab):
+            if st and not _growth_brand_blocked(st, lab) and not _growth_stem_is_generic(st, lab):
                 brands.add(st)
         merge = False
         if can and gap <= max_gap:
             if sents and _gap_has_content_boundary(sents, pe, s, brands):
                 merge = False
-            elif sents and gap > 20.0:
-                # Longer than a tight handoff: only merge if the gap
-                # still looks like ad language (covers interview pods
-                # with an opening/brand, blocks a return to the show
-                # with no "welcome back" cue).
+            elif sents and gap > 2.0:
+                # Even short gaps must look like a pod handoff, not a
+                # split we just made (a 4s gap after peeling an
+                # over-grown start off the next ad). Touching / 2s
+                # gaps still join.
                 merge = _gap_is_adlike(words, nw, sents, bg_bow, pe, s, brands)
             else:
                 merge = True

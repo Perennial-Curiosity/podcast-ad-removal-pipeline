@@ -379,12 +379,32 @@ def test_generic_stems_do_not_grow():
     post = _unique(40, body[-1][0] + 1, "post")
     words = pre + body + post
     nw = rp.norm_words(words)
-    t = body[-1][0] - 4
-    for label in ("reverb/url:-words",
-                  "brand-orphan/cta/url:brand-orphan:code-itm20"):
-        frag = [(t - 6.0, t + 8.0, label)]
-        grown = rp._grow_confirmed_fragments(words, nw, [], frag)
-        assert grown[0][0] >= frag[0][0] - 0.01, (label, grown)
+    t0 = body[-1][0] - 4
+    # Garbage "-words" stems are a hard block.
+    frag = [(t0 - 6.0, t0 + 8.0, "reverb/url:-words")]
+    grown = rp._grow_confirmed_fragments(words, nw, [], frag)
+    assert grown[0][0] >= frag[0][0] - 0.01, grown
+
+
+def test_code_stem_growth_is_capped_and_skips_v4v():
+    """Promo-code labels may grow (unlike '-words'), within the 60s cap."""
+    pre = _unique(80, 0, "pre")
+    pre = pre[:-1] + _mk("That was the news.", pre[-1][0])
+    body = (
+        "check out betus and sign up for a free trial on your first deposit. "
+    ) * 8  # ~40s of commercial talk
+    cta = "go to betus dot com and use code YOUTUBE150 to get started today"
+    ad = _mk(body + cta, pre[-1][0] + 1)
+    post = _unique(40, ad[-1][0] + 1, "post")
+    words = pre + ad + post
+    nw = rp.norm_words(words)
+    url_t = [w[0] for w in ad if "betus" in w[2].lower()][-1]
+    frag = [(url_t - 8.0, url_t + 12.0, "brand/cta:code-youtube")]
+    grown = rp._grow_confirmed_fragments(words, nw, [], frag)
+    # Allowed to grow, unlike a hard-blocked '-words' stem, but capped
+    assert grown[0][0] < frag[0][0] - 5, grown
+    assert frag[0][0] - grown[0][0] <= rp._GROW_SOFT + 1.0, grown
+    assert grown[0][0] >= pre[-1][0] - 0.5, grown
 
 
 def test_glued_midrolls_split_at_return_to_show():
@@ -417,3 +437,106 @@ def test_glued_midrolls_split_at_return_to_show():
     b2 = (b[0][0], b[-1][1], "cta/url:buildkite")
     merged = rp._merge_lexical_pods([b1, b2], max_gap=90.0, words=words, nw=nw)
     assert len(merged) == 2, merged
+
+
+def test_end_refine_does_not_cut_mid_pod():
+    """A promo code in the middle of a multi-brand read must not trim the end."""
+    pre = _unique(80, 0, "pre")
+    bitbox = (
+        "our friends at bitbox made this hardware wallet for you. "
+        "go to bitboxswiss slash robin and use code robin to get started. "
+    )
+    rest = (
+        "and I partnered up with coinvigilante on a beautiful timepiece. "
+        "check out those amazing coinvigilante watches today. "
+    ) * 6
+    ad = _mk(bitbox + rest, pre[-1][0] + 1)
+    post = _unique(80, ad[-1][0] + 1, "post")
+    words = pre + ad + post
+    last_cv = [w[0] for w in ad if "coinvigilante" in w[2].lower()][-1]
+    blocks, sus = rp.detect_ad_blocks(words, [
+        {"label": "Bitbox", "variants": ["bitbox", "bitboxswiss"]},
+        {"label": "CoinVigilante", "variants": ["coinvigilante"]},
+    ], [], None, None)
+    covering = [b for b in blocks if b[0] <= last_cv <= b[1]]
+    assert covering, (blocks, sus)
+    # Must include the later CoinVigilante mention, not stop at code robin
+    assert any(b[1] >= last_cv - 1 for b in covering), (last_cv, covering)
+
+
+def _ts_words(text, t0):
+    words, t = [], float(t0)
+    for w in text.split():
+        words.append((t, t + 0.35, w))
+        t += 0.4
+    return words
+
+
+def test_should_refine_end_trims_show_talk_but_keeps_mid_pod():
+    """Long show-talk tails refine inward; mid-pod sales talk does not."""
+    # Show talk for ~40s after the last mention.
+    show = _ts_words(
+        "anyway back to the story we were talking about earlier when the "
+        "guests arrived and started telling us about their trip last summer "
+        "and how the weather changed everything they had planned for the week "
+        "and then we all laughed about the missed train " * 2,
+        100.0,
+    )
+    ev, end = 100.0, show[-1][0]
+    assert end - ev > 30.0
+    assert rp._should_inward_refine_end(end, ev, show, [w[2].lower() for w in show])
+
+    mid = _ts_words(
+        "and I partnered up with coinvigilante on a beautiful timepiece. "
+        "check out those amazing coinvigilante watches today at coinvigilante.com. "
+        "use code robin to get started. " * 4,
+        1970.0,
+    )
+    ev, end = 1970.0, mid[-1][0]
+    assert end - ev > 30.0
+    assert not rp._should_inward_refine_end(end, ev, mid, [w[2].lower() for w in mid]), (ev, end)
+
+
+
+def test_last_adlike_end_stops_at_show_talk():
+    """A commercial sentence then unique show talk should end at the ad sentence."""
+    ad = _ts_words(
+        "check out granola today and use code THANKS at granola.com. ",
+        100.0,
+    )
+    # force a sentence boundary
+    ad[-1] = (ad[-1][0], ad[-1][1], ad[-1][2].rstrip(",") + ".")
+    gap_t = ad[-1][1] + 1.0
+    show = _ts_words(
+        "anyway back to the story we were talking about earlier when the "
+        "guests arrived and started telling us about their trip last summer "
+        "and how the weather changed everything they had planned. ",
+        gap_t,
+    )
+    words = ad + show
+    nw = [w[2].lower().strip(".,!?") for w in words]
+    ev = [w[0] for w in ad if "granola.com" in w[2].lower() or "granola" in w[2].lower()][-1]
+    e = show[-1][1]
+    ne = rp._last_adlike_end(words, nw, ev, e)
+    assert ne <= ad[-1][1] + 0.5, (ne, ad[-1][1], ev, e)
+    assert e - ne > 10.0
+
+
+def test_sponsoring_signoff_does_not_block_end_refine():
+    """'Thank you for sponsoring' after the last mention is a sign-off, not mid-pod copy."""
+    ad = _ts_words(
+        "go to granola.com and use code ATP. thank you to granola for sponsoring the show. ",
+        100.0,
+    )
+    ad[-1] = (ad[-1][0], ad[-1][1], ad[-1][2].rstrip(",") + ".")
+    show = _ts_words(
+        "to sustain this work we rely on listeners like you sending in boostagrams "
+        "and telling a friend about the show every week. anyway back to the story. " * 4,
+        ad[-1][1] + 1.0,
+    )
+    words = ad + show
+    nw = [w[2].lower().strip(".,!?") for w in words]
+    ev = [w[0] for w in ad if "granola" in w[2].lower()][-1]
+    e = show[-1][1]
+    assert (e - ev) > 30.0
+    assert rp._should_inward_refine_end(e, ev, words, nw), (ev, e)

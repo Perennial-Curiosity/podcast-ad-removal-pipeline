@@ -758,3 +758,227 @@ refuses merge.
 - Cross-episode duplicate audio/text for ads that repeat across shows.
 - After Tuesday: score Unsubscribe 286/287 and SN 1101 against the
   owner's full marks, with real Whisper transcripts (no `#` prefixes).
+
+
+## Experiment 10 — recover the two lost BLAB TPs without the −132s start (v5f, kept)
+
+Goal: get back `KWQMS_s4lu8` (BetUS, 2026–2218) and `bdJQGeuGcpE`
+(Bitbox+BitcoinWay+CoinVigilante, 1906–2076), which v5c shrank under
+50% coverage, without re-gluing `u7ecuuwssic` into a −132s start.
+Also merge `synth-015` Base44+KubeCon fragments left split after snap.
+Then survey a genre-diverse real-audio chapter-GT set (not tech-only)
+for later voice/room-change cues.
+
+Branch `grok/boundary-work` still on top of `a745b09` (v5c). Nothing
+pushed.
+
+### Diagnosis
+
+The two lost TPs were not caused by the 60s growth cap itself.
+
+- `bdJQGeuGcpE`: the heatmap already covered 1894–2076. Inward *end*
+  refine then cut 2076→1970 because auto-sponsor `code-robin` is
+  mentioned mid-pod, so coverage fell to 38% (FN). v5c also refused
+  to grow `code-*`, so the end stayed short.
+- `KWQMS_s4lu8`: heatmap 2032–2097 of a 192s BetUS read. v5a grew
+  forward +37s to 2134 (53%, just over 50%). v5c treated `code-youtube`
+  as a hard growth veto, so the walk never started (37s was under the
+  60s cap anyway).
+
+`u7ecuuwssic` −132s was backward growth of `freshly` into prior
+content, then a v5c *split* at the Freshly opening (4s gap). Post-snap
+merge must not re-glue an opening-only / empty-inner gap.
+
+`synth-015` Base44+KubeCon: merge ran *before* the second snap; snap
+pulled a grown end back to a mid-pod sign-off (~699), leaving cubcon
+783–817 unmerged, and 539–699 was 48% of 583–827 (FN in v5c).
+
+### Intermediate versions (measured, not kept)
+
+**v5d** (blunt 30s end-refine cap + `code-*` soft-block + post-snap
+merge + keep capped walks without a strong stop):
+
+- Recovered both BLAB TPs (34/135, F1 37.4%) and kept the `u7ecuuwssic`
+  split (Freshly start +0.0, not −132s).
+- Spliced F1 44.3% (27 TPs), but edges got worse: mean 15.58s→23.18s,
+  ≤5s 38.5%→27.8%, Time P 88.2%→81.6%. Granola ends jumped to +39s
+  and +99s because a "thank you for *sponsoring*" sign-off plus a
+  40s orphan-extend pad made `(e - ev_end) > 30`, so refine skipped.
+- Failed the "don't make start and end times worse" rule. Not kept.
+
+**v5e** (skip inward refine on a long tail only when the tail is still
+ad-like): recovered SerpAPI's +54s end and a 35th BLAB TP
+(`RuTIfLaarp4`, two FPs merged into one TP), but granola stayed long
+because the sign-off sentence itself contains the ADISH word
+"sponsoring". Not kept.
+
+### v5f (kept)
+
+- `code-*` is a soft growth block: the stem may grow with the 60s cap
+  but is not used as a brand. Hard-block remains `-words` / skip-list /
+  donation stems. Capped walks are kept when the walk is accepted
+  (exhaustion is a soft stop, not a discard) — needed for the +37s
+  BetUS walk.
+- End refine no longer uses a raw 30s cutoff. A long tail is kept only
+  when the text *after the last mention's sentence* is still ad-like
+  (another brand, CTA, or sales talk in a multi-brand pod). The
+  sign-off sentence is excluded so "thank you to granola for
+  sponsoring the show" cannot block a trim. Fallback:
+  `_last_adlike_end` when no method-segment end exists.
+- The same end refine runs again after grow + split + post-snap merge,
+  then a final snap, so a walk that overshoots after the early refine
+  still gets trimmed.
+- Merge: gaps >2s require `_gap_is_adlike`; an empty inner after
+  stripping a sign-off / opening requires *both* a sign-off and an
+  opening (opening alone is the next ad). Post-snap merge is on, so
+  `u7ecuuwssic`'s 4s opening-only gap stays split.
+- Early inward end refine is skipped for mid-pod promo codes
+  (`bdJQGeuGcpE` code-robin at 1970s in an 1894–2076 read).
+
+Official production path (`--no-supplement` on BLAB 48; spliced
+show-notes-only; V4V uncut hosts). Snap diagnostic code path
+unchanged (v1d + 12s inward cap); not re-run for v5f. After means
+from v5d/v5a: mid 5.46s, overshoot 8.75s, mixed 4.91s.
+
+Spliced show-notes-only (20 episodes, 71 ads):
+
+| | Cov P | Cov R | Cov F1 | TP | Time P | Time R | mean \|err\| | ≤5s | signed start | worst |
+|---|---|---|---|---|---|---|---|---|---|---|
+| v4b (`6e34fe0`) | 26.0% | 18.3% | 21.5% | 13 | 94.1% | 26.7% | 11.20s | 50.0% | +5.3s | 75s |
+| v5a (`69ff162`) | 55.3% | 36.6% | 44.1% | 26 | 85.4% | 38.2% | 20.94s | 36.5% | +5.2s | 210s |
+| v5c (`a745b09`) | 52.0% | 36.6% | 43.0% | 26 | 88.2% | 36.7% | 15.58s | 38.5% | +9.4s | 74s |
+| v5d (not kept) | 52.9% | 38.0% | 44.3% | 27 | 81.6% | 38.8% | 23.18s | 27.8% | +5.6s | 99s |
+| v5e (not kept) | 52.9% | 38.0% | 44.3% | 27 | 82.8% | 38.6% | 22.18s | 29.6% | +5.6s | 99s |
+| v5f (kept) | 52.9% | 38.0% | 44.3% | 27 | 86.8% | 38.1% | 18.94s | 33.3% | +5.6s | 84s |
+
+F1 is 0.2pp above v5a and 1.3pp above v5c, with 27 TPs (v5c's 26
+kept). Time P recovered most of the v5d loss (81.6%→86.8%, vs v5c
+88.2%). Granola ends are back: synth-015 +39s→−0.5s, synth-007
++99s→−0.3s; SerpAPI end −1.7s; Perplexity +28s→−5.8s. Remaining
+spliced edge gap vs v5c is mostly compositional: the new synth-015
+Base44+KubeCon TP (65% coverage, end −83.9s, leftover cubcon 784–817
+still unmerged) is now in the edge average, and synth-000's
+Hostinger+Buildkite pod split (v5c had one 97% TP; v5f has
+code-practical 3169–3297 + buildkite 3340–3421, both under 50% of
+the combined GT). Post-snap merge still will not join a 41s
+mid-KubeCon conference-talk gap.
+
+BLAB 48-ep production (`--no-supplement`):
+
+| | Cov P | Cov R | Cov F1 | TP/135 | Time P | Time R | mean \|err\| | ≤5s | signed start | worst |
+|---|---|---|---|---|---|---|---|---|---|---|
+| v4b | 58.1% | 18.5% | 28.1% | 25 | 77.3% | 27.7% | 14.86s | 48.0% | −10.8s | 109s |
+| v5a | 79.1% | 25.2% | 38.2% | 34 | 70.0% | 36.3% | 23.04s | 41.2% | −17.5s | 132s |
+| v5c | 69.6% | 23.7% | 35.4% | 32 | 71.0% | 32.1% | 18.57s | 40.6% | −0.7s | 101s |
+| v5d (not kept) | 72.3% | 25.2% | 37.4% | 34 | 72.2% | 37.9% | 17.42s | 41.2% | −5.5s | 84s |
+| v5e (not kept) | 76.1% | 25.9% | 38.7% | 35 | 72.5% | 37.7% | 17.67s | 41.4% | −3.5s | 84s |
+| v5f (kept) | 76.1% | 25.9% | 38.7% | 35 | 75.2% | 37.6% | 16.55s | 45.7% | −3.5s | 84s |
+
+Both lost TPs recovered: `KWQMS_s4lu8` 2033–2134 (53%, start +6.4,
+end −84.1, same as v5a); `bdJQGeuGcpE` 1894–2076 (100%, start −12.7,
+end +0.3). A third TP appeared on `RuTIfLaarp4` (v5c/v5d had two FPs;
+v5f merges them to a 4116–4217 vs GT 4052–4212 TP). `u7ecuuwssic`
+Freshly start is +0.0 (not −132s); the following Squarespace chapter
+in the same 5402–5609 GT is 5402–5611 (end +1.9, 100% coverage). The
+leftover FP 5276–5397 remains. First Squarespace ad is back to v5c
+accuracy (5.4–35.0, end +3.3; v5d/v5e had +17.9). Worst remaining
+edge is still the short BetUS end (−84s). Coverage F1 is 0.5pp above
+v5a and 3.3pp above v5c; ≤5s 45.7% is the best of the v5 line.
+
+V4V hard negatives (16 uncut hosts):
+
+| | CTA-segment FP time | Clean FP time | Clean blocks / hour |
+|---|---|---|---|
+| v4b (`6e34fe0`) | 3.1% (597s / 19034s) | 1.8% (1177s) | 1.00 (18 blocks) |
+| v5a (`69ff162`) | 3.7% (712s) | 1.9% (1228s) | 1.00 (18) |
+| v5c (`a745b09`) | 3.7% (705s) | 1.8% (1189s) | 1.00 (18) |
+| v5d / v5e (not kept) | 3.7% (712s) | 1.8% (1189s) | 1.00 (18) |
+| v5f (kept) | 3.7% (699s) | 1.8% (1189s) | 1.00 (18) |
+
+Same 18 clean blocks and 13 CTA-touching blocks. CTA time is 5s under
+v5c (bunny end trimmed slightly). Not a regression.
+
+Reverted this batch: v5d (blunt 30s cap) and v5e (adlike-tail check
+that still treated "sponsoring" in the sign-off as mid-pod copy).
+Their TP-recovery pieces (`code-*` soft-block, mid-pod skip, post-snap
+merge, keep capped walks) are kept inside v5f with the sign-off-aware
+refine.
+
+Unit tests: 50 passed, including generic `-words` still blocked,
+`code-youtube` growth ≤60s, mid-pod `code robin` must not cut
+CoinVigilante, long show-talk tails refine inward, and "thank you
+for sponsoring" does not block a trim.
+
+### Real-audio chapter-GT set (multi-genre, not tech-only)
+
+The app has to work on any podcast, so this eval cannot be
+Changelog/ATP alone, and audio voice/room-change cues must not be
+tuned on spliced ads (those overstate insertion artifacts) or on a
+tech-only slice.
+
+Built this turn (local, under `eval_work/real_audio_gt/`, not
+committed; pad-dataset inputs untouched):
+
+- `unspliced_chapter_gt_manifest.json`: 28 already-downloaded original
+  unspliced mp3s (Changelog 8, Practical AI 6, JS Party 6, ATP 8) with
+  68 publisher-chapter GT ads (50 `podcast:chapters` JSON, 18 ID3
+  CHAP). ATP is host-read; Changelog-network is mixed/unknown. All
+  English technology. Full-episode Whisper transcripts are not
+  present; transcribing ~28 hour-long shows on CPU is deferred. Kept
+  as *one genre slice*, not the full set. Do not tune on this slice
+  alone.
+- `chapter_feed_probe.json` + `catalog.json`: probed ~100 public RSS
+  feeds across true crime, comedy, news, sports, business, health,
+  history, kids/family, fiction, interviews, technology, and
+  non-English (de/es/fr/pt/sv). Finding: strict `Sponsor:` / `[Ad]`
+  chapter titles in this pass appeared only on the Changelog network.
+  Major DAI shows (Crime Junkie, SmartLess, The Daily, Huberman, The
+  Bill Simmons Podcast, etc.) publish no chapter marks at all. Acquired
+  had a topical "Advertising" chapter (false hit). Lage der Nation
+  (German news) had a mid-show "advertise with us" callout, not a
+  sponsor read. Stuff You Missed in History Class has some chapter
+  payload but no ad titles in the sample. RSS-only probing undercounts
+  ID3 CHAP shows (ATP is confirmed on disk; Relay FM likely similar
+  and not yet downloaded). Several kids/fiction/Radiotopia feeds
+  failed on SSL/404 and need alternate official URLs.
+- BLAB 48 (already the official word-eval) is more genre-diverse than
+  the on-disk chapter slice: comedy 11, sports 13, health/fitness 9,
+  business/crypto 11, interviews 3, news-talk 1, across 12 channels.
+  Missing: true crime, kids, fiction, history, non-English. Its audio
+  is YouTube-blocked on this box, so it cannot judge voice/room-change
+  cues.
+- Other labeled sources: owner 286/287 dynamic-only marks in-repo
+  (full 286/287/1101 still expected Tuesday); Hamburg 2025 MA thesis
+  "Identifying Advertisements in Podcasts" (manual RSS + SponsorBlock
+  YouTube; public release not confirmed); SponsorBlock dumps (same
+  YouTube block here); EACL 2021 extraneous-content set used the
+  withdrawn Spotify 100k corpus.
+
+Audio voice/room-change cue work was **not started**. Spliced would
+overstate it; BLAB audio is blocked here; the only ready real audio
+with chapter GT is a technology slice, and tuning on that would
+overfit tech-sponsor vocabulary.
+
+### Next ideas (not yet measured)
+
+- Join leftover mid-pod fragments: `synth-015` cubcon 784–817 still
+  unmerged (41s of conference talk in the gap); synth-000
+  Hostinger+Buildkite split into two sub-50% pieces (voice/reverb
+  finds Buildkite, merge does not join a ~42s gap).
+- The short BetUS end on `KWQMS_s4lu8` (−84s) is still the worst
+  official BLAB edge; growing `code-youtube` further without a new
+  overshoot would help.
+- Leftover FP 5276–5397 on `u7ecuuwssic` (pre-Freshly split-off).
+- Expand the real-audio GT set for genre diversity, not volume:
+  retry failed kids/fiction/Radiotopia RSS URLs; ID3-CHAP probe on
+  one short episode each from Relay FM and a German Podlove show;
+  Podcast Index search for mid=chapters with Sponsor/Ad/Werbung
+  titles; transcribe 1 short episode per genre before any of the
+  28 tech hours. Include both host-read and produced/DAI ads.
+  Report per-genre scores once more than one genre has
+  audio+GT+transcripts.
+- Only then try voice/room-change boundary cues, judged on that
+  diverse real-audio set (and BLAB if audio becomes available),
+  never primarily on splices.
+- After Tuesday: score Unsubscribe 286/287 and SN 1101 against the
+  owner's full marks, with real Whisper transcripts (no `#` prefixes).
