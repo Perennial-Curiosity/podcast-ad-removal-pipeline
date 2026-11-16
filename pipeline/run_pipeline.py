@@ -3478,6 +3478,7 @@ def _run_dynamic_for_episode(item, pcfg, state, work, mp3_path, words,
         try:
             if os.path.exists(b_mp3):
                 os.remove(b_mp3)
+            os.makedirs(os.path.dirname(b_mp3), exist_ok=True)
             download(item["audio_url"], b_mp3, retries=3)
         except Exception as exc:
             log(f"  probe download failed ({exc!r}); detector-only output")
