@@ -83,6 +83,13 @@ EDGE_METHODS = ("cluster", "cta", "brand", "duplicate", "chapter")
 
 
 def _part(label):
+    # Labels can be None: the slot flow legitimately emits unnamed
+    # dynamic slots (DESIGN.md section 4 — "still marked"), and the
+    # chapter/history machinery already treats them as unnamed. A None
+    # label has no sponsor part, so it matches nothing and the rescue
+    # skips the block, like any other artifact label.
+    if not label:
+        return ""
     return label.split(":")[-1].strip().lower().replace(" ", "")
 
 
