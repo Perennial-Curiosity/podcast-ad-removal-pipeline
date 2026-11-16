@@ -112,3 +112,44 @@ V4V false positives (full uncut hosts, 16 episodes, `data/v4v_cta/results/base_v
 touched; 1,160 s predicted in 64,705 s of the remaining content (1.8%),
 18 blocks ≈ 1.0 per clean hour (mostly duplicate/reverb/voice labels
 like `dry-island`, i.e. audio-method hits on music/bits).
+
+## Batch 2: mixed tech + non-tech ad pool (DAI clips)
+
+`dai_clips.py` turns the real-audio DAI diff set
+(`<pipeline repo>/eval_work/real_audio_gt/dai/`, read-only: stretches that
+differed between two downloads of the same episode = dynamically inserted,
+mostly produced ads, from news / history / business / sports / true crime /
+interviews / comedy / health shows) into individual clips:
+
+1. Whisper transcript per slot clip (`data/transcripts/dai_raw/`).
+2. Split multi-ad breaks at sponsor opening cues ("This message comes
+   from…", "Support for … comes from…", "sponsored by", "brought to you
+   by") after a sentence end/pause, and at ≥0.8 s pauses after a sentence
+   end when both sides are ≥12 s (produced spots without a spoken cue).
+3. Brand from the cue, else the most-spoken `<name>.com`, else a
+   capitalized name spoken ≥2×; otherwise `unknown-<id>`.
+4. Silence-trim edges (≤150 ms pad), drop pieces <12 s, flag pieces whose
+   clip edge cuts a sentence or that are not English (`splice_ok=false`).
+5. Dedupe across A/B copies and episodes: word-sequence containment ≥0.8,
+   or ≥0.6 with the same brand → keep the longest copy.
+
+Output: `data/ads/dai/*.wav`, `data/ads/dai_clips.json` (source show, genre,
+brand, src times, first/last words, duplicates removed).
+
+```bash
+python dai_clips.py
+python splice.py --n 20 --seed 5678 --min-win 1800 --max-win 4500 \
+    --dai-mix 0.6 --out data/spliced/batch2
+```
+`--dai-mix 0.6`: each ad is drawn from the DAI pool with p=0.6, else from
+the tech chapter pool. Brands never repeat within an episode
+(`brand_key` folds "rosettastone.com" = "Rosetta Stone"). `gt_ads.json`
+entries now carry `genre` and `source_show` (tech chapter clips: `tech`).
+
+Caveats: DAI clip edges come from an A/B diff, so a clip can start with a
+network bumper ("…announcements and messages from our sponsors") or keep a
+fragment of an adjacent spot; splits at pauses can occasionally cut one
+spot in two (both halves stay labeled ad, so GT is still correct). Some
+brand labels are approximate (domain or repeated name). Several DAI
+fills were served to the same box on the same day, so the pool skews to
+Nov-2026 holiday campaigns (McDonald's, Mint Mobile, Schwab, Coca-Cola).

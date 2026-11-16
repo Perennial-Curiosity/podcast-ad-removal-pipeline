@@ -30,6 +30,12 @@ MIN_SPACING = 240.0     # s between mid-roll breaks
 EDGE_MARGIN = 120.0     # no mid-roll this close to start/end
 
 
+def brand_key(b):
+    """'rosettastone.com' == 'Rosetta Stone' == 'RosettaStone'."""
+    import re
+    return re.sub(r"(com|org|net|io)$", "", re.sub(r"[^a-z0-9]", "", b.lower()))
+
+
 def word_gaps(words):
     """Candidate insertion gaps: (t_insert, kind)."""
     out = []
@@ -78,9 +84,12 @@ def build_episode(rng, host, host_audio, host_words, host_lufs, clips, ad_cache,
         n_ads = 2 if rng.random() < 0.25 else 1
         chosen = []
         for _ in range(n_ads):
-            cands = [c for c in clips if c["brand"].lower() not in used_brands]
+            pool = clips
+            if isinstance(clips, dict):  # {"pools": [...], "mix": p}
+                pool = clips["pools"][1] if rng.random() < clips["mix"] else clips["pools"][0]
+            cands = [c for c in pool if brand_key(c["brand"]) not in used_brands]
             c = rng.choice(cands)
-            used_brands.add(c["brand"].lower())
+            used_brands.add(brand_key(c["brand"]))
             chosen.append(c)
         breaks.append({"slot": kind, "host_t": t, "clips": chosen})
     # assemble
@@ -129,6 +138,7 @@ def build_episode(rng, host, host_audio, host_words, host_lufs, clips, ad_cache,
             ad_end = out_len
             gt_ads.append({"start": ad_start / SR, "end": ad_end / SR, "clip": c["id"],
                            "brand": c["brand"], "source": c["source"], "type": c["type"],
+                           "genre": c.get("genre", "tech"), "source_show": c.get("source_show", c["source"]),
                            "slot": br["slot"], "insert_kind": br["slot"] if br["slot"] != "mid" else None,
                            "pod_index": ci, "pod_size": len(br["clips"]),
                            "xfade_in_ms": round(n_in * 1000 / SR), "gap_in_ms": gap_in,
@@ -195,6 +205,8 @@ def main():
     ap.add_argument("--out", default=os.path.join(DATA, "spliced", "batch1"))
     ap.add_argument("--min-win", type=float, default=35 * 60)
     ap.add_argument("--max-win", type=float, default=100 * 60)
+    ap.add_argument("--dai-mix", type=float, default=0.0,
+                    help="probability an ad is drawn from data/ads/dai_clips.json (batch2: 0.6)")
     args = ap.parse_args()
     rng = random.Random(args.seed)
     manifest = {h["id"]: h for h in json.load(open(os.path.join(DATA, "hosts", "manifest.json")))}
@@ -204,6 +216,10 @@ def main():
     if os.path.exists(qual):
         bad = {k for k, v in json.load(open(qual)).items() if not v.get("ok", True)}
         clips = [c for c in clips if c["id"] not in bad]
+    if args.dai_mix > 0:
+        dai = [c for c in json.load(open(os.path.join(DATA, "ads", "dai_clips.json"))) if c.get("splice_ok")]
+        print(f"pool: {len(clips)} tech chapter clips + {len(dai)} DAI clips, mix {args.dai_mix}")
+        clips = {"pools": [clips, dai], "mix": args.dai_mix}
     norm_dir = os.path.join(DATA, "ads", "norm")
     os.makedirs(norm_dir, exist_ok=True)
     # host order: each host once, then longest hosts again (different window)
@@ -245,7 +261,8 @@ def main():
         print(eid, f"{meta['duration']/60:.1f}m", [(round(a['start']), round(a['end']), a['slot']) for a in meta["ads"]], flush=True)
     json.dump(gt, open(os.path.join(args.out, "gt.json"), "w"), indent=1)
     json.dump(gt_ads_all, open(os.path.join(args.out, "gt_ads.json"), "w"), indent=1)
-    json.dump({"seed": args.seed, "n": args.n, "hosts": order}, open(os.path.join(args.out, "batch.json"), "w"), indent=1)
+    json.dump({"seed": args.seed, "n": args.n, "hosts": order, "dai_mix": args.dai_mix,
+               "min_win": args.min_win, "max_win": args.max_win}, open(os.path.join(args.out, "batch.json"), "w"), indent=1)
 
 
 if __name__ == "__main__":
