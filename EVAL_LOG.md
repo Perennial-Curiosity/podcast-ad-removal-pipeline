@@ -637,3 +637,124 @@ the closing URL, and a donations.com fragment that must not grow.
 - Cross-episode duplicate audio/text for ads that repeat across shows.
 - After Tuesday: score Unsubscribe 286/287 and SN 1101 against the
   owner's full marks, with real Whisper transcripts (no `#` prefixes).
+
+## Experiment 9 — cap over-growth and unglue adjacent mid-rolls (v5c, kept)
+
+Goal: win back edge accuracy and time precision lost to v5a over-growth
+without giving back the recall gains. Baseline: `69ff162` (v5a). Branch
+`grok/boundary-work`. Local only; no GitHub writes.
+
+Target: coverage F1 within ~2pp of v5a on spliced and BLAB, while
+pulling mean |err| and signed start bias toward v4b.
+
+### What landed (v5c)
+
+1. Backward/forward growth past 60s is kept only when the walk hit a
+   strong stop: an opening cue (back), a sign-off (forward), or a
+   topic-shift / return cue. Two non-ad-like sentences or a mid-read
+   brand mention is not enough to walk 2–4 minutes. Forward walks now
+   stop at a sign-off (included) or at a new opening after leaving
+   the fragment (that opening belongs to the next mid-roll).
+2. When an opening cue sits inside a long unpunctuated ASR sentence,
+   growth starts at the cue, not the sentence start — otherwise a
+   "brought to you by" 90s into a run-on sentence pulls the start
+   back through show talk.
+3. Generic / garbage stems are not grown: labels starting with `-`
+   (`-words`), `code-*` promo-code labels (`code-itm20`), stems in
+   `_GENERIC_STEMS` (`words`, `episode`, `slash`, …), and the existing
+   skip-list / meetup / donation veto.
+4. Lexical pods still merge at ≤90s (and up to 180s when the gap is
+   ad-like), but a gap with a topic-shift / return cue is not merged.
+   Longer gaps are judged on the *inner* text after stripping a
+   leading sign-off and a trailing opening, so the next ad's
+   "brought to you by" cannot make 157s of show talk look like a pod.
+   Bare "this episode" was removed from opening extras (it matched
+   "when you brought up this episode to me" in regular talk);
+   "this episode is also" is kept alongside `OPEN_CUES`.
+5. `_split_glued_midrolls` splits a long block that contains a
+   return-to-show cue, or a sign-off then a later opening with a
+   non-sales island between them. Immediate pod handoffs and
+   interview-style second reads stay one block.
+6. Grown / split edges are re-snapped with the same v1d
+   truncation-aware snap.
+
+Audio voice/room-change cues were not started; the merge-rule
+iteration used the remaining time.
+
+### Results
+
+Snap diagnostic (579 ads): unchanged from v3c / v4b / v5a (snap
+function not edited). Mid-read after 5.46s, overshoot 8.75s, mixed
+4.91s.
+
+Spliced set, show-notes-only (71 GT ads, 20 episodes):
+
+| | Cov P | Cov R | Cov F1 | Time P | Time R | Time F1 | mean \|err\| | ≤5s | signed start |
+|---|---|---|---|---|---|---|---|---|---|
+| v4b (`6e34fe0`) | 26.0% (13/37) | 18.3% (13/71) | 21.5% | 94.1% | 26.7% | 41.6% | 11.20s | 50.0% | +5.3s |
+| v5a (`69ff162`) | 55.3% (26/21) | 36.6% (26/71) | 44.1% | 85.4% | 38.2% | 52.8% | 20.94s | 36.5% | +5.2s |
+| v5c (kept) | 52.0% (26/24) | 36.6% (26/71) | 43.0% | 88.2% | 36.7% | 51.9% | 15.58s | 38.5% | +9.4s |
+
+Same 26 TPs as v5a. Coverage F1 44.1%→43.0% (−1.1pp, inside the
+~2pp budget). Time precision 85.4%→88.2% and mean |err| 20.94s→15.58s
+move toward v4b. Worst edge 209s→74s: the `synth-006` SerpAPI mid-roll
+and Perplexity post-roll are no longer glued into one 310s block
+(2200–2510 → 2200–2299 + 2468–2510). Hostinger+Buildkite, Notion, and
+granola TPs are kept. Signed start is a bit later (+9.4s) because
+walks without an opening cue stop at 60s.
+
+BLAB 48-ep production path (`--no-supplement`):
+
+| | Cov P | Cov R | Cov F1 | Time P | Time R | Time F1 | mean \|err\| | ≤5s | signed start |
+|---|---|---|---|---|---|---|---|---|---|
+| v4b (`6e34fe0`) | 58.1% (25/18) | 18.5% (25/135) | 28.1% | 77.3% | 27.7% | 40.8% | 14.86s | 48.0% | −10.8s |
+| v5a (`69ff162`) | 79.1% (34/9) | 25.2% (34/135) | 38.2% | 70.0% | 36.3% | 47.8% | 23.04s | 41.2% | −17.5s |
+| v5c (kept) | 69.6% (32/14) | 23.7% (32/135) | 35.4% | 71.0% | 32.1% | 44.2% | 18.57s | 40.6% | −0.7s |
+
+Coverage F1 38.2%→35.4% (−2.8pp), a hair over the ~2pp target, from
+two lost TPs: `KWQMS_s4lu8` 2026–2218 was a barely-50% v5a match
+(end −84s) that the 60s cap shrank under the line; `bdJQGeuGcpE`
+1906–2076 was a clean v5a TP that shrank to 1894–1970. In return,
+the `u7ecuuwssic` start −132s overshoot is gone (−1.1s), signed
+mean start is −0.7s (better even than v4b's −10.8s), and mean |err|
+23.04s→18.57s. Kept: the boundary win is the point of this batch,
+spliced recall is intact, and BLAB is still well above v4b (35.4%
+vs 28.1%).
+
+V4V hard negatives (16 uncut hosts):
+
+| | CTA-segment FP time | Clean FP time | Clean blocks / hour |
+|---|---|---|---|
+| v4b (`6e34fe0`) | 3.1% (597s / 19034s) | 1.8% (1177s) | 1.00 (18 blocks) |
+| v5a (`69ff162`) | 3.7% (712s) | 1.9% (1228s) | 1.00 (18) |
+| v5c (kept) | 3.7% (705s) | 1.8% (1189s) | 1.00 (18) |
+
+Same 18 clean blocks and 13 CTA-touching blocks. Slightly cleaner
+than v5a (`code-*` / `-words` no longer grow). Not a meaningful
+regression vs v4b (same block counts).
+
+Reverted this batch: nothing. An intermediate v5b that also split
+true multi-brand pods (Hostinger+Buildkite, Perplexity+Coder, Base44
++KubeCon) was tightened before keep — interview-style second reads
+are not a return to the show. v5c passed spliced F1, V4V, and snap
+gates; BLAB F1 is 0.8pp past the soft 2pp line in exchange for the
+start-bias fix.
+
+Unit tests: 45 passed, including the 60s cap, opening cue beyond 60s,
+generic-stem veto, and a "welcome back" mid-roll split that still
+refuses merge.
+
+### Next ideas (not yet measured)
+
+- Recover the two BLAB TPs that the 60s cap shrank under 50%
+  (`bdJQGeuGcpE` especially) without bringing back the −132s start.
+  A mid-length cap (~90s) or "keep walking while the brand repeats"
+  might be enough.
+- `synth-015` Base44+KubeCon is still two fragments in the final
+  pred (539–699 + 784–817); a post-snap merge pass could restore a
+  more precise pod edge.
+- Audio voice/room-change at insertion boundaries, scored primarily
+  on BLAB (splices make this too easy).
+- Cross-episode duplicate audio/text for ads that repeat across shows.
+- After Tuesday: score Unsubscribe 286/287 and SN 1101 against the
+  owner's full marks, with real Whisper transcripts (no `#` prefixes).

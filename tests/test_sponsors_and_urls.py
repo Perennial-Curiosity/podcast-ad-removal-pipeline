@@ -326,3 +326,94 @@ def test_v4v_donation_fragment_does_not_grow():
     grown = rp._grow_confirmed_fragments(words, nw, [], frag)
     # Blocked brand stem, or v4vish stop: must not walk back through thank-yous
     assert grown[0][0] >= frag[0][0] - 0.01, grown
+
+
+def test_growth_without_opening_is_capped():
+    """A long walk with only weak ad-like talk must not exceed ~60s."""
+    pre = _unique(80, 0, "pre")
+    # Brand repeats keep the walk ad-like so v5a would have gone ~150s.
+    body = (
+        "acmewidget helps you ship faster and your team can focus. "
+    ) * 25  # ~12 words * 25 * 0.4s = ~120s
+    cta = "go to acmewidget dot com slash changelog and use code SHOW to get started"
+    ad = _mk(body + cta, pre[-1][0] + 1)
+    post = _unique(40, ad[-1][0] + 1, "post")
+    words = pre + ad + post
+    nw = rp.norm_words(words)
+    url_t = [w[0] for w in ad if "acmewidget" in w[2].lower()][-1]
+    frag = [(url_t - 8.0, url_t + 12.0, "cta/url:acmewidget")]
+    grown = rp._grow_confirmed_fragments(words, nw, [], frag)
+    # Must grow some, but not all the way back through 120s of body
+    assert grown[0][0] < frag[0][0] - 5, grown
+    assert frag[0][0] - grown[0][0] <= rp._GROW_SOFT + 1.0, grown
+    assert grown[0][0] > ad[0][0] + 20, grown
+
+
+def test_growth_with_opening_can_exceed_soft_cap():
+    pre = _unique(80, 0, "pre")
+    pre = pre[:-1] + _mk("That was the news.", pre[-1][0])
+    opener = "what's up nerds I am here with the ceo of acmewidget. "
+    body = (
+        "acmewidget helps you ship faster and your team can focus. "
+    ) * 20  # ~80s+ of body after the opening
+    cta = "go to acmewidget dot com slash changelog and use code SHOW to get started"
+    ad = _mk(opener + body + cta, pre[-1][0] + 1)
+    post = _unique(40, ad[-1][0] + 1, "post")
+    words = pre + ad + post
+    nw = rp.norm_words(words)
+    url_t = [w[0] for w in ad if "acmewidget" in w[2].lower() and w[0] > ad[0][0] + 5][-1]
+    frag = [(url_t - 8.0, url_t + 12.0, "cta/url:acmewidget")]
+    # Opening is well more than 60s before the URL fragment
+    assert frag[0][0] - ad[0][0] > rp._GROW_SOFT + 5, (frag[0][0], ad[0][0])
+    grown = rp._grow_confirmed_fragments(words, nw, [], frag)
+    assert grown[0][0] <= ad[0][0] + 6.0, grown
+    assert grown[0][0] >= pre[0][0] + 20
+
+
+def test_generic_stems_do_not_grow():
+    pre = _unique(80, 0, "pre")
+    body = _mk(
+        "thank you to everyone who sent support this week. "
+        "please go to the site and use code ITM20 for the merch shop",
+        pre[-1][0] + 1)
+    post = _unique(40, body[-1][0] + 1, "post")
+    words = pre + body + post
+    nw = rp.norm_words(words)
+    t = body[-1][0] - 4
+    for label in ("reverb/url:-words",
+                  "brand-orphan/cta/url:brand-orphan:code-itm20"):
+        frag = [(t - 6.0, t + 8.0, label)]
+        grown = rp._grow_confirmed_fragments(words, nw, [], frag)
+        assert grown[0][0] >= frag[0][0] - 0.01, (label, grown)
+
+
+def test_glued_midrolls_split_at_return_to_show():
+    pre = _unique(20, 0, "pre")
+    a = _mk(
+        ("hostinger keeps your sites online and you can scale today. ") * 12 +
+        "go to hostinger dot com slash and use code practical today. "
+        "thanks to hostinger for their support.",
+        200)
+    mid = _mk(
+        "welcome back. " +
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa. " * 20,
+        a[-1][0] + 1)
+    b = _mk(
+        "this episode is brought to you by our friends at buildkite. " +
+        ("buildkite runs your CI on your own agents every day. ") * 10 +
+        "go to buildkite dot com slash changelog and get started today",
+        mid[-1][0] + 1)
+    post = _unique(20, b[-1][0] + 1, "post")
+    words = pre + a + mid + b + post
+    nw = rp.norm_words(words)
+    glued = [(a[0][0], b[-1][1], "cta/url:hostinger")]
+    assert glued[0][1] - glued[0][0] > 90
+    out = rp._split_glued_midrolls(words, nw, glued)
+    assert len(out) == 2, out
+    assert out[0][1] <= mid[0][0] + 15, out
+    assert out[1][0] >= b[0][0] - 2, out
+    # And merge must refuse the same gap
+    b1 = (a[0][0], a[-1][1], "cta/url:hostinger")
+    b2 = (b[0][0], b[-1][1], "cta/url:buildkite")
+    merged = rp._merge_lexical_pods([b1, b2], max_gap=90.0, words=words, nw=nw)
+    assert len(merged) == 2, merged
