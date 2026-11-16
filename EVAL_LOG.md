@@ -982,3 +982,130 @@ overfit tech-sponsor vocabulary.
   never primarily on splices.
 - After Tuesday: score Unsubscribe 286/287 and SN 1101 against the
   owner's full marks, with real Whisper transcripts (no `#` prefixes).
+
+## Experiment 11 — pre/post-roll, underwriting, start bias, batch2 gate (v5m)
+
+Date: 2026-11-15 CST. Local only, no GitHub writes.
+
+Targeted the weaknesses the DAI set exposed on v5f: missed pre-rolls
+and post-rolls, early start bias (signed start −23.9s), and NPR-style
+underwriting. Added the DAI set as a 5th official gate (per-genre F1
+must not drop, overall DAI F1 and start bias must improve; DAI
+precision is pessimistic because same-fill ads are unlabeled, so
+judge mainly on recall and boundaries). Added genre-diverse spliced
+batch2 as a 6th gate (show-notes-only F1 up; brands-listed start
+bias toward 0).
+
+Existing gates still apply: spliced batch1 show-notes-only F1 up,
+BLAB 48 coverage F1 within ~2pp, V4V clean FPs not rising, snap
+diagnostic within 0.3s.
+
+### What changed (on top of v5f `c153ebc`)
+
+Detector work in `pipeline/run_pipeline.py` (unit tests in
+`tests/test_sponsors_and_urls.py` and `tests/test_boundaries.py`):
+
+- New `_method_underwrite` for NPR-style openings ("support for this
+  podcast comes from…", "this message comes from…"), with
+  `_span_is_underwrite_body`, a larger edge reject budget, and
+  `_underwrite_lookahead_ok` so founder-story sentences don't stop
+  the walk when commercial language resumes shortly after.
+- New `_method_edge_adlike` for produced language in the first/last
+  90s, with edge promotion of underwrite/url/edge votes, a 15s floor
+  only when those methods voted, and heatmap islands extended to the
+  full overlapping edge/underwrite candidate.
+- Host-boundary phrases (credits, "tune in next", "thanks for
+  listening", "hey Lulu here") stop backward growth and edge
+  clusters. Leading post-roll extension only walks wordless gaps,
+  not host talk (Athletic early-start).
+- `_span_is_show_contact` vetoes tip-line / show-inbox URLs (Crime
+  Junkie FP). `_span_has_open(..., extras=False)` so "what's up" /
+  "I'm here" growth extras cannot seed a V4V theme-song preroll.
+- `_span_has_shift` uses word boundaries so "ok back" does not match
+  "look back" (Granola mid-roll split). `_span_has_commercial` treats
+  spoken TLDs (including `.io`) only after "dot", not bare "net"/"com".
+- URL pause-clamp only fires when a previous other-brand group ended
+  nearby (mid-read stutters before "fly .io" no longer eat the
+  lookback).
+- Generic single-token oracle stems ("Made", "John") are dropped
+  unless they are a known popular brand. Brand-orphan mentions are
+  grouped by a 90s gap instead of spanning first-to-last mention
+  across the episode (batch2 brands-listed "Made" was 155–729s,
+  signed start −374s).
+- V4V theme-song vanity URLs (vorac.org, morphovorek.org) are
+  dropped via a `_v4vish_near` veto on `_method_url` and by requiring
+  a real opening/CTA before promoting a URL-only edge block (a
+  window is not "adish" just because it contains its own TLD).
+- Weak directional CTAs ("why go to Google?") without a URL are not
+  treated as produced edge language. URL-only edge seeds in front of
+  a host outro within 90s are skipped (V4V roundtable guest-show
+  plug).
+
+72 unit tests pass.
+
+### Official gates vs v5f (kept baseline)
+
+| Gate | v5f | v5m | Verdict |
+|---|---|---|---|
+| Spliced batch1 show-notes-only coverage F1 | 44.3% (27 TP / 24 FP) | 43.2% (27 TP / 27 FP) | **near miss** (−1.1pp). The three v5l-lost TPs (Fly.io, Perplexity, Granola) are recovered. Net +3 FPs: a split Granola tail, a short `url:os` fragment, a mid-sentence-splice edge on synth-014, and a 4–25s under-cover of the real Claude preroll on synth-007 (GT 0–123, 17% coverage so it scores as FP+FN). |
+| BLAB 48 coverage F1 | 38.7% (35 TP / 11 FP) | 37.4% (40 TP / 39 FP) | **within ~2pp soft budget** (−1.3pp). Recall up (25.9%→29.6%), precision down (76.1%→50.6%). Signed start −3.54s → −8.06s. mean \|start\| 20.04s → 19.68s. |
+| V4V clean FP time | 1189s (1.8%, 18 blocks, 1.00/h) | 1201s (1.9%, 18 blocks, 1.00/h) | **essentially flat** (+12s). The +12s is noagenda-1913's existing `knowaginemetops` block ending 10440 vs 10428. Intro "what's up" prerolls and vorac/morphovorek/roundtable outro FPs from v5l are gone. CTA FP time improved 699s→656s. |
+| Snap diagnostic (after, mid / overshoot / mixed) | v5l: 5.44 / 8.78 / 4.86s | 5.44 / 8.78 / 4.86s | **PASS** (identical, well within 0.3s). |
+| DAI overall F1 / recall / signed start | 50.0% / 47.1% / −23.86s | 77.3% / 100% / −10.57s | **PASS**. Precision 53.3%→63.0% (still pessimistic). mean \|start\| 28.45s → 13.98s. |
+| batch2 show-notes-only coverage F1 | 33.9% (19 TP / 18 FP) | 40.0% (24 TP / 21 FP) | **PASS** (+6.1pp). Per-ad hits 29/96 (30%) → 35/96 (36%). Pre-rolls 2/13 → 5/13, post-rolls 0/6 → 1/6, edge-rolls 2/19 → 6/19. |
+| batch2 brands-listed signed start (overall / news / worst \|edge\|) | −11.96s / −95.7s / 373.6s | +9.92s (per-ad +4.0s) / +3.3s / 113.3s | **PASS** (bias moved toward 0; the 374s "Made" over-growth is gone). mean \|start\| 38.14s → 16.50s. Brands coverage F1 47.5%→46.0% (same 29 TP, +4 FP) is not the gate. |
+
+### DAI per genre (coverage F1 / recall / signed start)
+
+| Genre | v5f | v5m |
+|---|---|---|
+| business | 66.7% / 67% / −3.0s | 85.7% / 100% / −3.5s |
+| comedy | n/a / 0% | 50.0% / 100% / −0.3s |
+| health | 66.7% / 50% / −40.3s | 100% / 100% / −19.5s |
+| history | 50.0% / 33% / −17.9s | 100% / 100% / +0.2s |
+| interviews | n/a / 0% | 50.0% / 100% / +4.0s |
+| news | 33.3% / 33% / −75.4s | 75.0% / 100% / −29.0s |
+| sports | 50.0% / 50% / −19.7s | 57.1% / 100% / −27.5s |
+| true crime | 100% / 100% / −15.8s | 100% / 100% / +3.7s |
+
+No per-genre F1 drop vs v5f. Sports start bias is slightly earlier
+(the Athletic Gemini early-start is improved overall but still
+present on some sports edges). Comedy F1 50% is one FP on a
+same-fill-unlabeled episode (precision pessimism), recall is 100%.
+
+### batch2 per-ad notes (v5f → v5m)
+
+| group | v5f hit | v5m hit |
+|---|---|---|
+| ALL | 29/96 (30%) | 35/96 (36%) |
+| tech | 14/37 (38%) | 17/37 (46%) |
+| non-tech | 15/59 (25%) | 18/59 (31%) |
+| business / comedy | 0/5, 0/4 | still 0 |
+| history | 1/11 | 2/11 |
+| news | 3/9 | 5/9 |
+| pre / post / edge-roll | 2/13, 0/6, 2/19 | 5/13, 1/6, 6/19 |
+
+### Not kept as the official baseline
+
+v5l improved DAI (F1 79.1%, recall 100%, signed start −10.29s) and
+BLAB F1 (45.9%, 51 TP) but failed spliced batch1 (F1 38.7%, lost
+Fly.io / Perplexity / Granola) and V4V (clean FP 1501s, 25 blocks)
+because of theme-song prerolls and URL-only outros. v5m keeps the
+DAI recall win, restores those three spliced TPs, and returns V4V
+to 18 clean blocks.
+
+### Next
+
+- Grow the synth-007 Claude preroll (GT 0–123, currently 4–25)
+  through the host-read body after "we are sponsored this episode
+  by…" so it becomes a coverage TP; that alone would put batch1
+  show-notes-only F1 above v5f (28 TP / 26 FP ≈ 44.8%).
+- Merge the leftover Granola tail (2395–2411) with 2279–2378
+  (`look back on later` is mid-read, not a topic shift).
+- Mid-sentence splices that glue show talk and an opening cue into
+  one 100s+ sentence (synth-014 Tailscale) still mark the host
+  prefix.
+- batch2 notes still miss all comedy and business ads; post-rolls
+  are 1/6.
+- After Tuesday (Nov 17): ingest Muse's zip, score Unsubscribe
+  286/287 and SN 1101, then push only when the owner says so.

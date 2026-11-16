@@ -55,6 +55,10 @@ MIN_AD_LEN = 45
 # than single-method blocks: dynamic spots run 30-31s (Unsubscribe 286,
 # 2026-10-26). Single-method blocks keep the 45s floor.
 HEATMAP_MIN_AD_LEN = 30
+# Produced edge spots (preroll/postroll) often run 15–30s, shorter
+# than a mid-roll host-read. Used only at episode edges.
+EDGE_MIN_AD_LEN = 15
+EDGE_MARGIN = 90.0
 MAX_AD_LEN = 12 * 60
 
 # History pre-roll voter (2026-11-14, A/B test — NOT merged): the
@@ -184,6 +188,25 @@ def init_podcast(podcast_id):
         os.makedirs(d, exist_ok=True)
     return cfg, pcfg
 
+# NPR / public-radio underwriting and produced-spot openings.
+# Kept as a distinct list so the underwrite voter can use them
+# without relying on the substring "sponsor" already in OPEN_CUES.
+UNDERWRITE_CUES = [
+    "this message comes from",
+    "the following message comes from",
+    "the following message come from",
+    "support for this podcast comes from",
+    "support for this program comes from",
+    "support for this show comes from",
+    "support for npr",
+    "supporters include",
+    "messages from our sponsors",
+    "announcements and messages from our sponsors",
+    "stay tuned for the following announcements",
+    "this episode sponsor is",
+    "this episode's sponsor",
+]
+
 OPEN_CUES = [
     "brought to you by",
     "brought to you",
@@ -197,6 +220,33 @@ OPEN_CUES = [
     "our good friends at",
     "good friends at",
     "our friends at",
+] + UNDERWRITE_CUES
+
+# Host intro/outro phrasing: a boundary, not an ad opening.
+# Deliberately omits bare "welcome to" (ads say "welcome to [brand]").
+HOST_BOUNDARY_PHRASES = [
+    "you're listening to",
+    "you are listening to",
+    "thanks for listening",
+    "thank you for listening",
+    "thanks for joining",
+    "thank you for joining",
+    "see you next time",
+    "until next time",
+    "that's our show",
+    "that does it for",
+    "from npr news",
+    "join us again",
+    "we hope you'll join",
+    "we hope you will join",
+    "back to you next time",
+    "back to you next",
+    "tune in next",
+    "tune in next time",
+    "tune in next week",
+    "please tune in",
+    "end of show",
+    "the best podcast in the universe",
 ]
 RETURN_CUES = [
     "welcome back",
@@ -348,11 +398,14 @@ def extract_sponsors(description_html):
             if root.startswith(prefix) and len(root) - len(prefix) >= 4:
                 variants.add(root[len(prefix):])
         # drop bare single common words that would false-positive
-        variants = {v for v in variants if not (len(v.split()) == 1 and v in
-                    {"material", "security", "one", "shield", "guard"})}
+        variants = _usable_variants(variants, text)
         if not variants:
-            variants = {root.replace(".", " ")}
-        brands.append({"label": text, "variants": {v for v in variants if v}})
+            # Keep a distinctive multi-char root; never fall back to a
+            # generic stem like "made" or "john".
+            fallback = root.replace(".", " ")
+            variants = _usable_variants({fallback}, text)
+        if variants:
+            brands.append({"label": text, "variants": variants})
     # Plain-text sponsor lists: "THANK YOU TO OUR SPONSORS! AG1 ... SHOPIFY ..."
     # Brand names come from the linked domains (ground truth); ALL-CAPS
     # names in the text supply extra match variants.
@@ -437,7 +490,9 @@ def extract_sponsors(description_html):
                                 "with"}:
                             variants.add(w)
                     break
-            brands.append({"label": label, "variants": variants})
+            variants = _usable_variants(variants, label)
+            if variants:
+                brands.append({"label": label, "variants": variants})
     # YouTube / show-notes blurbs often have no "our sponsors" header:
     # a URL sitting next to a promo code or "visit / check out", or a
     # "this episode is brought to you by" line. Ported from the PR #1
@@ -446,12 +501,14 @@ def extract_sponsors(description_html):
     text_all = unescape(text_all)
     brands = _sponsors_from_ad_context_urls(text_all, brands)
     brands = _sponsors_from_brought_to_you(text_all, brands)
-    # de-dupe preserving order
+    # de-dupe preserving order, and drop generic single-token stems
     seen, out = set(), []
     for b in brands:
-        if b["label"] not in seen:
-            seen.add(b["label"])
-            out.append(b)
+        variants = _usable_variants(b.get("variants") or set(), b.get("label") or "")
+        if not variants or b["label"] in seen:
+            continue
+        seen.add(b["label"])
+        out.append({**b, "variants": variants})
     return out
 
 
@@ -1236,7 +1293,7 @@ def _edge_sharpness(starts, ends, votes, t, side):
 
 
 
-def _refine_tail_is_adlike(words, nw, ev_end, e):
+def _refine_tail_is_adlike(words, nw, ev_end, e, label=None):
     """True if the span after the last mention's sentence still looks like ad copy.
 
     The sign-off sentence itself often contains 'sponsoring' ("thank you to
@@ -1259,41 +1316,56 @@ def _refine_tail_is_adlike(words, nw, ev_end, e):
     # A later brand.com / slash URL with no phrase wrapper.
     if any(any(s in t for s in ADISH_TLDS) for t in toks):
         return True
+    if label and "underwrite" in str(label).lower() and _span_is_underwrite_body(toks):
+        return True
     return False
 
 
-def _should_inward_refine_end(e, ev_end, words, nw):
+def _should_inward_refine_end(e, ev_end, words, nw, label=None):
     """Whether to pull a block end in toward the last mention's evidence.
 
-    Short tails are always refined. Long tails are refined only when
-    they no longer look like the same ad (show talk after a sign-off),
-    so mid-pod promo codes do not cut off a later brand in the same read.
+    A tail that is still underwriting or commercial is never trimmed
+    (Up First Squarespace after a Rosetta Stone URL). Short non-adlike
+    tails are refined; long tails are refined only when they no longer
+    look like the same ad, so mid-pod promo codes do not cut off a
+    later brand in the same read.
     """
     if e < ev_end:
         return False
+    if _refine_tail_is_adlike(words, nw, ev_end, e, label):
+        return False
     if (e - ev_end) <= 30.0:
         return True
-    return not _refine_tail_is_adlike(words, nw, ev_end, e)
+    return True
 
 
-def _last_adlike_end(words, nw, ev_end, e):
+def _last_adlike_end(words, nw, ev_end, e, label=None):
     """End of the last still-commercial sentence at or after ev_end, else ev_end.
 
     Used when method-segment ends are missing, so a post-growth show-talk
     tail can still be trimmed back to the read.
     """
+    uw = bool(label and "underwrite" in str(label).lower())
     last = ev_end
-    for st, en, toks, _ in _sentence_spans(words, nw):
-        if en <= ev_end or st >= e:
-            continue
-        adlike = (
+    sents = _sentence_spans(words, nw)
+
+    def _is_ad(toks):
+        return (
             _span_has_commercial(toks)
             or _span_has_open(toks)
             or any(any(s in t for s in ADISH_TLDS) for t in toks)
+            or (uw and _span_is_underwrite_body(toks))
         )
-        if adlike or st <= ev_end:
+
+    for i, (st, en, toks, _) in enumerate(sents):
+        if en <= ev_end or st >= e:
+            continue
+        if _is_ad(toks) or st <= ev_end:
             last = max(last, min(en, e))
         elif st > ev_end:
+            later = any(_is_ad(z[2]) and z[0] < e for z in sents[i + 1:])
+            if uw and later:
+                continue
             break
     return last
 
@@ -1319,19 +1391,109 @@ def _inward_refine_ends(blocks, words, nw, edge_cands, listed_sponsors, sponsors
     out = []
     for s, e, l in blocks:
         ev_end = _block_ev_end(s, e, l, words, nw, listed_sponsors, sponsors)
-        if ev_end is None or not _should_inward_refine_end(e, ev_end, words, nw):
+        if ev_end is None or not _should_inward_refine_end(e, ev_end, words, nw, l):
             out.append((s, e, l))
             continue
         ends = [ce for _, ce in edge_cands if ev_end <= ce <= e]
         if ends:
             ne = min(ends)
         else:
-            ne = _last_adlike_end(words, nw, ev_end, e)
+            ne = _last_adlike_end(words, nw, ev_end, e, l)
         if ne < e and ne > s:
             log(f"  {tag} '{l}': {e:.0f}s -> {ne:.0f}s")
             e = ne
         out.append((s, e, l))
     return out
+
+
+
+def _extend_edge_through_leading_gap(blocks, words, nw):
+    """Pull a post-roll start back through leading music/silence.
+
+    Science Vs speech starts ~30s after the host sign-off, but the DAI
+    slot includes the music bed. Only do this when the block itself
+    does not already open with a cue ('stay tuned' already marks the
+    start — pulling back would add the credits gap and inflate early
+    start error, as on Up First).
+    """
+    if not blocks or not words:
+        return blocks
+    ep = words[-1][1]
+    if ep < 180.0:
+        return blocks
+    sents = _sentence_spans(words, nw)
+    out = []
+    for s, e, l in blocks:
+        at_post = s >= ep - EDGE_MARGIN or e >= ep - 30.0
+        if not at_post:
+            out.append((s, e, l))
+            continue
+        # Don't pull back when the block already starts on an opening cue.
+        opening = False
+        for z in sents:
+            if z[1] < s - 0.05:
+                continue
+            if z[0] > s + 1.5:
+                break
+            if _span_has_open(z[2]):
+                opening = True
+                break
+        if opening:
+            out.append((s, e, l))
+            continue
+        t0 = s
+        prevs = [z for z in sents if z[1] <= t0 + 0.05]
+        if prevs and t0 - prevs[-1][1] <= 2.0 and not _span_has_host_boundary(prevs[-1][2]):
+            t0 = prevs[-1][0]
+            prevs = [z for z in sents if z[1] <= t0 + 0.05]
+        if prevs and t0 - prevs[-1][1] >= 5.0 and not any(
+                prevs[-1][1] < w[0] < t0 for w in words):
+            ns = prevs[-1][1]
+            if ns < s:
+                log(f"  extend post-roll silence '{l}': {s:.0f}s -> {ns:.0f}s")
+                s = ns
+        out.append((s, e, l))
+    return out
+
+
+
+
+def _span_is_show_contact(tokens):
+    """Listener tip-lines and show inboxes are not advertisements."""
+    punct = '.,!?;:\'"'
+    win = " ".join(tok.strip(punct) for tok in tokens)
+    win = win.replace(" -", "-").replace("- ", "-")
+    return any(p in win for p in (
+        "tip line", "tips at", "gmail.com", "gmail .com",
+        "we want to hear from you", "send anything you've got",
+        "our tip line", "at gmail",
+    ))
+
+
+def _extend_blocks_to_edge_candidates(blocks, candidates, words):
+    """Grow a heatmap island to the full overlapping edge/underwrite span."""
+    if not blocks or not candidates or not words:
+        return blocks
+    ep = words[-1][1]
+    if ep < 180.0:
+        return blocks
+    edge_cands = [
+        (s, e, l, m) for s, e, l, m in candidates
+        if m in ("edge", "underwrite") and (s <= EDGE_MARGIN or e >= ep - EDGE_MARGIN)
+    ]
+    out = []
+    for s, e, l in blocks:
+        for cs, ce, cl, cm in edge_cands:
+            if cs < e + 1.0 and ce > s - 1.0:
+                ns, ne = min(s, cs), max(e, ce)
+                if ne - ns > MAX_AD_LEN:
+                    continue
+                if (ns, ne) != (s, e):
+                    log(f"  extend edge candidate '{l}': {s:.0f}s-{e:.0f}s -> {ns:.0f}s-{ne:.0f}s")
+                    s, e = ns, ne
+        out.append((s, e, l))
+    return out
+
 
 
 def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
@@ -1418,8 +1580,16 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     if not words:
         return [], []
 
-    listed_sponsors = list(sponsors or [])
-    auto = discover_autosponsors(words, own_domains, listed_sponsors)
+    def _sanitize_sponsors(items):
+        out = []
+        for sp in items or []:
+            variants = _usable_variants(sp.get("variants") or set(), sp.get("label") or "")
+            if variants:
+                out.append({**sp, "variants": variants})
+        return out
+
+    listed_sponsors = _sanitize_sponsors(list(sponsors or []))
+    auto = _sanitize_sponsors(discover_autosponsors(words, own_domains, listed_sponsors))
     if auto:
         log("  auto-sponsors: " + ", ".join(a["label"] for a in auto))
         sponsors = listed_sponsors + auto
@@ -1440,6 +1610,8 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
         candidates.extend([(s, e, l, 'voice') for s, e, l in _method_voice(words, mp3_path)])
         candidates.extend([(s, e, l, 'reverb') for s, e, l in _method_reverb(words, mp3_path)])
     candidates.extend([(s, e, l, 'history-preroll') for s, e, l in _method_history_preroll(words)])
+    candidates.extend([(s, e, l, 'underwrite') for s, e, l in _method_underwrite(words, silences)])
+    candidates.extend([(s, e, l, 'edge') for s, e, l in _method_edge_adlike(words, silences)])
 
     if not candidates:
         if candidates_out is not None:
@@ -1603,14 +1775,22 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
             in_block = False
             be = sec
             dur = be - bs
-            if HEATMAP_MIN_AD_LEN <= dur <= MAX_AD_LEN:
+            _edge_vote = bool(block_methods & {"edge", "underwrite"})
+            _at_edge = (duration >= 180 and _edge_vote
+                        and (bs <= EDGE_MARGIN or be >= duration - EDGE_MARGIN))
+            _min = EDGE_MIN_AD_LEN if _at_edge else HEATMAP_MIN_AD_LEN
+            if _min - 0.05 <= dur <= MAX_AD_LEN:
                 entries = sum([vote_detail[s] for s in range(bs, be)], [])
                 blocks.append((bs, be, f"{'/'.join(sorted(block_methods))}:{_pick_label(entries, bs, be)}"))
                 log(f"  heatmap {bs:.0f}s-{be:.0f}s ({dur:.0f}s) votes={sorted(block_methods)}")
     if in_block:
         be = duration
         dur = be - bs
-        if HEATMAP_MIN_AD_LEN <= dur <= MAX_AD_LEN:
+        _edge_vote = bool(block_methods & {"edge", "underwrite"})
+        _at_edge = (duration >= 180 and _edge_vote
+                    and (bs <= EDGE_MARGIN or be >= duration - EDGE_MARGIN))
+        _min = EDGE_MIN_AD_LEN if _at_edge else HEATMAP_MIN_AD_LEN
+        if _min - 0.05 <= dur <= MAX_AD_LEN:
             entries = sum([vote_detail[s] for s in range(bs, be)], [])
             blocks.append((bs, be, f"{'/'.join(sorted(block_methods))}:{_pick_label(entries, bs, be)}"))
 
@@ -1632,6 +1812,11 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
         else:
             merged_blocks.append((bs, be, l))
     blocks = merged_blocks
+    # Voice often covers only the first 15s of a produced post-roll
+    # (Daily Show McDonald's), so the 2-vote heatmap island ends early
+    # and the rest of the edge candidate is never promoted. Extend an
+    # overlapping edge/underwrite candidate out to its full span.
+    blocks = _extend_blocks_to_edge_candidates(blocks, candidates, words)
 
     # Sponsor-anchor check (2026-10-27): a heat-map block labeled with a
     # description sponsor must sit within 10s of an actual mention of
@@ -1903,6 +2088,46 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
                 blocks[_bi] = (_ns, _ne, _bl)
             break
 
+    # Edge promotion (2026-11-15, DAI preroll/postroll): a single
+    # underwrite, url, or produced-spot edge vote in the first or last
+    # EDGE_MARGIN seconds is enough to mark. Mid-episode those methods
+    # stay corroborating-only. V4V donation vocabulary nearby is a veto.
+    # A mid-episode content URL in the first 90s still needs commercial
+    # or underwriting language so it is not marked on location alone.
+    _ep_end_t = words[-1][1]
+    # Short clips (unit tests, trailers) have no meaningful 90s edge.
+    ep_end_too_short = _ep_end_t < 180.0
+    for s, e, label, method in candidates:
+        if method not in ('url', 'underwrite', 'edge'):
+            continue
+        if not (s <= EDGE_MARGIN or e >= _ep_end_t - EDGE_MARGIN):
+            continue
+        dur = e - s
+        if not (EDGE_MIN_AD_LEN - 0.6 <= dur <= MAX_AD_LEN):
+            continue
+        if ep_end_too_short:
+            continue
+        if any(s < be and e > bs for bs, be, _ in blocks):
+            continue
+        mid_i, mid_t = 0, (s + e) / 2
+        for i, w in enumerate(words):
+            if w[0] >= mid_t:
+                mid_i = i
+                break
+        if _v4vish_near(_nw_heat, mid_i):
+            continue
+        if method == 'url':
+            # A spoken URL is already why this candidate exists;
+            # _adish_in_window is then true of almost every URL
+            # window (the TLD itself). Demand an opening or a real
+            # commercial CTA so show-jingle vanity URLs are not
+            # promoted as post-rolls.
+            if not (_has_opening_cue(words, _nw_heat, s, e)
+                    or _window_has_strong_commercial(words, _nw_heat, s, e)):
+                continue
+        blocks.append((s, e, f"{method}:{label}"))
+        log(f"  promote edge '{label}': {method} {s:.1f}s-{e:.1f}s ({dur:.0f}s)")
+
     # Mention-span cap (2026-10-27): orphan padding (+-45s) and cluster
     # pause-snapping inflate blocks with surrounding content (Unsubscribe
     # 286: 312s over-cut across 4 blocks). Trim each sponsor-identified
@@ -1992,7 +2217,7 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
             # grown granola/SerpAPI end cannot sit 40–100s past the
             # sign-off.
             ends = [ce for _, ce in edge_cands if ev_end <= ce <= e]
-            if ends and _should_inward_refine_end(e, ev_end, words, nw):
+            if ends and _should_inward_refine_end(e, ev_end, words, nw, l):
                 ne = min(ends)
                 if ne != e:
                     log(f"  refine end '{l}': {e:.0f}s -> {ne:.0f}s")
@@ -2030,6 +2255,7 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     blocks = _inward_refine_ends(
         sorted(blocks), words, nw, edge_cands, listed_sponsors, sponsors,
         tag="post-grow refine end")
+    blocks = _extend_edge_through_leading_gap(sorted(blocks), words, nw)
     blocks = _snap_block_edges(words, nw, silences, sorted(blocks), sponsors)
 
     # Suspect reel (2026-10-22, per the owner): low-confidence candidates
@@ -2109,11 +2335,23 @@ ADISH_PHRASES = [
     ("get", "it", "at"), ("available", "at"),
     ("use", "code"), ("promo", "code"), ("coupon", "code"),
     ("discount", "code"), ("use", "promo"),
+    ("this", "message", "comes", "from"),
+    ("supporters", "include"),
+    ("messages", "from", "our", "sponsors"),
+    ("learn", "more", "at"),
+    ("learn", "more"),
+    ("more", "information"),
+    ("terms", "apply"),
+    ("terms", "and", "conditions"),
+    ("participation", "may", "vary"),
+    ("for", "a", "limited", "time"),
+    ("limited", "time"),
 ]
 ADISH_WORDS = {
     "sponsor", "sponsored", "sponsors", "advertiser", "advertisement",
     "promo", "promocode", "coupon", "discount",
     "www", "http", "https", "dotcom",
+    "underwriting",
 }
 ADISH_TLDS = (".com", ".net", ".org", ".io", ".co", ".tv", ".fm")
 # Return-to-content / topic-shift phrases: a block that already
@@ -2470,6 +2708,10 @@ def _snap_block_edges(words, nw, silences, blocks, sponsors):
             if first_m is not None:
                 cue_hi = max(cue_hi, first_m)
             cue_hi = max(cue_hi, min(e, s + CUE_LOOKBACK))
+            # Host-talk prefixes can run 20–30s before an underwriting
+            # cue (Indicator). Search a bit further; the prefix-is-show
+            # guard below rejects a mid-read cue in ad copy.
+            cue_hi = max(cue_hi, min(e, s + 30.0))
             if first_m is not None and first_m >= s:
                 cue_hi = min(cue_hi, first_m)
         found_cue = False
@@ -2490,7 +2732,34 @@ def _snap_block_edges(words, nw, silences, blocks, sponsors):
                         or _is_mid_sentence(words, s, "start")
                         or _adish_in_window(words, nw, s - ADISH_WINDOW, s, variants))
             opening_like = _long_pause_beside(words, target_s, "start")
-            if mid_like and not opening_like:
+            # Prefix is host/show talk, not ad body: allow the longer
+            # inward jump (underwriting often starts 15–30s after a
+            # leftover early edge). A mid-read "sponsor" in ad copy
+            # still has ad-ish language in the skipped span, so the
+            # 12s cap still holds there.
+            # Only an underwriting cue (not a mid-read "sponsor" /
+            # "brought to you by") may jump more than 12s, and only
+            # when the skipped prefix has no ad-ish language.
+            underwrite_at_cue = any(
+                " ".join(nw[j:j + 8]).startswith(c)
+                for j, w in enumerate(words)
+                if abs(w[0] - target_s) <= 0.6
+                for c in UNDERWRITE_CUES
+            )
+            prefix_is_show = (
+                underwrite_at_cue
+                and not _adish_in_window(words, nw, s, target_s - 1e-6, variants)
+                and not _has_opening_cue(words, nw, s, target_s - 1e-6)
+            )
+            if prefix_is_show and target_s - s <= 45.0:
+                pass  # keep: underwriting cue after host/show talk
+            elif mid_like and not opening_like:
+                found_cue = False
+                target_s = s
+            elif not prefix_is_show:
+                # A later opening in the same pod (Science Vs Tremfya
+                # then "this message comes from Petivity") must not
+                # pull the start inward past the first brand.
                 found_cue = False
                 target_s = s
 
@@ -2850,6 +3119,365 @@ def _method_history_preroll(words):
     return [(ws, we, 'history-prior')]
 
 
+def _cue_index_in(nw, j, cues):
+    """If a cue from `cues` starts at nw[j], return the cue, else None."""
+    for cue in cues:
+        k = len(cue.split())
+        _w = [w.strip(".,!?;:'\"") for w in nw[j:j + k]]
+        if " ".join(_w) == cue:
+            return cue
+    return None
+
+
+def _span_has_host_boundary(tokens):
+    clean = [tok.strip('.,!?;:\'"') for tok in tokens]
+    win = " ".join(clean)
+    if any(p in win for p in HOST_BOUNDARY_PHRASES):
+        return True
+    # "Hey, Lulu here." — host reclaims the mic after a preroll.
+    if clean and clean[0] in ("hey", "hi", "hello") and "here" in clean[1:6]:
+        return True
+    # Show credits / pack-up: "This has been a Comedy Central podcast."
+    if "podcast" in clean and "this has been a" in win:
+        return True
+    return False
+
+
+def _method_underwrite(words, silences):
+    """Method 'underwrite': NPR-style underwriting and 'messages from
+    our sponsors' openings (2026-11-15, DAI edge misses).
+
+    Corroborating vote everywhere; may mark alone only at episode
+    edges (see the edge-promotion pass in detect_ad_blocks). Segment
+    runs from the cue (or the pause just before it) through following
+    ad-like sentences, stopping at a host intro/outro, a topic shift,
+    V4V vocabulary, or 180s.
+    """
+    if not words:
+        return []
+    nw = norm_words(words)
+    sents = _sentence_spans(words, nw)
+    hits = []
+    seen = set()
+    for j in range(len(nw)):
+        if _cue_index_in(nw, j, UNDERWRITE_CUES) is None:
+            continue
+        if j in seen:
+            continue
+        cue_t = words[j][0]
+        # Snap back to the pause/sentence start just before the cue,
+        # but never more than 8s (don't swallow the previous item).
+        start = cue_t
+        for z in reversed(sents):
+            if z[1] <= cue_t + 0.05 and cue_t - z[0] <= 8.0:
+                # Only take the sentence if the cue sits in it
+                if z[0] <= cue_t <= z[1] + 0.05:
+                    start = z[0]
+                break
+        for p_start, p_end in reversed(get_pauses(words, silences)):
+            if p_end <= cue_t and p_end >= cue_t - 8 and (p_end - p_start) >= 0.5:
+                start = p_end
+                break
+        start = max(0.0, start)
+        # Walk forward while the text stays underwriting/ad-like.
+        end = words[min(j + 8, len(words) - 1)][1]
+        rejects = 0
+        for z in sents:
+            if z[1] <= cue_t:
+                continue
+            if z[0] > start + 180.0:
+                break
+            if _span_has_host_boundary(z[2]) or _span_has_shift(z[2]) or _v4vish_near(nw, z[3]):
+                break
+            if (_span_has_open(z[2]) or _span_has_commercial(z[2])
+                    or _span_has_signoff(z[2])
+                    or _span_is_underwrite_body(z[2])
+                    or _span_is_adlike(z[2], set(), {}, {})):
+                end = z[1]
+                rejects = 0
+                # mark words in this sentence so a later cue in the
+                # same break does not start a second overlapping span
+                for k in range(z[3], min(z[3] + max(len(z[2]), 1), len(nw))):
+                    seen.add(k)
+            else:
+                if _underwrite_lookahead_ok(sents, z):
+                    end = z[1]
+                    continue
+                rejects += 1
+                # Preroll/post-roll underwriting often has 2–4
+                # sentences of founder or book-promo copy before the
+                # next CTA (Up First, Radiolab).
+                at_edge = start <= EDGE_MARGIN or z[1] >= words[-1][1] - EDGE_MARGIN
+                if rejects >= (4 if at_edge else 2):
+                    break
+        if end - start < EDGE_MIN_AD_LEN:
+            # still keep a short cue window if the cue itself is near
+            # the start or end — the edge floor is applied later
+            end = max(end, min(words[-1][1], start + EDGE_MIN_AD_LEN))
+        if end - start < 8:
+            continue
+        # Don't invent a span past the episode
+        end = min(end, words[-1][1])
+        hits.append((start, end, "underwrite"))
+        seen.add(j)
+    # Merge overlapping underwrite spans (one break, several cues)
+    hits.sort()
+    merged = []
+    for s, e, l in hits:
+        if merged and s <= merged[-1][1] + 5:
+            ps, pe, pl = merged[-1]
+            merged[-1] = (ps, max(pe, e), pl)
+        else:
+            merged.append((s, e, l))
+    return merged
+
+
+# Lexical hooks for produced spots with no URL and no underwriting cue
+# (Daily Show McDonald's/Coke post-roll). "now at" is only kept when
+# the next token is not a function/time word ("now at this point").
+_EDGE_NOW_AT_STOP = {
+    "this", "that", "the", "a", "an", "my", "our", "your", "his", "her",
+    "its", "their", "time", "point", "least", "most", "home", "work",
+    "school", "night", "last", "first", "all", "some", "any", "which",
+    "what", "when", "where", "how", "here", "there",
+}
+_EDGE_AD_PHRASES = (
+    ("participation", "may", "vary"),
+    ("terms", "apply"),
+    ("terms", "and", "conditions"),
+    ("available", "nationwide"),
+    ("order", "now"),
+    ("shop", "now"),
+    ("buy", "now"),
+    ("learn", "more", "at"),
+    ("for", "a", "limited", "time"),
+    ("limited", "time"),
+    ("that", "deserves", "a"),
+    ("extra", "value", "meal"),
+)
+
+
+
+_WEAK_EDGE_COMMERCIAL = {
+    ("go", "to"), ("visit",), ("check", "out"), ("head", "to"),
+    ("head", "over", "to"), ("learn", "more"), ("sign", "up"),
+}
+
+
+def _edge_commercial_is_weak(tokens):
+    """True when the only commercial evidence is a directional CTA
+    with no spoken URL or stronger promo language."""
+    clean = [tok.strip('.,!?;:\'"').lower() for tok in tokens]
+    tlds = {s.lstrip(".") for s in ADISH_TLDS}
+    for i, tok in enumerate(clean):
+        raw = tokens[i] if i < len(tokens) else tok
+        if any(s in (raw or "").lower() for s in ADISH_TLDS):
+            return False
+        if tok in tlds and i > 0 and clean[i - 1] == "dot":
+            return False
+        if tok in ADISH_WORDS or tok == "slash":
+            return False
+        for ph in ADISH_PHRASES:
+            if tuple(clean[i:i + len(ph)]) == ph and ph not in _WEAK_EDGE_COMMERCIAL:
+                return False
+    return True
+
+
+def _edge_sentence_is_produced(tokens):
+    """True if a sentence looks like a produced spot, not host talk."""
+    if _span_is_show_contact(tokens) or _span_has_host_boundary(tokens):
+        return False
+    if _span_has_open(tokens, extras=False):
+        return True
+    # "why go to Google?" is ordinary show talk; 'go to' / 'visit' /
+    # 'learn more' only count as produced with a URL or stronger CTA.
+    if _span_has_commercial(tokens) and not _edge_commercial_is_weak(tokens):
+        return True
+    clean = [tok.strip('.,!?;:\'"').lower() for tok in tokens]
+    for i, tok in enumerate(clean):
+        for ph in _EDGE_AD_PHRASES:
+            if tuple(clean[i:i + len(ph)]) == ph:
+                return True
+        if (tok in ("now", "only") and i + 1 < len(clean) and clean[i + 1] == "at"
+                and (i + 2 >= len(clean) or clean[i + 2] not in _EDGE_NOW_AT_STOP)):
+            return True
+        # Product lockups in URL-less post-rolls (Daily Show Coke).
+        if tok in ("coca", "coca-cola", "mcdonalds", "mcdonald"):
+            return True
+    return False
+
+
+def _method_edge_adlike(words, silences):
+    """Method 'edge': produced-ad language at the episode start or end.
+
+    Corroborating vote only in the first/last EDGE_MARGIN seconds, so
+    mid-episode show talk cannot seed a block. Marks alone only via
+    the edge-promotion pass, and only when the span is strongly
+    ad-like (underwriting is handled by _method_underwrite; this
+    covers URL-less product spots and disclaimer tails).
+    """
+    if not words:
+        return []
+    nw = norm_words(words)
+    ep_end = words[-1][1]
+    # Trailers and short unit-test clips have no distinct 90s edge.
+    if ep_end < 180.0:
+        return []
+    sents = _sentence_spans(words, nw)
+    results = []
+
+    def _sent_v4v(tokens):
+        win = " ".join(tok.strip('.,!?;:\'"') for tok in tokens)
+        if any(p in win for p in (
+                "no sponsors", "no product placement", "no ads",
+                "fighting for value", "fightin' for value", "fightin for value",
+                "there are no ad")):
+            return True
+        for tok in tokens:
+            if tok in _V4VISH_NEAR or "donat" in tok or "boostagram" in tok:
+                return True
+        return False
+
+    for region in ((0.0, min(EDGE_MARGIN, ep_end)),
+                   (max(0.0, ep_end - EDGE_MARGIN), ep_end)):
+        rs, re = region
+        # Seed on produced sentences. Fill forward (and only a tight
+        # <=2s step backward) so credits in the last 90s are not
+        # swallowed (Daily Show was briefly marked 1953–2043).
+        def _v4v_just_behind(z, window=25.0):
+            for z2 in sents:
+                if z2[1] > z[0] + 0.05:
+                    continue
+                if z[0] - z2[1] > window:
+                    continue
+                if _sent_v4v(z2[2]) or _v4vish_near(nw, z2[3]):
+                    return True
+            return False
+
+        def _host_outro_ahead(z, window=90.0):
+            for z2 in sents:
+                if z2[0] < z[1] - 0.05:
+                    continue
+                if z2[0] > z[1] + window:
+                    break
+                if _span_has_host_boundary(z2[2]):
+                    return True
+            return False
+
+        def _produced_beyond_url(tokens):
+            if _span_has_open(tokens, extras=False):
+                return True
+            clean = [tok.strip('.,!?;:\'"').lower() for tok in tokens]
+            for i, tok in enumerate(clean):
+                for ph in _EDGE_AD_PHRASES:
+                    if tuple(clean[i:i + len(ph)]) == ph:
+                        return True
+                if tok in ("coca", "coca-cola", "mcdonalds", "mcdonald"):
+                    return True
+            return False
+
+        seeds = []
+        for z in sents:
+            in_reg = z[1] >= rs and z[0] <= re
+            produced = (_edge_sentence_is_produced(z[2])
+                        and not _sent_v4v(z[2])
+                        and not _span_has_host_boundary(z[2])
+                        and not _v4vish_near(nw, z[3])
+                        and not _v4v_just_behind(z))
+            # A guest show-URL just before "tune in next time" is an
+            # outro plug, not a post-roll (V4V roundtable).
+            if produced and not _produced_beyond_url(z[2]) and _host_outro_ahead(z):
+                produced = False
+            if in_reg and produced:
+                seeds.append(z)
+        groups = []
+        for seed in seeds:
+            if groups and seed[0] - groups[-1][-1][1] <= 8.0:
+                last_end = groups[-1][-1][1]
+                for z in sents:
+                    if last_end < z[0] < seed[0] and not (
+                            _sent_v4v(z[2]) or _span_has_host_boundary(z[2])
+                            or _v4vish_near(nw, z[3])):
+                        groups[-1].append(z)
+                    elif z[0] >= seed[0]:
+                        break
+                groups[-1].append(seed)
+            else:
+                groups.append([seed])
+        for cluster in groups:
+            ce = cluster[-1][1]
+            last_prod = cluster[-1][1]
+            for z in sents:
+                if z[0] <= ce:
+                    continue
+                if z[0] > re:
+                    break
+                if z[1] < rs:
+                    continue
+                if (_sent_v4v(z[2]) or _span_has_host_boundary(z[2])
+                        or _v4vish_near(nw, z[3])):
+                    break
+                if z[0] - ce <= 8.0:
+                    produced_z = _edge_sentence_is_produced(z[2])
+                    # Don't walk a minute of sign-offs after a show
+                    # URL (V4V roundtable lightningthrashes.com).
+                    # Allow a short non-produced tail so "that deserves
+                    # a..." between Daily Show product lines is kept.
+                    if not produced_z and z[0] - last_prod > 20.0:
+                        break
+                    cluster.append(z)
+                    ce = z[1]
+                    if produced_z:
+                        last_prod = z[1]
+                else:
+                    break
+            # Tight backward only: same-read continuation, not credits.
+            cs = cluster[0][0]
+            for z in reversed(sents):
+                if z[1] >= cs:
+                    continue
+                if z[1] < rs:
+                    break
+                if (_sent_v4v(z[2]) or _span_has_host_boundary(z[2])
+                        or _v4vish_near(nw, z[3]) or _span_is_show_contact(z[2])):
+                    break
+                if cs - z[1] <= 2.0 and _edge_sentence_is_produced(z[2]):
+                    cluster.insert(0, z)
+                    cs = z[0]
+                else:
+                    break
+            s, e = max(cluster[0][0], rs), min(cluster[-1][1], re)
+            if ep_end - e <= 30.0 and e < ep_end:
+                e = ep_end
+            # Music bed after the host sign-off (Science Vs post-roll).
+            # Include at most one tight (<=2s) preceding sentence of the
+            # same read, then snap back through a wordless >=5s gap.
+            # Do not walk a chain of speech (Athletic Verizon before Gemini).
+            if ((s >= ep_end - EDGE_MARGIN or e >= ep_end - 30.0)
+                    and not any(_span_has_open(z[2]) for z in cluster)):
+                t0 = s
+                prevs = [z for z in sents if z[1] <= t0 + 0.05]
+                if prevs and t0 - prevs[-1][1] <= 2.0 and not _span_has_host_boundary(prevs[-1][2]):
+                    t0 = prevs[-1][0]
+                    prevs = [z for z in sents if z[1] <= t0 + 0.05]
+                if prevs and t0 - prevs[-1][1] >= 5.0 and not any(
+                        prevs[-1][1] < w[0] < t0 for w in words):
+                    s = prevs[-1][1]
+            if e - s >= EDGE_MIN_AD_LEN - 0.6:
+                results.append((s, e, "edge-ad"))
+
+    # Merge overlaps
+    results.sort()
+    merged = []
+    for s, e, l in results:
+        if merged and s <= merged[-1][1] + 3:
+            ps, pe, pl = merged[-1]
+            merged[-1] = (ps, max(pe, e), pl)
+        else:
+            merged.append((s, e, l))
+    return merged
+
+
 def _method_cta(words, sponsors, silences, own_domains=None):
     """Method 'cta': Generic URL/promo-code CTA detection.
     Returns [(start, end, label)] independently."""
@@ -2897,21 +3525,70 @@ def _method_url(words, silences, own_domains=None):
     positions = find_bare_urls(nw, own_domains)
     if not positions:
         return []
+    sents = _sentence_spans(words, nw)
+    filtered = []
+    for brand, idx in positions:
+        t0 = words[idx][0]
+        contact = False
+        for z in sents:
+            if z[0] <= t0 <= z[1] and _span_is_show_contact(z[2]):
+                contact = True
+                break
+        if not contact and not _v4vish_near(nw, idx):
+            filtered.append((brand, idx))
+    positions = filtered
+    if not positions:
+        return []
     pauses = get_pauses(words, silences)
     # Group positions within 60s (a spot repeats its URL twice, and a
     # spelled-out URL yields fragment stems like 'filter' from
     # 'L-E-A-F filter .com' — the first brand in the group names it).
+    # Group by brand (or close stem). Mixing Dell + Granger + Apollo
+    # because their URLs fall within 60s glued a 2-minute preroll and
+    # the 45s lookback then started at t=0 (Athletic, DAI).
+    def _url_stem(b):
+        return re.sub(r"[^a-z0-9]", "", (b or "").lower())
+
     groups = []
     for brand, idx in positions:
         t = words[idx][0]
-        if groups and t - groups[-1][-1][1] <= 60:
-            groups[-1].append((brand, t))
-        else:
+        stem = _url_stem(brand)
+        placed = False
+        if groups:
+            prev_brand, prev_t = groups[-1][-1][0], groups[-1][-1][1]
+            same = stem == _url_stem(prev_brand) or (
+                stem and _url_stem(prev_brand)
+                and (stem in _url_stem(prev_brand) or _url_stem(prev_brand) in stem)
+            )
+            if same and t - prev_t <= 60:
+                groups[-1].append((brand, t))
+                placed = True
+        if not placed:
             groups.append([(brand, t)])
     results = []
+    prev_end = None
     for g in groups:
         brand = g[0][0]
         start, end = g[0][1] - 45.0, g[-1][1] + 10.0
+        # Do not look back through a previous other-brand URL group.
+        if prev_end is not None:
+            start = max(start, prev_end)
+        # If a long pause sits between the clamped start and the first
+        # URL, the pause is the produced-spot boundary (Dell ends, then
+        # Granger begins). Mid-ad short pauses are ignored by the 1.2s
+        # floor; a pause after an opening cue is kept only if it is
+        # also after prev_end.
+        first_url_t = g[0][1]
+        # Only clamp to a pre-URL pause when a previous other-brand
+        # group ended nearby (Dell then Granger). Mid-read stutters
+        # ("a, a, a" before fly .io) must not eat the 45s lookback.
+        late_pause = None
+        if prev_end is not None and first_url_t - prev_end <= 60.0:
+            for ps, pe in pauses:
+                if pe <= first_url_t - 1.0 and ps >= start and (pe - ps) >= 1.2:
+                    late_pause = pe
+            if late_pause is not None:
+                start = max(start, late_pause, prev_end)
         for ps, pe in pauses:
             if ps >= start and ps - start <= 10.0:
                 start = ps
@@ -2921,9 +3598,11 @@ def _method_url(words, silences, own_domains=None):
                 end = pe
                 break
         start = max(0.0, start)
-        if not (20 <= end - start <= 180):
+        if not (EDGE_MIN_AD_LEN <= end - start <= 180):
+            prev_end = max(prev_end or 0.0, end)
             continue
         results.append((start, end, brand))
+        prev_end = end
     return results
 
 
@@ -2933,7 +3612,10 @@ def _method_brand(words, sponsors, silences):
     nw = norm_words(words)
     results = []
     for sp in sponsors:
-        hits = find_mentions(nw, sp["variants"])
+        variants = _usable_variants(sp.get("variants") or set(), sp.get("label") or "")
+        if not variants:
+            continue
+        hits = find_mentions(nw, variants)
         if not hits:
             continue
         seg = _expand_segment(words, nw, silences, hits, sp["label"])
@@ -2954,27 +3636,55 @@ def _method_brand_orphan(words, sponsors, silences):
     pauses = get_pauses(words, silences)
     results = []
     for sp in sponsors:
-        hits = find_mentions(nw, sp["variants"])
+        variants = _usable_variants(sp.get("variants") or set(), sp.get("label") or "")
+        if not variants:
+            continue
+        hits = find_mentions(nw, variants)
         if not hits:
             continue
         if _expand_segment(words, nw, silences, hits, sp["label"]):
             continue  # the full brand method already handles it
         times = sorted(words[i][0] for i in hits)
-        start, end = max(0.0, times[0] - 45.0), times[-1] + 45.0
-        # snap to nearby pauses, never into neighboring content
-        for ps, pe in pauses:
-            if ps >= start and ps - start <= 6.0:
-                start = ps
-                break
-        for ps, pe in reversed(pauses):
-            if pe <= end and end - pe <= 6.0:
-                end = pe
-                break
-        if not (MIN_AD_LEN <= end - start <= MAX_AD_LEN):
-            continue
-        results.append((start, end, f"brand-orphan:{sp['label']}"))
-        log(f"  brand-orphan '{sp['label']}': {start:.1f}s-{end:.1f}s "
-            f"({len(hits)} mentions, no opening cue)")
+        # Do not span first-mention to last-mention across minutes of
+        # show talk (oracle brand "Made" used to cover 155–729s).
+        groups_t, gap = [], 90.0
+        for tm in times:
+            if groups_t and tm - groups_t[-1][-1] <= gap:
+                groups_t[-1].append(tm)
+            else:
+                groups_t.append([tm])
+        for times in groups_t:
+            start, end = max(0.0, times[0] - 45.0), times[-1] + 45.0
+            # Prefer a long pause just before the first mention / just
+            # after the last one so a 45s pad does not swallow a neighboring
+            # produced spot (Athletic: Granger orphan 0–85 covered Dell and
+            # Apollo). The padded-edge 6s snap below is kept as a fallback.
+            late_before = None
+            for ps, pe in pauses:
+                if pe <= times[0] - 0.3 and ps >= start and (pe - ps) >= 1.2:
+                    late_before = pe
+            if late_before is not None:
+                start = late_before
+            early_after = None
+            for ps, pe in pauses:
+                if ps >= times[-1] + 0.3 and pe <= end and (pe - ps) >= 1.2:
+                    early_after = ps
+                    break
+            if early_after is not None:
+                end = early_after
+            for ps, pe in pauses:
+                if ps >= start and ps - start <= 6.0:
+                    start = ps
+                    break
+            for ps, pe in reversed(pauses):
+                if pe <= end and end - pe <= 6.0:
+                    end = pe
+                    break
+            if not (MIN_AD_LEN <= end - start <= MAX_AD_LEN):
+                continue
+            results.append((start, end, f"brand-orphan:{sp['label']}"))
+            log(f"  brand-orphan '{sp['label']}': {start:.1f}s-{end:.1f}s "
+                f"({len(hits)} mentions, no opening cue)")
     return results
 
 
@@ -2986,7 +3696,10 @@ def _method_cluster(words, sponsors, silences):
     nw = norm_words(words)
     results = []
     for sp in sponsors:
-        hits = find_mentions(nw, sp["variants"])
+        variants = _usable_variants(sp.get("variants") or set(), sp.get("label") or "")
+        if not variants:
+            continue
+        hits = find_mentions(nw, variants)
         if not hits:
             continue
         times = [words[h][0] for h in hits]
@@ -3528,11 +4241,14 @@ _COMMERCIAL_NEAR = (
     ("percent", "off"), ("brought", "to", "you"), ("sponsored", "by"),
     ("our", "sponsor"), ("get", "started"), ("learn", "more"),
     ("slash",),
+    ("this", "message", "comes"),
+    ("messages", "from", "our", "sponsors"),
+    ("supporters", "include"),
 )
 _V4VISH_NEAR = (
     "donation", "donations", "donate", "boostagram", "boostagrams",
     "boost", "boosts", "sats", "satoshis", "sat", "patreon",
-    "value4value",
+    "value4value", "valueverse",
 )
 
 
@@ -3557,7 +4273,14 @@ def _v4vish_near(nw, i, radius=40):
         if tuple(span[j:j + 3]) in (("value", "for", "value"),
                                     ("time", "talent", "treasure"),
                                     ("executive", "producer"),
-                                    ("associate", "producer")):
+                                    ("associate", "producer"),
+                                    ("no", "product", "placement"),
+                                    ("fighting", "for", "value"),
+                                    ("fightin", "for", "value")):
+            return True
+    for j in range(len(span) - 1):
+        if tuple(span[j:j + 2]) in (("no", "sponsors"), ("no", "ads"),
+                                    ("no", "advertisements")):
             return True
     return False
 
@@ -3618,7 +4341,8 @@ def _expand_url_tail(words, silences, url_idx, lookback=75.0, lookahead=15.0):
 
 def _is_lexical_label(label):
     lab = (label or "").lower()
-    return any(k in lab for k in ("cta", "url", "brand", "chapter", "cluster"))
+    return any(k in lab for k in ("cta", "url", "brand", "chapter", "cluster",
+                                  "underwrite", "edge"))
 
 
 def _brand_stem_from_label(label):
@@ -3634,6 +4358,102 @@ _GENERIC_STEMS = {
     "website", "site", "page", "offer", "offers",
 }
 
+# Single-token variants that match ordinary speech. Oracle brand names
+# from truncated DAI labels ("Made", "John") would otherwise mention-
+# match for minutes and grow start error into the hundreds of seconds.
+# Known popular-brand stems (indeed, factor, seed, aura, mint, …) are
+# re-allowed in _usable_variants.
+_COMMON_VARIANT_STEMS = {
+    "made", "make", "making", "makes", "john", "work", "works",
+    "working", "worker", "workers", "just", "like", "also", "from",
+    "with", "this", "that", "have", "been", "will", "your", "their",
+    "they", "them", "than", "then", "what", "when", "where", "which",
+    "while", "some", "more", "most", "many", "much", "very", "even",
+    "only", "back", "well", "good", "great", "best", "new", "old",
+    "year", "years", "time", "times", "day", "days", "way", "ways",
+    "part", "parts", "home", "house", "life", "live", "lives", "world",
+    "family", "children", "child", "school", "story", "stories",
+    "first", "last", "next", "into", "over", "under", "after",
+    "before", "because", "through", "around", "between", "without",
+    "another", "being", "doing", "those", "these", "each", "both",
+    "same", "such", "own", "too", "really", "actually", "always",
+    "never", "still", "going", "come", "came", "know", "think",
+    "want", "need", "look", "use", "used", "using", "get", "got",
+    "getting", "see", "seen", "say", "said", "went", "take", "took",
+    "give", "given", "help", "helps", "call", "called", "find",
+    "found", "keep", "kept", "tell", "told", "try", "trying", "start",
+    "started", "stop", "play", "talk", "talking", "listen", "listening",
+    "support", "supporting", "supported", "material", "security",
+    "one", "shield", "guard", "plan", "eats", "news", "notes", "media",
+    "official", "free", "shop", "today", "sports",
+    # common first names that show up as truncated oracle brands
+    "adam", "alex", "andy", "ann", "anna", "ben", "bill", "bob",
+    "brian", "chris", "dan", "daniel", "dave", "david", "emma",
+    "eric", "evan", "george", "greg", "jack", "james", "jane",
+    "jason", "jeff", "jim", "joe", "john", "josh", "justin", "kevin",
+    "kyle", "lisa", "mark", "mary", "matt", "mike", "nick", "paul",
+    "peter", "robert", "ryan", "sam", "sarah", "scott", "sean",
+    "steve", "tim", "tom", "tony", "tyler", "william",
+}
+
+_STRONG_COMMERCIAL_PHRASES = (
+    "use code", "promo code", "coupon code", "discount code",
+    "free trial", "sponsored by", "brought to you", "our sponsor",
+    "percent off", "learn more at", "this message comes",
+    "messages from our sponsors", "supporters include",
+    "for a limited time", "presented by",
+)
+
+
+def _popular_variant_stems():
+    stems = set()
+    for pb in POPULAR_BRANDS:
+        stems.add(re.sub(r"[^a-z0-9]", "", (pb.get("label") or "").lower()))
+        for v in pb.get("variants") or []:
+            stems.add(re.sub(r"[^a-z0-9]", "", v.lower()))
+    return stems
+
+
+def _usable_variants(variants, label=""):
+    """Drop generic single-token stems unless they are a known brand."""
+    popular = _popular_variant_stems()
+    lab = re.sub(r"[^a-z0-9]", "", (label or "").split(":")[-1].lower())
+    out = set()
+    for v in variants or []:
+        v = (v or "").strip().lower()
+        if not v:
+            continue
+        if len(v.split()) >= 2:
+            out.add(v)
+            continue
+        stem = re.sub(r"[^a-z0-9]", "", v)
+        if not stem:
+            continue
+        if stem in popular or lab in popular:
+            out.add(v)
+            continue
+        if (stem in _COMMON_VARIANT_STEMS or stem in _GENERIC_STEMS
+                or stem in _AUTO_SPONSOR_SKIP):
+            continue
+        out.add(v)
+    return out
+
+
+def _window_has_strong_commercial(words, nw, t0, t1):
+    """Promo/underwriting language, not merely a spoken TLD or 'slash'."""
+    lo = 0
+    for i, w in enumerate(words):
+        if w[1] >= t0:
+            lo = i
+            break
+    hi = lo
+    for i, w in enumerate(words[lo:], lo):
+        if w[0] > t1:
+            break
+        hi = i + 1
+    span = " ".join(nw[lo:hi])
+    return any(p in span for p in _STRONG_COMMERCIAL_PHRASES)
+
 
 def _growth_brand_blocked(stem, label=""):
     """Hard block: do not grow this fragment at all."""
@@ -3642,6 +4462,10 @@ def _growth_brand_blocked(stem, label=""):
     # code-itm20) are a soft block: they may still grow with the 60s
     # cap, but the stem is not used as a brand (see
     # `_growth_stem_is_generic`).
+    # Underwrite/edge blocks often carry a garbage stem ('-cookware',
+    # 'underwrite') but still need to grow out to the full break.
+    if "underwrite" in (label or "").lower() or (label or "").lower().startswith("edge"):
+        return False
     if raw.startswith("-"):
         return True
     if not stem or stem in _AUTO_SPONSOR_SKIP or stem in _GENERIC_STEMS:
@@ -3713,9 +4537,17 @@ def _cosine_bow(a, b):
     return num / (da * db)
 
 
-def _span_has_open(tokens):
+def _span_has_open(tokens, extras=True):
+    """True if this span contains an ad-opening cue.
+
+    Growth extras ('what's up', 'i'm here') are for walking a confirmed
+    fragment, not for seeding an episode-edge block (V4V theme songs
+    and roundtable intros were marked as prerolls).
+    """
     win = " ".join(tokens)
-    if any(c in win for c in OPEN_CUES) or any(c in win for c in _GROW_OPEN_EXTRA):
+    if any(c in win for c in OPEN_CUES):
+        return True
+    if extras and any(c in win for c in _GROW_OPEN_EXTRA):
         return True
     return False
 
@@ -3741,9 +4573,14 @@ def _opening_cue_time(words, z):
 
 
 def _span_has_shift(tokens):
+    """Topic-shift phrases with a word boundary, so 'ok back' does not
+    match 'look back' (that false hit split the Granola mid-roll)."""
+    import re as _re
     win = " ".join(tokens)
-    return any(p in win for p in TOPIC_SHIFT_PHRASES) or any(
-        p in win for p in RETURN_CUES)
+    for p in list(TOPIC_SHIFT_PHRASES) + list(RETURN_CUES):
+        if _re.search(r"(^|[^a-z])" + _re.escape(p) + r"([^a-z]|$)", win):
+            return True
+    return False
 
 
 def _span_has_signoff(tokens):
@@ -3762,12 +4599,76 @@ def _span_has_brand(tokens, brands):
 
 
 def _span_has_commercial(tokens):
-    for i, tok in enumerate(tokens):
+    clean = [tok.strip(".,!?;:'\"") for tok in tokens]
+    for i, tok in enumerate(clean):
         for ph in ADISH_PHRASES:
-            if tuple(tokens[i:i + len(ph)]) == ph:
+            if tuple(clean[i:i + len(ph)]) == ph:
                 return True
+        raw = tokens[i] if i < len(tokens) else tok
         if tok in ADISH_WORDS or tok == "slash":
             return True
+        if any(s in (raw or "").lower() for s in ADISH_TLDS):
+            return True
+        if (tok in {s.lstrip(".") for s in ADISH_TLDS}
+                and i and clean[i - 1] == "dot"):
+            return True
+    return False
+
+
+
+def _underwrite_lookahead_ok(sents, current, max_look=3):
+    """True if underwriting/commercial language resumes in the next few sentences.
+
+    Lets founder-story or book-blurb sentences stay in the break when a
+    CTA or another 'this message comes from' is just ahead (Up First,
+    Radiolab 'now in paperback').
+    """
+    try:
+        idx = sents.index(current)
+    except ValueError:
+        return False
+    for z in sents[idx + 1:idx + 1 + max_look]:
+        if _span_has_host_boundary(z[2]) or _span_has_shift(z[2]):
+            return False
+        if (_span_has_open(z[2]) or _span_has_commercial(z[2])
+                or _span_has_signoff(z[2]) or _span_is_underwrite_body(z[2])):
+            return True
+    return False
+
+
+def _span_is_underwrite_body(tokens):
+    """Produced underwriting copy after 'this message comes from'.
+
+    Founder stories, 'learn more at', and 2nd-person sales are the
+    body of the spot but often have no CTA phrase, so the generic
+    ad-like check stops after two sentences and underwrite blocks
+    stay 16s long (Up First).
+    """
+    if not tokens:
+        return False
+    if _span_has_open(tokens) or _span_has_commercial(tokens) or _span_has_signoff(tokens):
+        return True
+    # Host teasers have a high you-rate ("stay with us", "start your day")
+    # and must not look like underwriting body, or backward growth walks
+    # into the previous news block (Up First 31–49).
+    _teaser_win = " ".join(tok.strip(".,!?;:") for tok in tokens)
+    if any(p in _teaser_win for p in (
+            "stay with us", "start your day", "after the break",
+            "more after this", "got news")):
+        return False
+    clean = [tok.strip('.,!?;:\'"') for tok in tokens]
+    win = " ".join(clean).replace(" -", "-").replace("- ", "-")
+    if any(p in win for p in (
+            "co-founder", "co founder", "founder of", "i founded",
+            "learn more", "more information", "terms apply",
+            "terms and conditions", "what's in your", "whats in your",
+            "now in paperback", "best-seller", "best seller",
+            "publishers of", "new york times best",
+            "invest your way")):
+        return True
+    # Do not use a bare 2nd-person rate: "if you have a mortgage"
+    # (Indicator) and "we want to hear from you" (Crime Junkie tip
+    # line) would keep growing into the show.
     return False
 
 
@@ -3848,16 +4749,20 @@ def _grow_confirmed_fragments(words, nw, silences, blocks, max_grow=_GROW_MAX):
                      for i, w in enumerate(words) if s <= w[0] <= e]
         frag_bow = _bow(frag_toks)
         ns, ne = s, e
+        uw = "underwrite" in l.lower()
         # Walk back
         before = [z for z in sents if z[1] <= s + 0.05 and z[0] >= s - max_grow]
         accepted, rejects, saw_stop = [], 0, False
         saw_open, saw_shift = False, False
         for z in reversed(before):
-            if _span_has_shift(z[2]) or _v4vish_near(nw, z[3]):
-                saw_shift = _span_has_shift(z[2])
+            if (_span_has_shift(z[2]) or _span_has_host_boundary(z[2])
+                    or _v4vish_near(nw, z[3])):
+                saw_shift = _span_has_shift(z[2]) or _span_has_host_boundary(z[2])
                 saw_stop = True
                 break
-            if _span_is_adlike(z[2], brands, frag_bow, bg_bow):
+            is_ad = (_span_is_adlike(z[2], brands, frag_bow, bg_bow)
+                     or (uw and _span_is_underwrite_body(z[2])))
+            if is_ad:
                 if _span_has_open(z[2]):
                     cue_t = _opening_cue_time(words, z)
                     accepted.append((cue_t, z[1], z[2], z[3]))
@@ -3869,6 +4774,8 @@ def _grow_confirmed_fragments(words, nw, silences, blocks, max_grow=_GROW_MAX):
                 if _span_has_brand(z[2], brands):
                     saw_stop = True  # keep walking toward the first mention
             else:
+                # Do not look ahead when walking backward: a teaser or
+                # later cue would pull show talk into the start.
                 rejects += 1
                 if rejects >= 2:
                     saw_stop = True
@@ -3882,14 +4789,27 @@ def _grow_confirmed_fragments(words, nw, silences, blocks, max_grow=_GROW_MAX):
         accepted_f, rejects, saw_stop_f = [], 0, False
         saw_signoff, saw_shift_f = False, False
         for z in after:
-            if _span_has_shift(z[2]) or _v4vish_near(nw, z[3]):
-                saw_shift_f = _span_has_shift(z[2])
+            if (_span_has_shift(z[2]) or _span_has_host_boundary(z[2])
+                    or _v4vish_near(nw, z[3])):
+                saw_shift_f = _span_has_shift(z[2]) or _span_has_host_boundary(z[2])
                 saw_stop_f = True
                 break
             if accepted_f and _span_has_open(z[2]):
+                # A mid-roll "brought to you by Y" after we have left
+                # the fragment is the next ad. Chained underwriting
+                # cues ("this message comes from Capital One" after
+                # Made in Cookware) are the same break and must be
+                # kept (Up First 55–127).
+                win = " ".join(z[2])
+                if uw and any(c in win for c in UNDERWRITE_CUES):
+                    accepted_f.append(z)
+                    rejects = 0
+                    continue
                 saw_stop_f = True
                 break
-            if _span_is_adlike(z[2], brands, frag_bow, bg_bow):
+            is_ad = (_span_is_adlike(z[2], brands, frag_bow, bg_bow)
+                     or (uw and _span_is_underwrite_body(z[2])))
+            if is_ad:
                 accepted_f.append(z)
                 rejects = 0
                 if _span_has_signoff(z[2]):
@@ -3897,8 +4817,11 @@ def _grow_confirmed_fragments(words, nw, silences, blocks, max_grow=_GROW_MAX):
                     saw_stop_f = True
                     break
             else:
+                if uw and _underwrite_lookahead_ok(sents, z):
+                    accepted_f.append(z)
+                    continue
                 rejects += 1
-                if rejects >= 2:
+                if rejects >= (4 if uw else 2):
                     saw_stop_f = True
                     break
         if accepted_f:
@@ -4025,6 +4948,14 @@ def _merge_lexical_pods(blocks, max_gap=90.0, words=None, nw=None, soft_gap=180.
                 # over-grown start off the next ad). Touching / 2s
                 # gaps still join.
                 merge = _gap_is_adlike(words, nw, sents, bg_bow, pe, s, brands)
+                # Mid-roll brand-change handoff (Acorns then Chime,
+                # ~5s, no full sentence in the gap): _gap_is_adlike is
+                # False on an empty gap, but this is still one pod.
+                # Do not use this at episode edges, where we just
+                # split back-to-back produced spots (Dell | Apollo).
+                if (not merge and gap <= 8.0 and words
+                        and not (ps <= EDGE_MARGIN or e >= words[-1][1] - EDGE_MARGIN)):
+                    merge = not _gap_has_content_boundary(sents, pe, s, brands)
             else:
                 merge = True
         elif can and sents and 0 < gap <= soft_gap:
@@ -4049,7 +4980,7 @@ def _split_glued_midrolls(words, nw, blocks, min_part=30.0):
     sents = _sentence_spans(words, nw)
     out = []
     for s, e, l in blocks:
-        if not _is_lexical_label(l) or (e - s) < 90.0:
+        if not _is_lexical_label(l) or (e - s) < 50.0:
             out.append((s, e, l))
             continue
         inner = [z for z in sents if z[0] >= s - 0.05 and z[1] <= e + 0.05]
@@ -4090,9 +5021,35 @@ def _split_glued_midrolls(words, nw, blocks, min_part=30.0):
                         break
                 if split_at:
                     break
+        # Back-to-back produced spots at episode edges: a new opening
+        # cue after a pause, not an "also brought to you by" same-pod
+        # handoff. Athletic preroll was Dell + Granger + "this episode
+        # is brought to you by Apollo" as one 0–86s block. Mid-roll
+        # multi-brand pods (Science Vs Tremfya+Petivity, Crime Junkie
+        # Acorns+Chime) must stay one block — splitting them dropped
+        # coverage under 50% of the GT span.
+        ep_end = words[-1][1] if words else e
+        at_edge = s <= EDGE_MARGIN or e >= ep_end - EDGE_MARGIN
+        if split_at is None and at_edge and (e - s) >= 50.0:
+            for i, z in enumerate(inner):
+                if z[0] < s + 12 or z[1] > e - 12:
+                    continue
+                if not _span_has_open(z[2]):
+                    continue
+                win = " ".join(z[2])
+                if "also brought" in win or "episode is also" in win:
+                    continue
+                prev_end = inner[i - 1][1] if i else s
+                gap = z[0] - prev_end
+                if gap < 1.2:
+                    continue
+                cue_t = _opening_cue_time(words, z)
+                if cue_t - s >= min(min_part, 15.0) and e - cue_t >= min(min_part, 15.0):
+                    split_at = (prev_end, cue_t)
+                    break
         if (split_at and split_at[1] >= split_at[0]
-                and split_at[0] - s >= min_part
-                and e - split_at[1] >= min_part):
+                and split_at[0] - s >= min(min_part, 15.0)
+                and e - split_at[1] >= min(min_part, 15.0)):
             log(f"  split glued mid-rolls '{l}': {s:.0f}s-{e:.0f}s -> "
                 f"{s:.0f}s-{split_at[0]:.0f}s + {split_at[1]:.0f}s-{e:.0f}s")
             out.append((s, split_at[0], l))

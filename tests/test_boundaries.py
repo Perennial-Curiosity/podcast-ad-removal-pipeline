@@ -230,3 +230,48 @@ def test_truncated_end_not_pulled_inward_to_early_signoff():
     assert e - thanks_t > 6.0
     (ns, ne, _), = rp._snap_block_edges(words, nw, [], [(s, e, "x:ad")], [])
     assert ne >= e - 6.0, (ne, e, thanks_t)
+
+
+def test_show_talk_prefix_snaps_inward_to_underwrite_cue():
+    """A start sitting in show talk 20s before 'this message comes from'
+    should jump to the cue; a mid-read start must still not."""
+    pre = seq("the average interest rate for a thirty year mortgage is going "
+              "up again this week and home buyers are noticing it now "
+              "because payments on a new loan cost more than they used "
+              "to just a couple of years ago in this market.", 0)
+    ad = seq("this message comes from eighty thousand hours. they want to "
+             "help you find work that stays relevant. learn more at "
+             "eightythousandhours.org slash npr today.",
+             pre[-1][1] + 1.0)
+    words = pre + ad
+    nw = rp.norm_words(words)
+    # sloppy early start ~22s before the cue, in show talk
+    s = pre[2][0] + 0.05
+    e = ad[-1][1]
+    cue_t = [w[0] for w in ad if "message" in w[2]][0]
+    assert cue_t - s > 12.0, (cue_t, s)
+    (ns, ne, _), = rp._snap_block_edges(words, nw, [], [(s, e, "url:eighty")], [])
+    assert ns >= cue_t - 1.5, (ns, cue_t, s)
+    assert ns <= cue_t + 0.5, (ns, cue_t)
+
+
+def test_later_underwrite_cue_does_not_trim_earlier_brand():
+    """Tremfya body then 'this message comes from Petivity' must not
+    snap the start inward 70s to the second brand's cue."""
+    body = ("tremfya helps with plaque psoriasis and your doctor can "
+            "tell you more about whether it is right for you today. ")
+    first = seq(body * 8 +
+                "go to tremfya dot com slash podcast for full safety info.",
+                0)
+    second = seq("this message comes from petivity. petivity monitors the "
+                 "litter box every day. learn more at petivity dot com.",
+                 first[-1][1] + 2.0)
+    words = first + second
+    nw = rp.norm_words(words)
+    s = first[0][0]
+    e = second[-1][1]
+    cue_t = [w[0] for w in second if "message" in w[2]][0]
+    assert cue_t - s > 45.0, (cue_t, s)
+    (ns, ne, _), = rp._snap_block_edges(words, nw, [], [(s, e, "url:petivity")], [])
+    assert ns <= first[2][0] + 1.0, (ns, cue_t, s)
+    assert ns < cue_t - 20.0, (ns, cue_t)

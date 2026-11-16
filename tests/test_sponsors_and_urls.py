@@ -540,3 +540,369 @@ def test_sponsoring_signoff_does_not_block_end_refine():
     e = show[-1][1]
     assert (e - ev) > 30.0
     assert rp._should_inward_refine_end(e, ev, words, nw), (ev, e)
+
+
+def test_underwrite_cues_are_opening_cues():
+    for cue in (
+        "this message comes from",
+        "support for this podcast comes from",
+        "supporters include",
+        "stay tuned for the following announcements",
+        "this episode sponsor is",
+    ):
+        assert cue in rp.OPEN_CUES
+        assert cue in rp.UNDERWRITE_CUES
+
+
+def test_v4v_thanks_for_support_is_not_underwrite():
+    pre = _unique(20, 0, "pre")
+    body = _mk(
+        "thank you so much for your support. we really appreciate every donation "
+        "and every boostagram this week from the community.",
+        pre[-1][0] + 1,
+    )
+    post = _unique(20, body[-1][0] + 1, "post")
+    words = pre + body + post
+    hits = rp._method_underwrite(words, [])
+    assert hits == [], hits
+
+
+def test_underwrite_method_finds_preroll_message_comes_from():
+    ad = _mk(
+        "This message comes from Open Door, with cash now more later. "
+        "Get cash up front for your home. Start your offer at opendoor.com slash NPR. "
+        "Profits calculated after fees and costs, eligibility and offer price may vary.",
+        0.0,
+    )
+    # force a sentence end before host talk
+    ad[-1] = (ad[-1][0], ad[-1][1], ad[-1][2].rstrip(",") + ".")
+    host = _mk(
+        "Okay, I'm going to start today's episode by taking you back in history.",
+        ad[-1][1] + 1.2,
+    )
+    words = ad + host
+    hits = rp._method_underwrite(words, [(ad[-1][1], host[0][0])])
+    assert hits, hits
+    s, e, _ = hits[0]
+    assert s <= 0.5, (s, e)
+    assert e >= ad[-3][1], (s, e, ad[-1][1])
+    assert e <= host[2][0] + 0.5, (s, e, host[0][0])
+
+
+def test_edge_url_postroll_is_promoted():
+    """A single url vote in the last 90s with commercial language is marked."""
+    pre = _unique(40, 0, "show")
+    # jump to near the end of a ~3 minute episode
+    ad = _mk(
+        "Many people searching for peptides worry about quality and trust. "
+        "Discover uncompromising quality at oathpeptides dot com. "
+        "Oath research where trust meets science.",
+        200.0,
+    )
+    words = pre + ad
+    assert words[-1][1] < 250
+    blocks, sus = rp.detect_ad_blocks(words, [], [], None, None)
+    covering = [b for b in blocks if b[0] <= ad[10][0] <= b[1]]
+    assert covering, (blocks, sus)
+    # should cover the URL / late body of the post-roll
+    assert any(b[1] >= ad[8][1] for b in covering), covering
+
+
+def test_url_groups_do_not_merge_different_brands():
+    dell = _mk(
+        "Shop at dell dot com for black friday laptops and powerful PCs. "
+        "Upgrade your whole setup for less and visit dell dot com slash deals today.",
+        0.0,
+    )
+    # long pause then a different brand
+    gr = _mk(
+        "This is the story of the one. Granger helps him stay prepared. "
+        "Click Granger dot com or just stop by Granger.",
+        25.0,
+    )
+    words = dell + gr
+    silences = [(dell[-1][1], gr[0][0])]
+    segs = rp._method_url(words, silences, None)
+    brands = {s[2].lower().replace(" ", "") for s in segs}
+    assert any("dell" in b for b in brands), segs
+    assert any("granger" in b for b in brands), segs
+    # Granger must not start at t=0 (the 45s lookback would have)
+    gr_segs = [s for s in segs if "granger" in s[2].lower()]
+    assert gr_segs, segs
+    assert gr_segs[0][0] >= 18.0, gr_segs
+
+
+def test_underwrite_and_host_boundary_detect_full_break():
+    intro = _mk("You're listening to Up First from NPR. I'm A Martinez.", 0.0)
+    intro[-1] = (intro[-1][0], intro[-1][1], intro[-1][2].rstrip(",") + ".")
+    ad = _mk(
+        "Stay tuned for the following announcements and messages from our sponsors. "
+        "Support for NPR and the following message come from Made in Cookware. "
+        "Learn more at madeincookware dot com. This message comes from Capital One. "
+        "Capital One, what's in your wallet? Details at capitalone dot com.",
+        intro[-1][1] + 1.5,
+    )
+    # Episode must be long enough for the 90s edge prior to apply.
+    post = _unique(400, ad[-1][1] + 1.2, "post")
+    post = _mk("Nvidia CEO Jensen Huang is in the news today. ", ad[-1][1] + 1.2) + post
+    words = intro + ad + post
+    silences = [(intro[-1][1], ad[0][0]), (ad[-1][1], post[0][0])]
+    blocks, sus = rp.detect_ad_blocks(words, [], silences, None, None)
+    covering = [b for b in blocks if b[0] <= ad[8][0] <= b[1]]
+    assert covering, (blocks, sus)
+    # should not swallow the host intro
+    assert all(b[0] >= intro[-1][1] - 1.0 for b in covering), covering
+
+
+def test_glued_edge_pods_split_at_new_opening():
+    a = _mk(
+        ("granger helps the team stay prepared every shift. ") * 10 +
+        "click granger.com today for the ones who get it done.",
+        0.0,
+    )
+    b = _mk(
+        "this episode is brought to you by apollo.io. "
+        + ("apollo helps sales teams find the right buyers. ") * 12 +
+        "go to apollo.io slash show to get started today.",
+        a[-1][1] + 2.0,
+    )
+    words = a + b
+    nw = rp.norm_words(words)
+    # one glued block covering both
+    glued = [(a[0][0], b[-1][1], "cta/url:granger")]
+    out = rp._split_glued_midrolls(words, nw, glued, min_part=15.0)
+    assert len(out) == 2, out
+    assert out[0][1] <= b[0][0] + 1.0, out
+    assert out[1][0] <= b[4][0], out
+
+
+def test_midroll_multi_brand_pod_is_not_split():
+    """A mid-episode Tremfya-then-Petivity style pod must stay one block."""
+    pre = _unique(200, 0, "pre")  # ~80s, not enough; start the ad later
+    # Place the pod around 400s in a ~700s episode so it is not an edge.
+    a = _mk(
+        ("tremfya helps with plaque psoriasis and you can ask your doctor. ") * 10 +
+        "go to tremfya dot com slash podcast to learn more.",
+        400.0,
+    )
+    b = _mk(
+        "this message comes from petivity. "
+        + ("petivity monitors your cat litter box every day. ") * 10 +
+        "learn more at petivity dot com slash show.",
+        a[-1][1] + 2.0,
+    )
+    tail = _unique(400, b[-1][1] + 1.0, "tail")
+    words = pre + a + b + tail
+    nw = rp.norm_words(words)
+    assert words[-1][1] > 700
+    glued = [(a[0][0], b[-1][1], "cta/url:tremfya")]
+    out = rp._split_glued_midrolls(words, nw, glued, min_part=15.0)
+    assert len(out) == 1, out
+    assert out[0][0] == a[0][0] and out[0][1] == b[-1][1]
+
+
+def test_underwrite_growth_walks_chained_messages():
+    """NPR underwriting must grow through founder copy and later
+    'this message comes from' cues in the same break."""
+    intro = _mk("You're listening to Up First from NPR. I'm A Martinez.", 0.0)
+    intro[-1] = (intro[-1][0], intro[-1][1], intro[-1][2].rstrip(",") + ".")
+    ad = _mk(
+        "Stay tuned for the following announcements and messages from our sponsors. "
+        "Support for NPR and the following message come from Made in Cookware. "
+        "President and co-founder Jay shares why he was inspired by his family's kitchen supply business. "
+        "Growing up in a commercial kitchen really opened my eyes to bringing restaurants into your home. "
+        "Learn more about Made in Cookware at madeincookware dot com. "
+        "This message comes from Capital One. What's in your wallet? Terms apply. Details at capitalone dot com. "
+        "This message comes from Schwab. You can invest your way with Schwab.",
+        intro[-1][1] + 1.5,
+    )
+    tail = _unique(400, ad[-1][1] + 1.5, "news")
+    words = intro + ad + tail
+    nw = rp.norm_words(words)
+    cue_end = [w[1] for w in ad if "cookware" in w[2].lower()][0]
+    frag = [(ad[0][0], cue_end + 2.0, "underwrite/url:cookware")]
+    grown = rp._grow_confirmed_fragments(words, nw, [], frag)
+    assert grown[0][0] <= ad[0][0] + 0.5, grown
+    assert grown[0][1] >= ad[-3][1] - 1.0, grown
+
+
+def test_edge_postroll_now_at_brand_without_url():
+    """URL-less produced post-roll ('now at McDonald's') must be marked."""
+    body = _unique(500, 0.0, "show")
+    # Force a long episode so the edge prior is armed.
+    last = body[-1][1]
+    if last < 200:
+        body = body + _unique(200, last + 0.5, "pad")
+        last = body[-1][1]
+    ad = _mk(
+        "Holiday drinks are now at McDonald's, like the new frosted cranberry energizer. "
+        "It's red bull meets cranberry flavors, topped with cold foam and sprinkles, "
+        "made to charge your holiday spirit now at McDonald's. "
+        "No matter what you accomplish today, celebrate with an ice-cold Coca-Cola. "
+        "Enjoy Coca-Cola!",
+        last + 1.5,
+    )
+    words = body + ad
+    # bump last word so duration > 180 and ad sits in the last 90s
+    assert words[-1][1] > 180
+    blocks, _ = rp.detect_ad_blocks(words, sponsors=[], silences=[])
+    spans = [(s, e) for s, e, *_ in blocks]
+    assert any(s <= ad[0][0] + 2 and e >= ad[-1][1] - 3 for s, e in spans), (spans, ad[0][0], ad[-1][1])
+
+
+def test_underwrite_refine_keeps_chained_brand_tail():
+    """Post-grow refine must not trim Squarespace after a Rosetta Stone URL."""
+    intro = _unique(400, 0.0, "news")
+    ad = _mk(
+        "Stay tuned for the following announcements and messages from our sponsors. "
+        "This message comes from Rosetta Stone offering an alternative approach to language learning. "
+        "More information at rosettastone dot com. "
+        "A beautifully designed Squarespace website is the difference between a hobby and a career. "
+        "Squarespace, because a website makes it real. "
+        "Use code DIFFERENCE for 50 percent off select plans, terms and conditions apply.",
+        intro[-1][1] + 2.0,
+    )
+    words = intro + ad
+    blocks, _ = rp.detect_ad_blocks(words, sponsors=[], silences=[])
+    # One block should cover the opening cue through the terms/conditions tail.
+    assert any(s <= ad[0][0] + 2 and e >= ad[-3][1] - 1 for s, e, *_ in blocks), blocks
+
+
+def test_show_tip_line_is_not_an_ad():
+    """A show's own 'tips at audiochuck.com' closer is not a post-roll."""
+    body = _unique(500, 0.0, "story")
+    if body[-1][1] < 200:
+        body = body + _unique(200, body[-1][1] + 0.5, "pad")
+    close = _mk(
+        "We want to hear from you. Send anything you've got to our tip line at tipsataudiochuck dot com or miranda at gmail dot com. "
+        "Crime Junkie is an audio chuck production.",
+        body[-1][1] + 2.0,
+    )
+    words = body + close
+    blocks, _ = rp.detect_ad_blocks(words, sponsors=[], silences=[])
+    # No block should cover the tip-line closer.
+    for s, e, *_ in blocks:
+        assert e < close[0][0] - 1 or s > close[-1][1] + 1, blocks
+
+
+def test_bare_net_is_not_commercial_but_dot_com_is():
+    assert not rp._span_has_commercial(["the", "net", "it", "doesn't"])
+    assert not rp._span_has_commercial(["this", "is", "net", "net", "from", "detroit"])
+    assert rp._span_has_commercial(["visit", "example", "dot", "com"])
+    assert rp._span_has_commercial(["go", "to", "example.com"])
+
+
+def test_whats_up_theme_song_is_not_an_edge_preroll():
+    """V4V intros often start 'what's up' / 'I'm here' — not a preroll."""
+    intro = _mk(
+        "What's up, bye bye for the atom running the show. "
+        "Kick down the door, here we go. No script, no filter, no corporate line.",
+        40.0,
+    )
+    pad = _unique(500, intro[-1][1] + 1.0, "show")
+    if pad[-1][1] < 200:
+        pad = pad + _unique(200, pad[-1][1] + 0.5, "pad")
+    words = intro + pad
+    assert words[-1][1] > 180
+    blocks, _ = rp.detect_ad_blocks(words, sponsors=[], silences=[])
+    for s, e, *_ in blocks:
+        assert e < 40 or s > intro[-1][1] + 1, blocks
+
+
+def test_look_back_is_not_a_topic_shift():
+    assert not rp._span_has_shift(["let's", "look", "back", "at", "the", "notes"])
+    assert rp._span_has_shift(["ok", "back", "to", "the", "topic"])
+    assert rp._span_has_shift(["okay", "back", "to", "cooking"])
+
+
+def test_generic_oracle_stems_are_dropped():
+    desc = "Sponsors: Made made.com ; John john.com ; Hostinger hostinger.com"
+    brands = rp.extract_sponsors(desc)
+    variants = {v for b in brands for v in b["variants"]}
+    labels = {b["label"].lower() for b in brands}
+    assert "made" not in variants
+    assert "john" not in variants
+    assert "hostinger" in variants or any("hostinger" in l for l in labels)
+    # Known short popular stems must still be kept.
+    desc2 = "Sponsors: Indeed indeed.com ; Seed seed.com"
+    variants2 = {v for b in rp.extract_sponsors(desc2) for v in b["variants"]}
+    assert "indeed" in variants2
+    assert "seed" in variants2
+
+
+def test_generic_made_mentions_do_not_span_the_episode():
+    """A truncated oracle brand 'Made' must not mark minutes of 'made' talk."""
+    pre = _unique(200, 0.0, "pre")
+    talk = _mk(
+        "We made dinner and then we made a plan and made our way home. "
+        "John made coffee and made a joke about the news made today.",
+        pre[-1][1] + 1.0,
+    )
+    mid = _unique(40, talk[-1][1] + 1.0, "mid")
+    more = _mk("I made this later and made sure nobody made a fuss.", mid[-1][1] + 1.0)
+    tail = _unique(200, more[-1][1] + 1.0, "tail")
+    words = pre + talk + mid + more + tail
+    assert words[-1][1] > 180
+    sponsors = [{"label": "Made", "variants": {"made"}}]
+    blocks, _ = rp.detect_ad_blocks(words, sponsors=sponsors, silences=[])
+    # No block should cover both 'made' clusters (they'd be minutes apart).
+    for s, e, *_ in blocks:
+        assert e - s < 180, blocks
+        # And none should start in the first talk cluster and end in the second.
+        assert not (s < mid[0][0] and e > mid[-1][1]), blocks
+
+
+def test_v4v_theme_song_url_is_not_a_postroll():
+    """No Agenda outros plug vorac.org after 'fighting for value'."""
+    body = _unique(300, 0.0, "body")
+    jingle = _mk(
+        "No sponsors, no product placement. Fightin for value, fightin for value, "
+        "keep it alive. The best podcast in the universe, yeah, mofo to vorac "
+        "dot org slash n a. This is the best.",
+        body[-1][1] + 1.0,
+    )
+    words = body + jingle
+    assert words[-1][1] > 180
+    blocks, _ = rp.detect_ad_blocks(words, sponsors=[], silences=[])
+    for s, e, *_ in blocks:
+        assert s < body[-1][1] - 1 or e < jingle[0][0], blocks
+
+
+def test_tune_in_next_time_is_not_an_edge_postroll():
+    """A guest show URL just before the host outro is not a post-roll."""
+    body = _unique(300, 0.0, "body")
+    outro_url = _mk(
+        "You can find that at lit lightningthrashes dot com. "
+        "That's pretty much Sir Libre in a nutshell.",
+        body[-1][1] + 1.0,
+    )
+    # Host credits often sit 40–60s after a guest show URL.
+    pad = _unique(80, outro_url[-1][1] + 1.0, "credits")
+    sign = _mk(
+        "Please tune in next time, or tune in next week for the Round Table Podcast.",
+        pad[-1][1] + 1.0,
+    )
+    words = body + outro_url + pad + sign
+    outro = outro_url
+    assert words[-1][1] > 180
+    blocks, _ = rp.detect_ad_blocks(words, sponsors=[], silences=[])
+    for s, e, *_ in blocks:
+        assert s < body[-1][1] - 1 or e < outro[0][0], blocks
+
+
+def test_go_to_google_is_not_an_edge_postroll():
+    """Show talk 'why go to Google?' in the last 90s is not a post-roll."""
+    body = _unique(300, 0.0, "body")
+    talk = _mk(
+        "This is good. Free is over. Google is going to have charging people. "
+        "It's broken. Who goes, why go to Google? Just ask Muse. "
+        "He says tokens is a new currency.",
+        body[-1][1] + 1.0,
+    )
+    words = body + talk
+    assert words[-1][1] > 180
+    assert rp._edge_commercial_is_weak(["why", "go", "to", "google"])
+    assert not rp._edge_commercial_is_weak(["go", "to", "dell", "dot", "com"])
+    blocks, _ = rp.detect_ad_blocks(words, sponsors=[], silences=[])
+    for s, e, *_ in blocks:
+        assert s < body[-1][1] - 1 or e < talk[0][0], blocks
