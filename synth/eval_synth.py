@@ -17,7 +17,7 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(REPO, "eval"))
 from pipe import load_pipeline
-from transcribe import transcript_for
+from transcribe import transcript_for, spliced_tdir
 from score_segments import score_episode, aggregate, format_report
 
 DATA = os.environ.get("PAD_DATA", os.path.join(REPO, "data"))
@@ -59,7 +59,7 @@ def cmd_spliced(args, mod):
         t0 = time.time()
         blocks, suspects, sponsors, words = run_detect(
             mod, os.path.join(args.batch, eid, "audio.mp3"),
-            os.path.join(DATA, "transcripts", "spliced", eid), desc)
+            spliced_tdir(DATA, args.batch, eid), desc)
         g = [(a[0], a[1]) for a in gt[eid]["ads"]]
         r = score_episode([(s, e) for s, e, _ in blocks], g)
         r["episode"] = eid

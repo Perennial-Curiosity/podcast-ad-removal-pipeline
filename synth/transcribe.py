@@ -36,3 +36,14 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def spliced_tdir(data, batch_dir, eid):
+    """Transcript cache dir for a spliced episode. batch1 keeps its original
+    flat layout; later batches get their own subfolder (episode ids repeat
+    across batches)."""
+    import os
+    b = os.path.basename(os.path.normpath(batch_dir))
+    if b == "batch1":
+        return os.path.join(data, "transcripts", "spliced", eid)
+    return os.path.join(data, "transcripts", "spliced", b, eid)
