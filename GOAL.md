@@ -44,6 +44,7 @@ That precision is the goal. Finding the ad is only step one.
 
 6. **Publish** — Original audio, unchanged, in a feed for Podcast Addict, with chapters added:
    - `Muse Detected Ad For <name>`
+   - `Muse Detected Ad` (no name) — when a block's evidence is too weak to name a sponsor, the chapter carries no name rather than a made-up one
    - `Muse Detected House Plug For <name>` — see below
 
 7. **Score** — Compare every edge against the owner's hand-marked times. Report per edge: error in seconds, share within 1 second, share within 2 seconds, median error, and worst error.
@@ -71,6 +72,7 @@ That precision is the goal. Finding the ad is only step one.
 - Dynamic-slot comparison integrated 2026-11-11: on feeds that serve different ads per download, a second download is transcribed and compared with the first; differing regions are inserted ads, marked only when ad evidence backs them. On the owner's two marked episodes it raised coverage at the strict scorer from 7/9 to 9/9 ads (episode 286) and 6/8 to 7/8 (episode 287), with dynamic-ad edges averaging 0.42 seconds of error. The false slot inside a real ad on 286 was fixed 2026-11-13 by tightening the gate: a slot overlapping a detected block by under half now merges into the block.
 - Six-mechanism merge live 2026-11-14: the substring guard, cross-episode recurrence, publisher-transcript differential, gate tightening, back-to-back split, and density floor are now in the pipeline. On the 25-episode test set: 75 of 107 ads found, 38 false blocks, median edge error 4.8 seconds, 26.0% of edges within 1 second. On the owner's two marked episodes, slot-flow scoring is 9/9 ads on 286 with no false blocks and 7/8 on 287 with one false block (the Pepperbox house plug).
 - Fusion-fix merge 2026-11-14: the URL-anchored split rescue and the per-podcast history voter (with a guard against gluing ads together) are now live. Test set now: 75 of 107 ads found, 40 false blocks, median edge error 4.8 seconds, 26.0% of edges within 1 second. The two extra false blocks are both real second ads the test's answer key cannot see (Our Place and Rorra), so the count is a measurement artifact, not new mistakes.
+- Label-fix merge 2026-11-18: three label rules are now live — a block with only weak evidence gets a plain chapter with no sponsor name instead of a made-up one, a name that is really the show's own identity is stripped the same way, and the missed-sponsors check no longer flags a sponsor a block already names. Test set unchanged: 75 of 107 ads found, 40 false blocks, median edge error 4.8 seconds, 26.0% of edges within 1 second, with five wrong names removed and no detection change.
 - Transcription model: still the fast base model. A larger model transcribes more accurately but does not improve edges; a hotwords switch was approved, then abandoned after three failed verifications.
 - Every marked edge now carries a sharpness score (added 2026-11-10). Moving flat edges to the nearest vote step was tested the same day and discarded — it pushed good edges out of place.
 
