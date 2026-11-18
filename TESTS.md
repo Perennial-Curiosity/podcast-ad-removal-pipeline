@@ -2695,6 +2695,124 @@ NOTE.md is corrected.
 
 ---
 
+## 42. Weak-evidence block labels — RECOMMEND MERGE, MERGED 2026-11-18 (autonomous run, Test 4)
+
+A block whose label rests only on weak methods (duplicate, reverb,
+voice, history — never a naming method) gets no sponsor name in its
+chapter title (plain "Muse Detected Ad") instead of a made-up one.
+Detection untouched by construction: the strip runs after spans and
+votes are final, and downstream steps read only whether a label part
+matches a description sponsor — 'ad' matches none, exactly as
+'dry-island' matched none. Baseline reproduced exactly first
+(`combined_repro30`). Variant: every detection number identical, 0
+span changes on all 25 episodes, exactly 2 label changes (Acquired's
+"Dry-Island" block and SN-1103's "duplicate-9" block become plain).
+On Ep 289 the same rule changes exactly the 3 Dry-Island blocks
+(38:05, 55:25, 70:25). Transcripts confirm all five weak blocks are
+real ad audio with fictitious names: 289's three are the same
+repeated dynamic ad, a Universal Pictures "Focker and Law" movie
+promo; Acquired's is a Sierra read; SN-1103's is a Wayfair Christmas
+read. Wrong chapter names removed: 4 total (1 on the SB set + 3 on
+Ep 289). Correct names removed: 0. (The SB-set effect looks small
+because SB labels are host-read-only; 30% of a published episode's
+chapters carried a fictitious name.) Held patch:
+`sb_eval/ab/label_quality/label_quality.patch` (3,161 bytes).
+Records: `sb_eval/ab/label_quality/`. Merged 2026-11-18 at the
+owner's direction; applied cleanly first try. Post-merge
+verification: the 2 SB-set label changes confirmed, 0 span changes,
+all headlines identical (see the merge record at the end of entry
+44).
+
+## 43. URL-stem guard — RECOMMEND MERGE, MERGED 2026-11-18 (autonomous run, Test 6)
+
+When a block's sponsor name comes from the fuzzy URL-stem fallback,
+reject it if the stem matches the podcast's own identity
+(feed-supplied channel domain stem plus own domains — never
+hardcoded). Baseline reproduced exactly first
+(`combined_repro32`). Variant: detection identical, 0 span changes,
+exactly 3 label changes — both Lex Fridman blocks ("lexfreedman"
+and "friedman", both chaptered "Lexfridman") and one Huberman outro
+block ("hubertmanlab") become plain "Muse Detected Ad". Label
+accuracy: wrong 1 → 0, unnamed 0 → 2, unknown 1 → 1. The correct
+count dips 73 → 72, but that is the frozen-adjudicated Lex twin —
+the scorer counted it correct only circularly; the show is not its
+own sponsor, so no real sponsor name was lost. The Vergecast case
+is unchanged (it goes through a different step — verbatim return,
+not the fuzzy fallback — and needs its own mechanism; see Test 7).
+Held patch: `sb_eval/ab/url_stem_guard/url_stem_guard.patch`
+(4,084 bytes). Records: `sb_eval/ab/url_stem_guard/`.
+
+Merge, 2026-11-18: the original patch failed on hunk #2 because
+patch 1 (entry 42) had inserted its call at the same point — just
+before `return scored, suspects` at the end of `detect_ad_blocks`.
+Regenerated as `url_stem_guard_r2.patch` against the patch-1-applied
+file; verified its added/removed lines are identical (as multisets)
+to the original — same helpers, same `own_identity=None`
+parameter, same call logic, nothing else. Dry-run clean, applied.
+Wiring (part of the documented merge form): `process_episode` and
+`slots_only_mode` pass
+`own_identity={_domain_stem(host)} | own_domains` to
+`detect_ad_blocks` — but the NOTE's literal form
+`_domain_stem(channel_link)` was wrong: `_domain_stem` takes a
+host, and passing the full feed URL gives "https://lexfridman",
+which fails the 0.75 fuzzy threshold (0.692 for lexfreedman, 0.609
+for friedman; the correct stem `lexfridman` scores 0.857 / 0.778),
+so the guard would have been silent in production for its flagship
+case (production-path check on frozen Lex inputs: 0/2 blocks
+stripped). Fix: extract the host with the same regex
+`extract_own_domains` uses before stemming, guarded for a
+missing/None link (`parse_channel_link` can return None;
+`_domain_stem(None)` would crash). The fixed form yields
+`{'lexfridman'}` and strips 2/2. The SB verification passed because
+the harness computes `own_identity` with host extraction — it never
+exercises the call-site expression, which is why the separate
+production-path check (`tmp/prod_path_check.py`) was needed.
+Post-merge verification: the 3 SB-set label changes confirmed, 0
+span changes, all headlines identical (see the merge record at the
+end of entry 44).
+
+## 44. Missed-sponsors check counts blocks as found — RECOMMEND MERGE, MERGED 2026-11-18 (autonomous run, Test 11)
+
+The missed-sponsors check reported a description sponsor as missed
+when it had zero transcript mentions, returning before ever looking
+at detector blocks — so a sponsor whose read Whisper mis-transcribed
+to zero mentions was flagged missed even when a block names it
+(exactly the FUM on Ep 289 case: block at 61:00 names FUM,
+transcript says "fume" / "tryfume"). The fix, in the zero-hit branch
+only, applies the same block-label test the check already uses on
+the mentions-found path. No new matching rules, no new constants, no
+hardcoded names. Baseline reproduced exactly first
+(`combined_repro36`). Frozen diagnosis: 38 missed sponsors total (37
+SB set + 1 on Ep 289), exactly 2 false alarms: FUM on Ep 289 and
+Rorra on Huberman "What Humans, Animals and Plants Tell Us About
+Consciousness" (transcript says "Rora" throughout; block 919.7–
+1001.0 contains the whole read with its rora.com CTA). Variant
+result exactly as predicted: detection identical (recall 0.701, FP
+40), spans identical block-for-block on all 25 episodes, missed
+sponsors 38 → 36 — exactly the 2 false alarms removed, 0 true
+misses lost, 0 newly flagged. Rorra is still correctly flagged on a
+different Huberman episode ("Neuroscience of Emotions"), which has
+no naming block. Diagnostic-only — cannot move any span or block by
+construction. Held patch: `sb_eval/ab/missed_check/missed_check.patch`
+(983 bytes). Records: `sb_eval/ab/missed_check/`. Merged 2026-11-18
+at the owner's direction; applied cleanly (hunk at offset +124
+lines). Post-merge verification: missed 38 → 36 confirmed.
+
+Label-fix merge (2026-11-18, owner-directed): all three patches
+live, run_pipeline.py md5 `8aa885fe680f487a017ada68c616619d`, 4,070
+lines (was `44e64847…`, 3,929 lines). Combined post-merge
+verification on the live modules (`sb_eval/ab/merged_live_labels/`):
+SB set recall 0.701 (75/107), FP 40, median 4.8s, mean 13.1s,
+within-1s 26.0%, within-2s 36.7%, max 79.3s — identical to the
+pre-merge baseline on every headline and per-show number; exactly 5
+label changes, 0 span changes. 286/287 unchanged (286 7/9 ≥80%,
+606.7/673s, 0 FP; 287 6/8, 463.0/531s, 1 FP Pepperbox). Synthetic
+23/27 ≥50%, 19/27 ≥80%, FP 3, median 2.55s; TTS full 9/9 ≥50%, 8/9
+≥80%, FP 0, median 1.32s; null episode 8 blocks — all identical to
+frozen numbers. Automatic run stays paused.
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
