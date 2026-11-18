@@ -307,6 +307,22 @@ Notes:
   false rescues; the scoreboard cannot see them because each is the
   second ad of a merged-pair SponsorBlock label). 286/287 detector
   numbers unchanged. Full numbers in `TESTS.md`.
+- **Label-fix merge (2026-11-18, live):** three held patches from the
+  autonomous improvement run (TESTS.md entries 42–44), merged on the
+  owner's direction. (9) Weak-evidence labels: a block whose name rests
+  only on weak methods (duplicate, reverb, voice, history) gets a plain
+  `Muse Detected Ad` chapter with no sponsor name instead of a made-up
+  one. (10) URL-stem guard: a name from the fuzzy URL-stem fallback is
+  stripped when it matches the podcast's own identity (feed channel
+  domain stem plus own domains); the production wiring extracts the
+  host before stemming, since the stem function takes a host, not a
+  URL. (11) Missed-sponsors check: a sponsor a block already names is
+  no longer flagged missed when the transcript has zero mentions of
+  it. Post-merge numbers on the live pipeline: 25-episode set recall
+  0.701 (75/107), false blocks 40, median edge error 4.8s, within 1s
+  26.0% — identical to the pre-merge baseline; exactly five label
+  changes, zero span changes. 286/287 detector numbers unchanged. Full
+  numbers in `TESTS.md`.
 - **Ollama / LLM reviewer: evaluated 2026-10-14, REJECTED.** It hallucinated
   sponsor reads, missed real ads, produced garbled timestamps, and was
   too slow and memory-hungry. Do not re-add without a fresh evaluation.
