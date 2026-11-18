@@ -970,8 +970,118 @@ def _edge_sharpness(starts, ends, votes, t, side):
     return sum(inside) / len(inside) - sum(outside) / len(outside)
 
 
+# Weak-evidence block labels (2026-11-15, A/B test — NOT merged):
+# a block's chapter title names a sponsor, and a wrong name is
+# user-visible harm. A block is WEAK when no naming method's vote
+# names its sponsor. Naming methods (their candidate labels name an
+# advertiser): brand, brand-orphan, cta, url, cluster,
+# cluster-popular, chapter. Weak methods (their labels are artifacts
+# that name no advertiser): duplicate, reverb, voice,
+# history-preroll — labels 'dry-island', 'voice-anomaly',
+# 'history-prior', 'duplicate-N'. A weak block's label is rewritten
+# to '<methods>:ad'; 'ad' is in GENERIC_AD_TITLES, so the existing
+# ad_chapter_name() returns None and the chapter is titled plain
+# 'Muse Detected Ad'. Spans, votes, block existence, and every other
+# label are untouched; suspects are untouched. No sponsor name is
+# hardcoded: the rule reads only the method list and the artifact
+# set from the label string. See sb_eval/ab/label_quality/NOTE.md.
+_WEAK_LABEL_METHODS = frozenset(
+    {"duplicate", "reverb", "voice", "history-preroll"})
+_WEAK_ARTIFACT_NAMES = frozenset(
+    {"dry-island", "voice-anomaly", "history-prior"})
+
+
+def _is_weak_label(label):
+    """True when a block label rests only on weak evidence."""
+    import re as _re
+    if not label:
+        return False
+    spons = label.split(":")[-1].strip().lower().replace(" ", "")
+    if spons in _WEAK_ARTIFACT_NAMES or \
+            _re.fullmatch(r"duplicate-\d+", spons):
+        return True
+    if ":" not in label:
+        return False
+    methods = [m for m in label.split(":", 1)[0].split("/") if m]
+    return bool(methods) and all(m in _WEAK_LABEL_METHODS for m in methods)
+
+
+def _strip_weak_labels(blocks):
+    """Rewrite weak block labels to '<methods>:ad', preserving every
+    other field. Blocks are (start, end, label, *rest)."""
+    out = []
+    for b in blocks:
+        label = b[2]
+        if _is_weak_label(label):
+            label = label.split(":", 1)[0] + ":ad" if ":" in label else "ad"
+        out.append((b[0], b[1], label) + tuple(b[3:]))
+    return out
+
+
+# URL-stem guard (2026-11-15, A/B test — NOT merged): a spoken-URL
+# stem ('friedman' from Whisper-split "Lex Friedman .com", a
+# mangled own-domain stem like 'lexfreedman' / 'hubertmanlab')
+# can slip the exact-match own-domain filter and then resolve,
+# via ad_chapter_name's fuzzy fallback (>= 0.75), to the SHOW
+# ITSELF — because the show's own domain is itself listed as a
+# description sponsor. A block label is stripped iff (i) its
+# methods include 'url' or 'cta' (the name comes from URL
+# evidence), (ii) its sponsor part is not exactly a description
+# sponsor's label, and (iii) its normalized sponsor part
+# fuzzy-matches an own-identity form at >= 0.75 — the pipeline's
+# own fuzzy threshold, not a tuned number. Own identity =
+# {_domain_stem(channel_link)} ∪ own_domains, feed-supplied,
+# never hardcoded. A stripped label becomes '<methods>:ad'; 'ad'
+# is in GENERIC_AD_TITLES, so the chapter is titled plain
+# "Muse Detected Ad". Spans, votes, block existence, and every
+# other label are untouched; suspects are untouched. See
+# sb_eval/ab/url_stem_guard/NOTE.md.
+_URL_GUARD_METHODS = frozenset({"url", "cta"})
+_URL_GUARD_THRESHOLD = 0.75
+
+
+def _is_own_identity_label(label, sponsors, own_identity):
+    """True when a block's sponsor name comes from URL evidence
+    and fuzzy-matches the podcast's own identity."""
+    import difflib as _difflib
+    import re as _re
+    if not label or not own_identity or ":" not in label:
+        return False
+    methods = [m for m in label.split(":", 1)[0].split("/") if m]
+    if not any(m in _URL_GUARD_METHODS for m in methods):
+        return False
+    spons = _re.sub(r"[^a-z0-9]", "", label.split(":")[-1].strip().lower())
+    if not spons:
+        return False
+    sponsor_labels = {_re.sub(r"[^a-z0-9]", "", sp.get("label", "").lower())
+                      for sp in (sponsors or [])}
+    if spons in sponsor_labels:
+        return False
+    for ident in own_identity:
+        ident_n = _re.sub(r"[^a-z0-9]", "", str(ident).lower())
+        if not ident_n:
+            continue
+        if _difflib.SequenceMatcher(None, spons, ident_n).ratio() \
+                >= _URL_GUARD_THRESHOLD:
+            return True
+    return False
+
+
+def _strip_own_identity_labels(blocks, sponsors, own_identity):
+    """Rewrite own-identity block labels to '<methods>:ad',
+    preserving every other field. Blocks are (start, end, label,
+    *rest)."""
+    out = []
+    for b in blocks:
+        label = b[2]
+        if _is_own_identity_label(label, sponsors, own_identity):
+            label = label.split(":", 1)[0] + ":ad" if ":" in label else "ad"
+        out.append((b[0], b[1], label) + tuple(b[3:]))
+    return out
+
+
 def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
-                     own_domains=None, candidates_out=None):
+                     own_domains=None, candidates_out=None, own_identity=None):
     # words: list of (start, end, word) from Whisper (may contain duplicates).
     """Locate ad-read blocks via multi-method heat map (2026-10-09).
 
@@ -1597,6 +1707,20 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     # section 6): the gate needs method-level evidence, not blocks.
     if candidates_out is not None:
         candidates_out.extend(candidates)
+    # Weak-evidence label rule (2026-11-15, A/B test — NOT merged):
+    # strip the sponsor name from weak blocks only. Spans and votes
+    # are already final here; rescue/xep/slot flow downstream read
+    # only whether a label part matches a description sponsor, and
+    # 'ad' matches none, exactly as 'dry-island' matched none.
+    scored = _strip_weak_labels(scored)
+    # URL-stem guard (2026-11-15, A/B test — NOT merged): strip
+    # the sponsor name from blocks whose URL-evidenced label
+    # fuzzy-matches the show's own identity. Spans and votes are
+    # already final here; rescue/xep/slot flow downstream read
+    # only whether a label part matches a description sponsor,
+    # and 'ad' matches none, exactly as the stripped stems did
+    # ('friedman' / 'lexfreedman' / 'hubertmanlab' match none).
+    scored = _strip_own_identity_labels(scored, sponsors, own_identity)
     return scored, suspects
 
 
@@ -2522,6 +2646,15 @@ def check_missed_sponsors(words, sponsors, blocks):
             continue
         hits = find_mentions(nw, variants)
         if not hits:
+            # A block naming this sponsor covers it even with zero
+            # transcript mentions (2026-11-15: FUM on Unsubscribe
+            # 289 — Whisper heard "fumes", 0 mentions, yet a block
+            # named FUM; Rorra on Huberman, heard "Rora"). The
+            # block-label test below already exists for the hits>0
+            # path; the zero-hit branch returned before reaching it.
+            if any(sp["label"].lower() in (lbl or "").lower()
+                   for _, _, lbl, *_ in blocks):
+                continue
             log(f"  WARNING: sponsor '{sp['label']}' not in audio (0 transcript mentions)")
             missed.append({"label": sp["label"], "mentions": 0})
             continue
@@ -3580,9 +3713,13 @@ def slots_only_mode(slug, items, channel_link):
     id3_chapters = [(ms / 1000.0, t) for ms, t in existing_ms]
     chapters = _merge_chapters(id3_chapters, item.get("rss_chapters", []))
     candidates_out = []
+    _channel_m = re.search(r"https?://([^/\"' >]+)", channel_link) if channel_link else None
+    _channel_host = _channel_m.group(1) if _channel_m else None
     blocks, _suspects = detect_ad_blocks(words, sponsors, silences, mp3_path,
                                          chapters, own_domains=own_domains,
-                                         candidates_out=candidates_out)
+                                         candidates_out=candidates_out,
+                                         own_identity=({_domain_stem(_channel_host)} | own_domains)
+                                         if _channel_host else own_domains)
     a_sha256 = sha256_file(mp3_path)
     flow = run_slot_flow(work, words, duration, mp3_path, a_sha256,
                          item["audio_url"], sponsors, desc_sponsors,
@@ -3666,9 +3803,13 @@ def process_episode(item, state, channel_link=None, pcfg=None):
     if chapters:
         log(f"{len(chapters)} chapters available for chapter-marker detection")
     candidates_out = []  # raw method segments, for the dynamic-slot gate
+    _channel_m = re.search(r"https?://([^/\"' >]+)", channel_link) if channel_link else None
+    _channel_host = _channel_m.group(1) if _channel_m else None
     blocks, suspects = detect_ad_blocks(words, sponsors, silences, mp3_path,
                                         chapters, own_domains=own_domains,
-                                        candidates_out=candidates_out)
+                                        candidates_out=candidates_out,
+                                        own_identity=({_domain_stem(_channel_host)} | own_domains)
+                                        if _channel_host else own_domains)
     # Cross-episode recurrence, positive direction (2026-11-11, KEPT):
     # recurring sponsor-copy spans from prior episodes of this show
     # extend already-detected blocks to the span's bounds. Runs after
