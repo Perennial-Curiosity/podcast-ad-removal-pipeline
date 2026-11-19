@@ -3279,6 +3279,63 @@ The fix is to make `_b_cache_check` drop the chunks when the
 marker is missing too; then a clean re-run and a re-publish if
 the blocks differ. Open item — not yet designed or tested.
 
+**THIRD RE-RUN (clean) — STOP, NO RE-PUBLISH (2026-11-19).**
+The B side worked as designed: same pinned B throughout (sha
+c48dc606…, 245,506,466 bytes, verified before/after; log
+"reusing pinned B download", no re-download); all 35 B chunks
+freshly transcribed 22:31–22:57 UTC, transcript.json rebuilt.
+Deletion set was chunk_*.json + transcript.json by hand; marker
++ mp3 kept (the probe code deletes + re-downloads the B if the
+marker is missing). BUT the experiment was confounded by the A
+rotating — and the present-destination HEAD check (entry 52,
+just applied) caused it: at 22:26:58 the HEAD check fired
+(local A 249,504,239 bytes vs server-advertised 243,897,322),
+deleted the good cached A, and downloaded a rotated cut
+(243,086,482 bytes, sha 09769e29…, 6,068.98s vs old 6,229.4s).
+A HEAD after the run advertised 250,072,662 — a third length.
+Megaphone rotates the A on nearly every request, so a length
+mismatch does NOT mean the local file is truncated. Worse,
+`transcribe_chunked` has NO audio-identity check on the A
+cache (same bug class as the B bug just fixed): it reused the
+Nov 15 A chunks 000–033 and dropped chunk 034 entirely (244
+words, 6,120–6,228.6s) because its start exceeds the new
+duration. Transcript went 19,074 → 18,830 words. Detection ran
+on old-A words + new-A audio — a chimera. Clean blocks (13) vs
+published 11: the two new blocks are false (40:25 show banter;
+58:45 comedy bit — the previous run rejected the same span
+twice); the 98:49 slot is false show banter (previous run
+rejected that exact span twice; violates "98:45 absent"); the
+102:41 slot is real Fockers ad copy, lost only because the new
+A is shorter than the slot position; FUM start/end and Perfect
+Jean start favour published. Clean is better on only 2 edges
+(Vsafe start 1417.0; Perfect Jean end 4590.0). Verdict: clean
+set worse — do not publish. `tmp/republish289.py` was not run.
+Verification: release 445857775 unchanged (marked 249,754,974,
+suspects 12,409,241); fresh post-run download md5
+405ff645… identical to pre-run; served feed byte-identical
+pre/post (md5 05f337a3…), 289 enclosure length 249754974, 288
+still Megaphone; state publish fields — landmine fired,
+restored by hand and verified; Ep 288 untouched; history
+untouched. Log: `tmp/retry289_clean_2026-11-19.log` ("289
+after: dynamic_status=slots slots=7 rejected=1 blocks=13").
+Open items from this run: (1) the HEAD check is unsafe for
+rotating sources — REVERTED by the parent the same day (entry
+52); a scoped redesign is a possible separate task. (2) The A
+transcript cache needs the same SHA-based invalidation as the B
+cache — a new fix task, same pattern as entry 51. (3) Residual
+state mismatch (not hand-edited): state 289 now says blocks=13,
+bytes 243330993 (the confounded run) while the publish fields
+point at the 11-block old-A file — a future feed regeneration
+from this state would list 13 ads against the 11-block
+enclosure; needs a decision on restoring the state's blocks to
+the published 11. (4) The old-A original.mp3 (249,504,239
+bytes) no longer exists on disk; the published marked mp3 is
+the surviving copy of that audio. The four early merged slots
+remain unverified for the fresh B in the strict sense — this
+run's slot flow used truncated old-A words. A true verification
+needs the old A audio (recoverable from the published marked
+file) or a fresh pin of the current A with its own transcript.
+
 ---
 
 ## 50. Content-Length check on download() — APPLIED 2026-11-19
@@ -3353,6 +3410,101 @@ re-entry (the pin path checks SHA itself, but
 task.
 
 ---
+
+## 51. `_b_cache_check` fix (missing marker drops stale chunks) — APPLIED 2026-11-19
+
+The defect: `_b_cache_check` dropped stale B chunks only when
+the marker file existed AND its recorded SHA mismatched the new
+B's SHA; when the marker was missing it wrote the new SHA and
+returned without dropping anything. This is what bit the 289
+second re-run (entry 49): deleting the marker defeated the
+invalidation and the re-run reused chunks 000–030 from the
+truncated B.
+
+Frozen design (written before any test run, tested exactly as
+written): dedent the chunk/`transcript.json` drop out of the
+`if os.path.exists(marker)` block, so it runs on every
+non-early-return path — a missing marker is treated exactly
+like a SHA mismatch (new log line: "no B transcript marker;
+dropping any stale B chunks"). Matching marker still returns
+early (cache valid, no re-transcription); mismatching marker
+still drops; pin-B reuse untouched. One function, +4 lines.
+Generic, no hardcoded sizes, names, or episode checks.
+
+Tests (a)–(e), all PASS: (a) missing marker + stale 3-chunk
+cache — live control KEPT the stale chunks (0
+re-transcriptions, stale words returned), patched DROPPED them
+and fully re-transcribed (3/3, zero stale words); (b) matching
+marker → cache kept, 0 re-transcriptions; (c) mismatching
+marker → drop, full re-transcription; missing marker + empty B
+dir → no crash; (d) SB set identical on all four headlines
+(detector 0.701/40, slot-flow 0.682/42, full 0.701/47,
+detect-only 0.682/35); (e) pin-B path — patched missing-marker
+case re-downloads 1× AND fully re-transcribes all 35 chunks (0
+cache hits) with identical slots (hash 13a57ae01f0a48ba).
+
+Applied: intermediate live md5
+`129f4e349a08d94f9163f2b855998750`, 4,149 lines;
+`py_compile` clean. (Later combined with the present-dest
+check into md5 ccd70395…, 4,193 lines; the present-dest check
+was then REVERTED — entry 52 — restoring this file as live.)
+Record: `sb_eval/ab/b_cache_check_fix/` (NOTE.md, patch,
+drivers, results JSONs, `both_combined_results.json`).
+
+---
+
+## 52. Present-destination download check — APPLIED then REVERTED 2026-11-19
+
+The defect: the early return in `download()` for an
+already-present non-empty dest trusted the file — a
+pre-existing truncated file was trusted on re-entry (the pin
+path checks SHA itself, but `process_episode`'s A download
+does not).
+
+Frozen design (written before any test run, tested exactly as
+written): new helper `_head_content_length(url)` issues a HEAD
+request (same User-Agent, 30s timeout), returning `None` when
+the length cannot be determined (absent/unparseable header, any
+request failure incl. 405 — fail open). In the early-return
+branch, if it returns a length and the local size differs, the
+local file is deleted and the normal download loop runs;
+otherwise the file is trusted as before. Fresh downloads issue
+no HEAD. `download()` + helper only, +44 lines. Generic, no
+hardcoded sizes, names, or episode checks.
+
+Tests (a)–(f), all PASS on the test rig: (a) pre-existing
+4,000-byte file + server advertising 10,240 — live control
+trusted it silently (0 HEADs, 0 GETs), patched deleted and
+re-downloaded complete (1 HEAD, 1 GET), mocked and real
+localhost server; (b) complete + matching CL → 1 HEAD, 0 GETs;
+reverse mismatch also re-downloads; (c) no/unparseable CL →
+trusted, 0 GETs; (d) HEAD 405 and connection error → trusted,
+no crash, 0 GETs; (e) SB set identical on all four headlines;
+(f) A-download call path verified by mock.
+
+Applied (combined live md5 ccd70395…, 4,193 lines; combined SB
+re-verification identical on all four headlines). THEN REVERTED
+the same day by the parent: in the clean 289 re-run (entry 49),
+the HEAD check fired on the cached A (local 249,504,239 bytes
+vs server-advertised 243,897,322), deleted the good cached A,
+and downloaded a rotated cut (243,086,482 bytes, sha
+09769e29…, 6,068.98s vs old 6,229.4s). A HEAD after the run
+advertised a third length (250,072,662) — Megaphone rotates
+the A on nearly every request, so a length mismatch does NOT
+mean the local file is truncated. The re-run was confounded
+(detection ran on old-A words + new-A audio) and produced 13
+blocks, 3 of them false — the publish was correctly refused.
+The check is unsafe for rotating sources: it treats rotation
+as truncation. Revert: reverse-applied
+`present_dest_check.patch`; live restored to md5 129f4e34…,
+4,149 lines (the `_b_cache_check` fix only); `py_compile`
+clean; cache fix still present; HEAD helper gone. The patch is
+preserved at `sb_eval/ab/present_dest_check/
+present_dest_check.patch` for a scoped redesign (e.g. only fire
+when the local file is smaller than advertised, or only for
+non-rotating hosts). Record:
+`sb_eval/ab/present_dest_check/` (NOTE.md, patch, drivers,
+results JSONs).
 
 ## Earlier rejected ideas — one-line index
 
