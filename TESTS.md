@@ -2900,6 +2900,63 @@ run.log, run_remeasure.py), per-path dirs `combined_repro37/`,
 
 ---
 
+## 46. False-block adjudication — TRUE COUNT IS 1 (2026-11-18)
+
+The re-measurement's corrected count of 35 was an upper bound: it
+corrected only the extra blocks (rescue + slot) and took the
+detector baseline's false blocks as counted. This run hand-checks
+all 35 against the frozen A transcripts (exact in-span words, no
+margin) to find the true count. The 35 are the detect-only path's
+false_positive_blocks (`fp_detect_only/results.json`) — the same 35
+that remain in the detector path (40 raw minus the 5 adjudicated
+rescue blocks) and the full path (47 raw minus 5 rescue minus 7
+slot blocks).
+
+Verdicts: **32 real paid ads, 2 house-plug-like, 1 true false
+block.** The true false-block count is **1** (4 strict, counting
+self-promotion as false: the 1 true block, the 2 house-plug-like
+detector blocks, and the Sydney live-show promo among the 7
+standalone slot blocks). Comparison: raw 47 → corrected 35 →
+**true 1 (4 strict)**.
+
+The 32 real ads are full sponsor reads with brand names, spoken
+URLs, and calls to action. All 8 already-known real ads were
+re-verified from the transcript and all 8 hold up: unsub-266 ×4
+Progressive, unsub-287 Progressive pre-roll + LeafFilter ×2,
+Acquired Sierra. The 2 house-plug-like blocks are Huberman
+promoting his own book at pre-sale (neuroscience, 127:40–128:08,
+"available by pre-sale at protocolzbook.com") and the Huberman
+what-humans outro (120:52–121:59, follows, five-star reviews,
+newsletter signup at HubermanLab.com). The 1 true false block is
+SN 1102, 110:37–111:16: ordinary show content about a PHP
+vulnerability disclosure; the "Shell.com" mention the block is
+labeled for falls just after the span ends — the duplicate/URL
+evidence came from just outside the block.
+
+Across the 25 episodes the full pipeline marks 75 SB-matched ads
+plus 43 further real paid ads the SB key cannot see (32 baseline +
+5 rescue + 6 slot) — **118 real paid ads in total** — plus 3
+self-promotional blocks and exactly 1 true false block, out of 122
+blocks marked. The detector's "false positives" on this set are
+almost entirely real ads SponsorBlock does not label, because SB
+covers host-read description sponsors only. Per-show true false
+blocks among the 35: SN 1102 has 1; every other show has 0.
+
+Closest call, flagged for re-decision: block 15, the Huberman
+what-humans outro. A generic outro could be read as an "outro
+tail," but the span is dominated by explicit asks for the show's
+own offerings (newsletter signup at HubermanLab.com is the
+centerpiece), which is what a house plug is; it is classified
+house-plug-like. Counting it as a true false block instead would
+make the true count 2, not 1. The reasoning is spelled out in the
+record. Records: `sb_eval/ab/fp_adjudication/`
+(adjudication_35.md, adjudication_35.json, fp35_list.json,
+exact_spans.json, spans.json, extract_spans.py, extract_exact.py,
+build_adjudication.py). No transcript was missing for any episode —
+zero blocks recorded as UNVERIFIED.
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
