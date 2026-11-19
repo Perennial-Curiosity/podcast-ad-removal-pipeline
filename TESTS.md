@@ -2957,7 +2957,7 @@ zero blocks recorded as UNVERIFIED.
 
 ---
 
-## 47. Slot determinism — PIN THE B DOWNLOAD + DRY-ISLAND GATE FIX, HELD (2026-11-18)
+## 47. Slot determinism — PIN THE B DOWNLOAD + DRY-ISLAND GATE FIX, MERGED 2026-11-19
 
 Slot output differed on every run of the same inputs (Ep 289:
 gated slots 7 vs 8, standalone blocks 2 vs 3, the 5925s slot at
@@ -3025,6 +3025,31 @@ than the final retry, which is precisely the instability being
 fixed; the combination's 289 numbers are measured on the frozen
 pair, not the final retry's B.
 
+**MERGED 2026-11-19 (owner directed).** Backup
+`tmp/run_pipeline_pre_slotdet_merge_2026-11-19.py`, md5-verified
+identical to the pre-merge live file. Live run_pipeline.py
+`8aa885fe…` (4,070 lines) → `db41bdf01f5aaab83fa918a4f4bd46d4`
+(4,119 lines) — exactly the expected md5, byte-identical to the
+tested copy; split_rescue.py untouched. Post-merge verification on
+frozen inputs (drivers asserted module `__file__`, live
+`pipeline/` first in `sys.path`): SB detector 0.701 (75/107) /
+FP 40 / median 4.8s / mean 13.1s / within-1s 26.0% / within-2s
+36.7% / max 79.3s; slot-flow 0.682 (73/107) / FP 42; full 0.701
+(75/107) / FP 47 — every headline identical to the pre-merge
+numbers. 286 7/9 ≥80%, 606.7/673s, 0 FP; 287 6/8, 463.0/531s, 1 FP
+(Pepperbox). Synthetic 23/27 ≥50%, 19/27 ≥80%, FP 3, median
+2.55s; TTS 9/9 ≥50%, 8/9 ≥80%, FP 0, median 1.32s; null 8 blocks
+identical. Frozen 289 pair: 11 blocks; 23:38 kept 1398.4–1443.3;
+98:45 dropped; 102:41 kept 6179.0–6228.6. Pin behaviour verified
+on the merged live file: run 1 downloads 1×, transcribes 35
+chunks, 6 slots; runs 2–3 download 0×, 0 new transcriptions
+(35 cache hits), slots byte-identical; corrupt B and missing
+marker each trigger exactly one fresh download with identical
+slots. Records: `sb_eval/ab/slot_determinism/merge_verify/`.
+Nothing published; no Ep 288/289 state modified. The 102:41
+start overshoot remains — fixed by entry 49's held patch, not by
+this merge.
+
 ---
 
 ## 48. Re-score against the adjudicated truth set — TRUE RECALL 0.787, TRUE FP 1 (2026-11-18)
@@ -3061,6 +3086,65 @@ owner ground truth shows slot-flow edges closer (Progressive end
 −3.7s → 0.0s exact; LeafFilter −6.1s → +0.9s, −1.7s → +0.5s).
 Record: `sb_eval/ab/adjudicated_score/` (NOTE.md,
 adjudicated_score.json).
+
+---
+
+## 49. Slot start trim — REPEATED-PHRASE HEAD TRIM, HELD (2026-11-19)
+
+On the frozen 289 pair the tail slot started at 6179.0, ~26s
+before the Focker copy starts at 6205.3 in A. Root cause
+measured, not assumed: the density start-extension accounts for
+only 12.1s of it (9 tokens back from the first differing token
+at 6191.0); the other 14.2s sits inside the slot, because A
+repeats the outro chant "You won the quarter" ~15 times while B
+repeats it ~3 times then plays its own ad — the extra chant
+repetitions are genuine A-vs-B differing tokens, so density
+alone cannot tell chant from ad copy.
+
+Held patch (`sb_eval/ab/slot_start_trim/slot_start_trim.patch`,
+54 lines, `pipeline/slot_align.py` only; NOT applied): in
+`density_slots`, after the existing span is computed, if the
+slot head is ≥3 consecutive repeats of one 4-token phrase,
+advance the start past the last full repeat (remaining slot must
+stay ≥ 8s). `diff_words` is recomputed over the trimmed span
+only when the trim fires; otherwise the live counts are
+preserved exactly. Generic: no names, times, or episode checks.
+
+Measured (baseline reproduced exactly first, fresh
+`fp_trim_base/`): on 289 the tail moves 6179.0 → 6204.9–6228.6
+(+25.1s, 0.4s before the 6205.3 copy start — inside the 1s
+goal); 23:38 kept as merged 1398.4–1443.3; 98:45 dropped;
+11 blocks; no other 289 slot moves. On the 25-episode SB set
+the numbers are IDENTICAL to baseline on every headline —
+slot-flow 0.682 (73/107) / FP 42, full 0.701 (75/107) / FP 47,
+medians and within-1s flat — and raw slots are identical on all
+25 episodes (the trim fires nowhere else). Synthetic/TTS have no
+A/B pair and never import `slot_align`, so no slot regression is
+possible there.
+
+DISCARDED: C1 trim-to-first-differing-token — tail only reaches
+6191.0 (still 14.3s early), splits the 23:38 merged block into
+detector + standalone slot, and drops the real LinkedIn slot
+(7.9s < the 8s minimum). C2 (same trim, but `diff_words`
+recomputed for every slot) — the counting change inflated every
+slot's density and let the Mitochondria outro tail (0.176 →
+0.824) pass the 0.5 floor, +1 SB FP; superseded by C2b, which
+keeps the live counts unless the trim fires. C3
+extension-density requirement and C4 ad-evidence head trim were
+discarded on evidence without a run (no threshold separates the
+tail extension, 5/9 differing, from real ads; C4 duplicates C2b
+with more machinery and a layering violation).
+
+Patch verified: dry-run + apply clean to a fresh live copy,
+compiles, byte-identical to the tested file
+(md5 `222b92a535251787ae86d4fa24e95083`, parent-verified by
+independent dry-run + apply + compile on a fresh copy). Record:
+`sb_eval/ab/slot_start_trim/` (NOTE.md, patch, drivers, variant
+results). No live files modified, nothing merged or published.
+Caveat: the `tracked` field in `variant_trim_c2b.json` shows
+102:41 as empty only because the tracker looks near the old
+start 6179.0; the block is present as `[6204.9, 6228.6, None,
+'slot']` on both paths.
 
 ---
 
