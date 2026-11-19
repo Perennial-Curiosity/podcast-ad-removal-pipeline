@@ -3212,6 +3212,146 @@ deleting the pin would reuse the truncated B and reproduce
 `slots_rejected` identically, so the next step needs the pinned
 B deleted first (or a later re-download).
 
+**SECOND RE-RUN + REPUBLISH — DONE 2026-11-19 (pinned B deleted,
+fresh B, publish gate passed).** The pinned truncated B and its
+marker were both deleted and verified gone; the re-run
+(`tmp/retry289_final.py`, 289 guid only, ~15 min, exit 0, log
+`tmp/retry289_rerun2_2026-11-19.log`) downloaded a fresh B:
+245,506,466 bytes, sha c48dc606…, 6,129.5s vs A 6,229.4s (ratio
+0.016 vs the 0.10 guard — a legitimate rotation difference, not
+truncation). Alignment: 12,011 anchors, differing-token rate
+0.1438, no guards tripped, `dynamic_status=slots`. Block list
+(11): Carvana 0:00–0:30 [merged]; Poncho 15:20–16:05
+[detector]; Vsafe 23:18–24:03 [merged]; Stop Box 31:40–32:15
+[detector]; Ad 38:19–38:47 [merged]; Take Ultra 47:28–49:31
+[detector]; Ad 55:30–56:08 [merged]; FUM 61:00–62:25
+[detector]; Ad 70:24–70:53 [merged]; The Perfect Jean
+74:43–76:40 [detector]; Ad 103:25–103:48 [slot]. Publish gate
+passed: 11 blocks; 23:38 merged into Vsafe (1398.4–1443.3);
+98:45 absent (5928.6–5940.1 rejected `no_ad_evidence`, density
+0.083); the 102:41 slot starts at 6205.2, within 0.1s of the
+6205.3 copy start; the only standalone new slot is 6205.2. The
+38:19, 55:30, 70:24 blocks carry slot edges replacing the old
+detector edges — designed gated-slot behavior, the same slot
+edges as the previous run, not new slots. Publish
+(`tmp/republish289.py`, exit 0): release 445857775 now carries
+the new marked asset, 249,754,974 bytes (was 249,754,901),
+md5 `405ff6453107d077bde5db7d4dab73a4`, byte-identical to the
+local marked file; suspects reel 12,409,241 bytes (unchanged);
+served feed 289 enclosure points at the new asset, length
+249754974 (the old length 249754901 appears 0 times in the
+served feed); ffprobe on the published asset: 11 ad chapters,
+6205.2–6228.6 "Muse Detected Ad" present, no chapter near
+98:45. State publish fields: the landmine fired as expected
+(all four fields None after the re-run); the republish driver
+set them from the upload responses and saved state — no hand
+repair needed (enclosure_bytes 249754974, suspects_bytes
+12409241, parent-verified). The content-length check was live
+during the run but did not fire — the B download completed
+cleanly on the first attempt, no retries. Ep 288 untouched
+(state 12 blocks, no enclosure key, served feed still the
+Megaphone original). History untouched (289 still 10 rows, 288
+still 12 rows; no hand edits).
+
+**PARENT FINDING — stale B transcript cache in the second
+re-run (2026-11-19, found during verification).** The second
+re-run's B transcript reused chunks 000–030 from the truncated
+B: their file timestamps are 12:45–13:11 (the first re-run),
+while only chunks 031–034 were written fresh (15:20–15:22) and
+transcript.json was rebuilt at 15:22. Cause, read in the code:
+`_b_cache_check` drops stale chunks only when the marker file
+exists AND its recorded SHA mismatches the new B's SHA; when
+the marker is missing it writes the new SHA and returns without
+dropping anything. The parent's brief told the coordinator to
+delete BOTH the mp3 and the marker — deleting the marker is
+what defeated the invalidation. (Deleting only the mp3 and
+keeping the marker would have triggered the drop, since the old
+SHA would mismatch.) The 102:41 slot sits in the
+freshly-transcribed tail (chunk 034 covers 6120–6300s) and is
+correct for the fresh B. The four early merged slots' edges
+(23:38, 38:19, 55:30, 70:24) were computed against the
+truncated B's transcript, not the fresh B's — their correctness
+for the fresh B is UNVERIFIED. A targeted check of the fresh B's
+audio at those regions confirms the two downloads differ there
+(the fresh B plays show banter where the truncated B's
+transcript has ad copy), so the edges cannot be assumed right.
+The fix is to make `_b_cache_check` drop the chunks when the
+marker is missing too; then a clean re-run and a re-publish if
+the blocks differ. Open item — not yet designed or tested.
+
+---
+
+## 50. Content-Length check on download() — APPLIED 2026-11-19
+
+The defect: `download()` performed no content-length check, so a
+short read looked like success. This bit us on 2026-11-19:
+Megaphone served a truncated B for Unsubscribe Ep 289 —
+220,200,960 bytes, 5,496.8s vs A 249,504,239 bytes, 6,229.4s; B
+ends mid-sentence ("And he's like,") — and only the duration
+guard (10% duration_ratio) caught it. The download step must
+fail loudly instead.
+
+Frozen design (written before any test run, tested exactly as
+written): inside `download()`, count bytes written during the
+read loop, then read the Content-Length header from the response
+(`r.getheader("Content-Length")`, falling back to
+`r.headers.get(...)`). If the header is present and parses as an
+integer, compare bytes written to it; on ANY mismatch
+(`written != expected`) raise `IOError("download truncated:
+...")` inside the existing `try`, so the existing cleanup
+(partial file deleted) + retry + loud re-raise engage. If the
+header is absent (e.g. chunked encoding) or unparseable, skip
+the check (fail open). Nothing else changes. Generic: no
+hardcoded sizes, names, or episode checks. Callers verified:
+`process_episode` fails loudly; both B flows degrade to
+detector-only.
+
+Tests (a)–(e), all PASS: (a) truncated reproduction 12/12 —
+mocked response (CL 10,240, clean EOF after 4,000 bytes) and a
+real localhost server closing early both raise, dest file
+removed, retried (2 urlopen calls with retries=2);
+CL-smaller-than-body also raises and removes dest. Control on
+pre-change live code: 5/12 — truncated downloads silently
+"saved 4000 bytes" (no IncompleteRead raised), proving the test
+reproduces the defect. (b) Complete download: identical bytes
+(10,240), one urlopen call. (c) Missing Content-Length:
+identical bytes; unparseable header ("garbage") also passes
+(fail open); missing header + short body passes by design. (d)
+SB set: baseline reproduced exactly first (fresh
+`combined_repro_clc`) — detector 0.701 (75/107) / FP 40 /
+median 4.8s / within-1s 26.0%; slot-flow 0.682 (73/107) / FP 42;
+full 0.701 (75/107) / FP 47; patched copy and live-after-apply
+identical on all four headline dicts (incl. detect-only 0.682 /
+FP 35) — zero detection impact. (e) Pin-B path 9/9: run 1
+downloads 1x, transcribes 35 chunks, 6 slots; runs 2–3 download
+0x, transcribe 0, 35 cache hits, identical slots; corrupt B /
+missing marker each re-download 1x with identical slots; prune
+keeps 4 newest siblings; byte-identical B still deleted
+(no_slots); truncated B served → 3 attempts, status b_failed,
+detector-only blocks, no file left behind; complete B after →
+identical slots.
+
+Applied (owner directed as an addition, test-first): backup
+`sb_eval/ab/content_length_check/run_pipeline.py.pre-clc.bak`,
+md5-verified identical to pre-change live. New live
+`pipeline/run_pipeline.py`: md5
+`bfd809200d5aaba9fd269bc570e41749`, 4,145 lines (+26);
+`py_compile` clean; diff live vs tested file empty.
+`split_rescue.py` and `slot_align.py` untouched. Live during
+the 289 second re-run; did not fire — the fresh B download
+completed cleanly on the first attempt. Record:
+`sb_eval/ab/content_length_check/` (NOTE.md, drivers, results
+JSONs). Caveats: the check only catches truncation when the
+server advertises a Content-Length larger than what it sends —
+if a server advertises a CL matching its truncated body, or
+serves chunked with a clean termination, no length check can
+catch it; the duration guard remains the backstop. The early
+return in `download()` for an already-present non-empty dest is
+unchanged; a pre-existing truncated file is still trusted on
+re-entry (the pin path checks SHA itself, but
+`process_episode`'s A download does not) — a possible separate
+task.
+
 ---
 
 ## Earlier rejected ideas — one-line index
