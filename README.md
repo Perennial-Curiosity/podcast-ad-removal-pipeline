@@ -341,12 +341,18 @@ Notes:
   The 150 is a lower bound and 0.787 an upper bound, since missed
   inserted ads are unknown; the false count of 1 is exact for marked
   blocks.
-- **Slot-determinism fix (2026-11-18, HELD, not merged):** pinning the
+- **Slot-determinism fix (2026-11-19, MERGED):** pinning the
   second download and ignoring reverb-only evidence at the slot gate
   (TESTS.md entry 47) makes slot results identical across runs with SB
-  numbers unchanged; the patch is held for the owner's approval. The
-  102:41 start on episode 289 remains ~26s early, a separate edge
-  problem.
+  numbers unchanged; post-merge verification on the frozen set
+  reproduces every headline exactly (detector 0.701/40, slot-flow
+  0.682/42, full 0.701/47).
+- **Slot-start trim (2026-11-19, HELD, not merged):** a slot head of
+  three or more repeats of one short phrase is trimmed past the last
+  full repeat (TESTS.md entry 49) — on episode 289 it moves the 102:41
+  start from 6179.0 to 6204.9, 0.4s before the ad copy starts, with
+  SB numbers identical everywhere else. The patch is held for the
+  owner's approval.
 - **Ollama / LLM reviewer: evaluated 2026-10-14, REJECTED.** It hallucinated
   sponsor reads, missed real ads, produced garbled timestamps, and was
   too slow and memory-hungry. Do not re-add without a fresh evaluation.
