@@ -335,6 +335,18 @@ Notes:
   entry 46) found 32 are real paid ads, 2 are the show promoting
   itself, and exactly 1 is a genuine mistake — the true false-block
   count is 1 (4 counting self-promotion as false).
+- **Adjudicated score (2026-11-18):** scored against the adjudicated
+  truth set of 150 known real ads (TESTS.md entry 48), the pipeline
+  finds 118 — true recall 0.787 — with 1 true false block (4 strict).
+  The 150 is a lower bound and 0.787 an upper bound, since missed
+  inserted ads are unknown; the false count of 1 is exact for marked
+  blocks.
+- **Slot-determinism fix (2026-11-18, HELD, not merged):** pinning the
+  second download and ignoring reverb-only evidence at the slot gate
+  (TESTS.md entry 47) makes slot results identical across runs with SB
+  numbers unchanged; the patch is held for the owner's approval. The
+  102:41 start on episode 289 remains ~26s early, a separate edge
+  problem.
 - **Ollama / LLM reviewer: evaluated 2026-10-14, REJECTED.** It hallucinated
   sponsor reads, missed real ads, produced garbled timestamps, and was
   too slow and memory-hungry. Do not re-add without a fresh evaluation.
