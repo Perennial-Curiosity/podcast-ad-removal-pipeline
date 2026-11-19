@@ -323,6 +323,15 @@ Notes:
   26.0% — identical to the pre-merge baseline; exactly five label
   changes, zero span changes. 286/287 detector numbers unchanged. Full
   numbers in `TESTS.md`.
+- **Full-pipeline re-measurement (2026-11-18):** the whole pipeline
+  as run was scored on the 25-episode set (TESTS.md entry 45). Full
+  pipeline: recall 0.701 (75/107), false blocks 47 raw, 35 after
+  hand-checking the extras — the other 12 are real ads the answer key
+  cannot see (inserted ads and second ads of merged pairs). The slot
+  comparison adds no matched ads and no true false blocks; the rescue
+  adds 2 matched ads and 5 real ones. The earlier full-pipeline
+  figure of 45 was derived arithmetically, not measured; this is the
+  first direct measurement.
 - **Ollama / LLM reviewer: evaluated 2026-10-14, REJECTED.** It hallucinated
   sponsor reads, missed real ads, produced garbled timestamps, and was
   too slow and memory-hungry. Do not re-add without a fresh evaluation.
