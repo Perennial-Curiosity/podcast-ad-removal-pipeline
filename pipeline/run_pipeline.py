@@ -3182,9 +3182,11 @@ def _b_cache_check(b_dir, b_sha256):
     between downloads (ads rotate), so the cached B chunks are only
     valid for the exact B file they were transcribed from. A marker
     file records that file's SHA; a mismatch drops the chunks (and
-    transcript.json) so transcribe_chunked re-transcribes. Without
-    this, a rotated ad would be aligned against a stale B transcript
-    and the slots would be wrong."""
+    transcript.json) so transcribe_chunked re-transcribes. A missing
+    marker drops them too: with no marker there is no evidence the
+    cache belongs to this B file, so it is treated exactly like a
+    mismatch. Without this, a rotated ad would be aligned against
+    a stale B transcript and the slots would be wrong."""
     marker = os.path.join(b_dir, "b_sha256.txt")
     if os.path.exists(marker):
         try:
@@ -3194,15 +3196,17 @@ def _b_cache_check(b_dir, b_sha256):
             pass
         log("  B audio differs from the cached B transcript; "
             "dropping stale B chunks")
-        for f in glob.glob(os.path.join(b_dir, "chunk_*.json")):
-            try:
-                os.remove(f)
-            except OSError:
-                pass
+    else:
+        log("  no B transcript marker; dropping any stale B chunks")
+    for f in glob.glob(os.path.join(b_dir, "chunk_*.json")):
         try:
-            os.remove(os.path.join(b_dir, "transcript.json"))
+            os.remove(f)
         except OSError:
             pass
+    try:
+        os.remove(os.path.join(b_dir, "transcript.json"))
+    except OSError:
+        pass
     with open(marker, "w") as f:
         f.write(b_sha256)
 
