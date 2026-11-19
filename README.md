@@ -360,6 +360,24 @@ Notes:
   blocks; the publish gate failed as designed and nothing was
   published. The blocker is the truncated download, not the pipeline —
   a plain re-run would reuse the pinned truncated copy.
+- **Ep 289 published (2026-11-19, corrected slots):** after the pinned
+  truncated file was deleted, a fresh second download (6,129.5s)
+  produced 11 blocks — the 102:41 chapter starts at 6205.2, within
+  0.1s of the ad copy start, and there is no chapter near 98:45
+  (TESTS.md entry 49). One correction found during verification: the
+  re-run reused the early part of the old truncated download's
+  transcript, because deleting the marker file defeats the cache check
+  — the 102:41 chapter is in the freshly transcribed tail and is
+  correct, but the four earlier merged slots' edges are not yet
+  verified against the fresh download. The fix (make the cache check
+  drop the old transcript when the marker is missing, then a clean
+  re-run and a re-publish if the blocks differ) is an open item.
+- **Content-length check on downloads (2026-11-19, APPLIED):** the
+  download step now compares bytes received against the advertised
+  Content-Length and fails loudly on a short read (TESTS.md entry 50).
+  Tested 12/12 on truncated downloads with zero detection impact; it
+  only catches truncation when the server advertises a larger size
+  than it sends, so the duration guard remains the backstop.
 - **Ollama / LLM reviewer: evaluated 2026-10-14, REJECTED.** It hallucinated
   sponsor reads, missed real ads, produced garbled timestamps, and was
   too slow and memory-hungry. Do not re-add without a fresh evaluation.
