@@ -528,11 +528,37 @@ def download(url, dest, retries=6):
                 log(f"downloading {url}")
             req = urllib.request.Request(url, headers={"User-Agent": "podcast-ad-pipeline/1.0"})
             with urllib.request.urlopen(req, timeout=120) as r, open(dest, "wb") as f:
+                written = 0
                 while True:
                     chunk = r.read(1 << 20)
                     if not chunk:
                         break
                     f.write(chunk)
+                    written += len(chunk)
+                # Content-Length check (2026-11-19): a short read used
+                # to look like success (truncated B for Unsubscribe
+                # 289 was caught only by the duration guard). Generic
+                # check, no hardcoded sizes: compare bytes written to
+                # the advertised length; on a mismatch raise inside
+                # the try so the existing retry/cleanup engages. A
+                # missing or unparseable header (e.g. chunked
+                # encoding) skips the check — fail open.
+                clen = None
+                try:
+                    clen = r.getheader("Content-Length")
+                except AttributeError:
+                    clen = r.headers.get("Content-Length") \
+                        if hasattr(r, "headers") else None
+                expected = None
+                if clen is not None:
+                    try:
+                        expected = int(clen)
+                    except (TypeError, ValueError):
+                        expected = None
+                if expected is not None and written != expected:
+                    raise IOError(
+                        f"download truncated: {url}: got {written} "
+                        f"bytes, expected {expected} (Content-Length)")
             log(f"saved {os.path.getsize(dest)} bytes")
             return
         except Exception as e:
