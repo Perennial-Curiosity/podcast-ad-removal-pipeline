@@ -2813,6 +2813,93 @@ frozen numbers. Automatic run stays paused.
 
 ---
 
+## 45. Full-pipeline re-measurement — FIRST DIRECT MEASUREMENT (2026-11-18)
+
+The numbers reported for the pipeline were the detector path only
+(`detect_ad_blocks` + rescue). The last full-pipeline figures were
+stale — pre-fusion-merge, on a 38-detector basis: slot-flow FP 43,
+full-pipeline FP 45 (the 45 derived arithmetically, never measured
+directly). This run scores all four paths on the frozen 25-episode
+SB set (107 labels) with the current live code
+(run_pipeline.py `8aa885fe…`, split_rescue.py `9323713c…`), frozen
+data only — nothing downloaded or re-transcribed. Baseline
+reproduced exactly first (`combined_repro37` equals
+`merged_live_labels` on every headline, edge stat, per-show, and
+per-episode number).
+
+| Path | Recall | FP (raw) | Median | Mean | Within-1s | Within-2s | Max |
+|---|---|---|---|---|---|---|---|
+| Detector (detect + rescue) | 0.701 (75/107) | 40 | 4.8s | 13.1s | 26.0% | 36.7% | 79.3s |
+| Detect-only (diagnostic) | 0.682 (73/107) | 35 | 4.7s | 12.4s | 26.7% | 37.7% | 79.3s |
+| Slot-flow (detect + slots) | 0.682 (73/107) | 42 | 4.7s | 12.4s | 26.7% | 37.7% | 79.3s |
+| Full (slots + rescue) | 0.701 (75/107) | 47 | 4.8s | 13.1s | 26.0% | 36.7% | 79.3s |
+
+Decomposition. Rescue: +2 matched, +5 FP — all 5 FP rescues are
+adjudicated real ads (entries 38/41: Eight Sleep, Lingo, Our Place,
+Rorra, Shopify). Slot flow: +0 matched, +7 FP, and zero
+matched-edge changes on any of the 25 episodes — its edge
+refinements landed only on blocks SB counts as false positives
+(real dynamic ads without SB labels). Where owner ground truth
+exists the slot edges are closer (unsub-287 Progressive end −3.7s
+→ 0.0s exact; LeafFilter ends −6.1s → +0.9s, −1.7s → +0.5s), but
+SB scoring cannot see it (unsub-287 has only 5 SB labels: no
+Progressive pre-roll, no Leaf Filter).
+
+Adjudication of the 7 standalone slot blocks (re-read from the
+frozen A transcripts; confirms the 2026-11-13 verdicts): 6 real paid
+dynamic ads — LinkedIn (8126.7–8166.3), RaceTrac ×2 (9223.3–
+9252.7, 8412.1–8451.1), HubSpot (8454.6–8487.7), Netflix
+(8433.6–8463.1), Progressive pre-roll (1.0–25.7) — plus 1
+self-promo, the Sydney live-show promo (0.0–21.4, house-plug-like).
+The Mitochondria tail is gone, removed by the density floor. Four
+of the seven carry label None and become plain "Muse Detected Ad"
+chapters in production.
+
+Corrected false-block counts (same convention as 2026-11-13 —
+correct only the extras): detector 35, slot-flow 35 (36 counting
+Sydney), full 35 (36 counting Sydney). After adjudication the full
+pipeline has 35 true false blocks — the same as the detector alone;
+slot flow and rescue add zero true false blocks. Caveat: 35 is an
+upper bound — at least 8 baseline FPs are known real ads SB does not
+label (unsub-287 ×3, unsub-266 ×4 Progressive, Acquired Sierra).
+
+Comparison to the stale figures. Slot-flow FP 43 → 42 (−1): slot
+net effect unchanged at +7; the −1 is the detector baseline moving
+36 → 35 (Mint Mobile phantom gone; neuroscience Helix now matches
+its pair label via the voter extension + guard). Full-pipeline FP 45
+→ 47 (+2): first direct measurement — the stale 45 was derived
+arithmetically. The +2 is the fusion merge's rescue blocks
+(detector 38 → 40); slot net +7 unchanged. Corrected full FP 37 →
+35 (38 → 36 counting Sydney): Mitochondria tail removed by the
+floor (−1) and Mint Mobile phantom gone (−1).
+
+Per-show recall / FP (detector | detect-only | slot-flow | full):
+99pi 1.000/0 across all paths; Acquired 0.000/5 across all;
+Huberman 0.750/14 | 0.688/10 | 0.688/13 | 0.750/17; Lex 0.500/2 |
+0.500/1 | 0.500/1 | 0.500/2; Modern Wisdom 0.625/3 | 0.625/3 |
+0.625/6 | 0.625/6; Security Now 0.769/9 across all; Unsubscribe
+1.000/7 | 1.000/7 | 1.000/8 | 1.000/8; Vergecast 0.500/0 across
+all. Transcript-diff is a verified no-op on the SB set (no
+`transcript_tags` in any frozen episode data file); xep was not run
+in the harness (verified separately, merge_verify §3). Frozen
+inputs: 18 gated slots across 11 episodes (probe.json: 12 dynamic,
+10 static, 3 b_failed); b_failed/static episodes are slot-flow
+no-ops, same as production degradation.
+
+Note: the `merged_live_labels` driver asserts run_pipeline md5
+`9c87823e`, a value no file on disk now has. The live file was
+modified 4 minutes after its `results.json` was written (22:14 →
+22:18 UTC Nov 18), consistent with the wiring-form fix landing
+after its SB verification ran. This re-measurement used the current
+live file (`8aa885fe…`) and reproduces its numbers exactly,
+confirming the difference is immaterial to SB scoring (the harness
+never exercises the call-site expression). Records:
+`sb_eval/ab/full_pipeline_remeasure/` (NOTE.md, results.json,
+run.log, run_remeasure.py), per-path dirs `combined_repro37/`,
+`fp_detect_only/`, `fp_slotflow/`, `fp_full/`.
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
