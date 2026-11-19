@@ -77,6 +77,11 @@ SLOT_GUARD_MAX_DUR_RATIO = 0.10  # |B dur - A dur| / A dur above this: abort
 SLOT_GUARD_MAX_SLOT_SHARE = 0.25  # gated slots > 25% of episode: abort
 SLOT_B_MARGIN_S = 10.0         # B-side gate window margin around mapped B span
 SLOT_FLOOR_DENSITY_MIN = 0.5  # standalone slot density below this: drop (not an ad read)
+SLOT_PINNED_B_KEEP_SIBLINGS = 4  # pinned B mp3s kept per podcast
+# besides the current episode (current + 4 siblings = 5 max,
+# ~1.25 GB at ~250 MB per B). Older pinned Bs are pruned at the
+# next B flow; a pruned episode re-downloads a fresh B on its
+# next run (old behaviour).
 # Transcribe-config fingerprint (2026-11-11): a stored config that differs
 # from the current one invalidates a cached chunk transcript. Missing
 # config = legacy cache (all pre-2026-11-11 caches are base/en/beam5).
@@ -3128,8 +3133,11 @@ def write_feed(state, site_dir, original_xml):
 # standalone detector: each slot must pass an evidence gate, and a gated
 # slot only ever replaces the EDGES of a detector block (or becomes a new
 # chapter when the detector found nothing there). Copy A is always the
-# published copy; chapters live on the A clock; copy B is never published
-# and its mp3 is deleted after alignment (transcript kept).
+# published copy; chapters live on the A clock; copy B is never published.
+# Its mp3 is PINNED (kept) after alignment so repeat runs align the
+# identical A/B pair (slot determinism, 2026-11-18), pruned to the 5
+# newest per podcast — except a byte-identical-to-A B, which is still
+# deleted (no slots, and a duplicate of A is pure waste).
 # ---------------------------------------------------------------------------
 
 def sha256_file(path):
@@ -3181,6 +3189,26 @@ def _cleanup_b_mp3(b_mp3):
         pass
 
 
+def _prune_pinned_b(work, keep=SLOT_PINNED_B_KEEP_SIBLINGS):
+    """Prune pinned B mp3s of sibling episodes (same podcast) to the
+    `keep` newest, so pinning cannot grow disk without bound. The
+    current episode's B is never pruned here; it joins the kept set
+    once pinned. A pruned episode re-downloads a fresh B on its next
+    run (old behaviour) — only the 5 newest episodes per podcast keep
+    run-to-run slot determinism."""
+    parent = os.path.dirname(os.path.abspath(work))
+    cur = os.path.abspath(os.path.join(work, "B", "original.mp3"))
+    paths = [p for p in glob.glob(os.path.join(parent, "*", "B",
+                                               "original.mp3"))
+             if os.path.abspath(p) != cur]
+    paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    for p in paths[keep:]:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
 def _slot_overlap(a0, a1, b0, b1):
     return max(0.0, min(a1, b1) - max(a0, b0))
 
@@ -3191,7 +3219,13 @@ def _slot_gate_a_side(slot, candidates, a_words, nw_a, sponsors, house_plugs):
     falls inside it. Returns evidence string ('detector' | 'mention')
     or None."""
     s, e = slot["start"], slot["end"]
-    for cs, ce, _l, _m in candidates:
+    for cs, ce, _l, m in candidates:
+        # Dry islands are single-vote reverb suspects, not detector
+        # evidence (slot determinism, 2026-11-18, candidate 3c): a slot
+        # whose only candidate overlap is a dry island passes the gate
+        # on noise. Any other method still passes.
+        if m == "reverb":
+            continue
         if _slot_overlap(s, e, cs, ce) > 0:
             return "detector"
     variants = set()
@@ -3438,12 +3472,31 @@ def run_slot_flow(work, a_words, a_duration, a_mp3_path, a_sha256, b_url,
               "slots": [], "rejected": [], "b_sha256": None,
               "b_duration": None, "differing_token_rate": None,
               "n_anchors": None}
-    # B download (fresh each time unless a path was supplied, e.g. the
-    # probe download or a validation fixture).
+    # B download: reuse a pinned B when one is valid (slot
+    # determinism, 2026-11-18 — a fresh download every run rotates the
+    # dynamic ads and re-transcription moves slot edges, so repeat runs
+    # of the same episode gave different slots). A pin is valid when
+    # the B mp3 is present and b_sha256.txt records the same SHA;
+    # _b_cache_check below then keeps the matching transcript cache,
+    # and transcribe_chunked reuses the cached chunks, so a re-run
+    # aligns the identical A/B pair. Otherwise download fresh
+    # (existing behaviour, including the probe/supplied-path case).
+    _prune_pinned_b(work)
+    pinned = False
     if b_mp3_path is None and os.path.exists(b_mp3):
-        os.remove(b_mp3)
+        marker = os.path.join(b_dir, "b_sha256.txt")
+        if os.path.exists(marker):
+            try:
+                if open(marker).read().strip() == sha256_file(b_mp3):
+                    pinned = True
+                    log("  reusing pinned B download "
+                        f"({os.path.getsize(b_mp3)} bytes)")
+            except OSError:
+                pass
+        if not pinned:
+            os.remove(b_mp3)
     try:
-        if b_mp3_path is None:
+        if b_mp3_path is None and not pinned:
             download(b_url, b_mp3, retries=3)
     except Exception as exc:
         log(f"  B download failed ({exc!r}); detector-only output")
@@ -3472,7 +3525,6 @@ def run_slot_flow(work, a_words, a_duration, a_mp3_path, a_sha256, b_url,
         result["status"] = "slots_rejected"
         result["rejected"] = [{"reason": "align_error",
                                "detail": repr(exc)}]
-        _cleanup_b_mp3(b_mp3)
         return result
     result["differing_token_rate"] = aligned["differing_token_rate"]
     result["n_anchors"] = aligned["n_anchors"]
@@ -3516,14 +3568,12 @@ def run_slot_flow(work, a_words, a_duration, a_mp3_path, a_sha256, b_url,
         result["status"] = "slots_rejected"
         result["guards"] = guards
         result["slots"] = gated  # kept for review, not merged
-        _cleanup_b_mp3(b_mp3)
         _write_align_result(work, a_sha256, b_sha256, aligned, gated,
                             rejected, guards)
         return result
     if not gated:
         log("  no gated slots; detector-only output")
         result["status"] = "no_slots"
-        _cleanup_b_mp3(b_mp3)
         _write_align_result(work, a_sha256, b_sha256, aligned, gated,
                             rejected, guards)
         return result
@@ -3537,7 +3587,6 @@ def run_slot_flow(work, a_words, a_duration, a_mp3_path, a_sha256, b_url,
     result["blocks"] = merged
     result["sources"] = sources
     result["slots"] = gated
-    _cleanup_b_mp3(b_mp3)
     _write_align_result(work, a_sha256, b_sha256, aligned, gated,
                         rejected, guards)
     return result
