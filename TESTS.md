@@ -3089,7 +3089,7 @@ adjudicated_score.json).
 
 ---
 
-## 49. Slot start trim — REPEATED-PHRASE HEAD TRIM, HELD (2026-11-19)
+## 49. Slot start trim — REPEATED-PHRASE HEAD TRIM, MERGED 2026-11-19
 
 On the frozen 289 pair the tail slot started at 6179.0, ~26s
 before the Focker copy starts at 6205.3 in A. Root cause
@@ -3145,6 +3145,72 @@ Caveat: the `tracked` field in `variant_trim_c2b.json` shows
 102:41 as empty only because the tracker looks near the old
 start 6179.0; the block is present as `[6204.9, 6228.6, None,
 'slot']` on both paths.
+
+**MERGED 2026-11-19 (owner directed).** Backup
+`tmp/slot_align_pre_starttrim_merge_2026-11-19.py`, md5-verified
+identical to the pre-merge live file. Live slot_align.py
+`8b708f88…` (325 lines) → `222b92a535251787ae86d4fa24e95083`
+(360 lines) — exactly the expected md5, diff-clean against the
+tested copy; run_pipeline.py and split_rescue.py unchanged.
+Post-merge verification on frozen inputs (baseline gate
+reproduced exactly first; drivers asserted module `__file__`,
+live `pipeline/` first in `sys.path`): SB detector 0.701
+(75/107) / FP 40 / median 4.8s / mean 13.1s / within-1s 26.0% /
+within-2s 36.7% / max 79.3s; slot-flow 0.682 (73/107) / FP 42;
+full 0.701 (75/107) / FP 47 — every headline identical to the
+pre-merge numbers. 286 7/9 ≥80%, 606.7/673s, 0 FP; 287 6/8,
+463.0/531s, 1 FP (Pepperbox). Frozen 289 pair: 11 blocks;
+102:41 at 6204.9–6228.6; 23:38 kept as merged 1398.4–1443.3;
+98:45 dropped; raw slots identical on all 25 episodes. Records:
+`sb_eval/ab/slot_start_trim/merge_verify/`. One correction
+during verification: the first detector-path scorer returned the
+detect-only headline (0.682/73/FP 35) because it scored raw
+`blocks_det`; corrected to detector + rescue from the frozen
+merge inputs, it gives the expected 0.701/75/FP 40 exactly.
+
+**Ep 289 re-run with the merged pipeline — DONE 2026-11-19,
+PUBLISH GATE FAILED, nothing published.** The re-run (18:41–
+19:14 CST, ~33 min, pipeline's own retry path, 289 guid only)
+completed with no crash, A transcript reused from cache, B
+downloaded fresh — but Megaphone served a truncated B:
+220,200,960 bytes, 5,496.8s (91:37) vs A 249,504,239 bytes,
+6,229.4s (103:49); B ends mid-sentence at 5,496.8 ("And he's
+like,") while A continues, and B starts inside the Carvana
+pre-roll. |B−A|/A = 11.76%, over the 10% `duration_ratio`
+guard, so the slot flow rejected all slots
+(`slots_rejected`). `download()` does no content-length check,
+so the short read looked like success — the duration guard is
+what caught it. The re-run produced 10 detector-only blocks
+(Carvana 0:00, Poncho 15:20, Vsafe 23:18, Stop Box 31:40,
+Dry-Island 38:05, Take Ultra 47:27, Dry-Island 55:25, FUM
+61:00, Dry-Island 70:25, The Perfect Jean 74:43); only Poncho's
+end differs from the published file (965.3 vs 961.5). The 5
+gated slots (0.0–30.0, 1417.1–1443.3, 2298.8–2327.1,
+3329.9–3368.0, 4224.4–4253.3) are all real detector-evidence
+slots that would only have adjusted detector edges, but they
+were never merged because the guard rejected the whole set; the
+giant rejected slot 5499.7–6228.6 (728.9s, `too_long`) is the
+missing-tail artifact of the truncated B, not an ad; the 98:45
+and 102:41 regions have no B counterpart at all in this
+download. The publish gate failed as designed — the re-publish
+driver was written and verified but not run, and no hand-picking
+was done. Published state unchanged (parent-verified live:
+release 445857775 still carries the 10-block asset,
+249,754,901 bytes, + suspects reel 12,409,241 bytes; served
+feed blob sha unchanged). State: 289 now holds the re-run
+(`slots_rejected`, 10 blocks, local marked file 249,754,856
+bytes; new B pinned, sha 75067c51…); the state-repair landmine
+fired as expected — `process_episode` dropped the four publish
+fields, restored by hand to match published reality
+(enclosure_bytes 249754901, suspects_bytes 12409241,
+parent-verified). Ep 288 untouched (state sha identical,
+history still 12 rows, feed enclosure still the original
+Megaphone URL). History untouched (289 still 10 rows; no hand
+edits). Log: `tmp/retry289_rerun_2026-11-19.log`. The blocker is
+the truncated B, not the pipeline: a plain re-run without
+deleting the pin would reuse the truncated B and reproduce
+`slots_rejected` identically, so the next step needs the pinned
+B deleted first (or a later re-download).
 
 ---
 
