@@ -213,14 +213,49 @@ def density_slots(regions, wa, ka, window=DENSITY_WINDOW, thresh=DENSITY_THRESH,
                 b += 1
         while b > ds[-1] and not differs[b]:
             b -= 1
+        trimmed = False
+        # CANDIDATE C2b (slot_start_trim, 2026-11-19): repeated-phrase
+        # head trim. A slot head that is consecutive repeats of one
+        # 4-token phrase (a chant / singalong — show content whose
+        # repeat count differs between downloads, so difflib marks the
+        # extra copies as differing) is not ad copy: advance past the
+        # last full repeat. Generic: no names, times, or episode
+        # checks. Guards: >=3 consecutive repeats, and the remaining
+        # slot must still be >= min_dur. diff_words is recomputed over
+        # the trimmed span (the old count spans the coarse slot and
+        # would overstate density after a long trim).
+        if b - a >= 12:
+            phrase = tuple(norm(wa[ka[a + j]][2]) for j in range(4))
+            reps = 0
+            while (a + (reps + 1) * 4 + 3 <= b and
+                   tuple(norm(wa[ka[a + reps * 4 + j]][2])
+                         for j in range(4)) == phrase):
+                reps += 1
+            if reps >= 3:
+                a_new = a + reps * 4
+                if wa[ka[b]][1] - wa[ka[a_new]][0] >= min_dur:
+                    a = a_new
+                    trimmed = True
         # NOTE: no start trim — the density extension deliberately reaches
         # back over coincidental matching common words at the ad opening;
         # trimming to the first differing token undoes it (v5 bug, fixed).
         t0 = wa[ka[a]][0]
         t1 = wa[ka[b]][1]
         if t1 - t0 >= min_dur:
-            out.append([round(t0, 1), round(t1, 1), len(ds), s1 - s0,
-                        a, b + 1])
+            # CANDIDATE C2b (2026-11-19): only recompute diff_words
+            # when the head trim actually fired. Counting differing
+            # tokens over the extended span [a, b] instead of the
+            # coarse span inflates density for EVERY slot (C2: the
+            # Huberman Mitochondria outro tail went 0.176 -> 0.824
+            # and passed the 0.5 standalone floor, +1 SB FP); with no
+            # trim the live count must be preserved exactly.
+            if trimmed:
+                diff_out = sum(1 for i in range(a, b + 1) if differs[i])
+                span_out = b + 1 - a
+            else:
+                diff_out, span_out = len(ds), s1 - s0
+            out.append([round(t0, 1), round(t1, 1), diff_out,
+                        span_out, a, b + 1])
     return out, total_diff, n
 
 
