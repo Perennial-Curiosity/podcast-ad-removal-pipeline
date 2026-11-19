@@ -347,12 +347,19 @@ Notes:
   numbers unchanged; post-merge verification on the frozen set
   reproduces every headline exactly (detector 0.701/40, slot-flow
   0.682/42, full 0.701/47).
-- **Slot-start trim (2026-11-19, HELD, not merged):** a slot head of
+- **Slot-start trim (2026-11-19, MERGED):** a slot head of
   three or more repeats of one short phrase is trimmed past the last
   full repeat (TESTS.md entry 49) — on episode 289 it moves the 102:41
   start from 6179.0 to 6204.9, 0.4s before the ad copy starts, with
-  SB numbers identical everywhere else. The patch is held for the
-  owner's approval.
+  SB numbers identical everywhere else. Post-merge verification
+  reproduces every headline exactly.
+- **Ep 289 re-run (2026-11-19, publish HELD):** the re-run with the
+  merged pipeline completed in ~33 min, but Megaphone served a
+  truncated second download (5,496.8s vs 6,229.4s), so the duration
+  guard rejected all slots and the re-run produced 10 detector-only
+  blocks; the publish gate failed as designed and nothing was
+  published. The blocker is the truncated download, not the pipeline —
+  a plain re-run would reuse the pinned truncated copy.
 - **Ollama / LLM reviewer: evaluated 2026-10-14, REJECTED.** It hallucinated
   sponsor reads, missed real ads, produced garbled timestamps, and was
   too slow and memory-hungry. Do not re-add without a fresh evaluation.
