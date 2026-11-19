@@ -2957,6 +2957,113 @@ zero blocks recorded as UNVERIFIED.
 
 ---
 
+## 47. Slot determinism — PIN THE B DOWNLOAD + DRY-ISLAND GATE FIX, HELD (2026-11-18)
+
+Slot output differed on every run of the same inputs (Ep 289:
+gated slots 7 vs 8, standalone blocks 2 vs 3, the 5925s slot at
+density 0.359 / 0.564 / absent, tail start 6159.8 → 6179.0 →
+6161.1). Root cause measured, not assumed: the v5b aligner is
+already deterministic — 3 runs on each of 13 frozen A/B pairs
+(289 + 12 dynamic SB episodes) are byte-identical and match the
+frozen align records exactly, and the 289 gate + merge replayed 3x
+is byte-identical with merged blocks equal to the RUN B log. The
+instability is input-side: B is re-downloaded fresh every run (ads
+rotate) and re-transcribed every run (Whisper varies).
+
+Held patch (`sb_eval/ab/slot_determinism/slot_determinism.patch`,
+137 lines, `run_pipeline.py` only; NOT applied): (1) pin the B
+download — keep `work/B/original.mp3` after alignment and reuse it
+when `b_sha256.txt` records the same SHA, so re-runs align the
+identical A/B pair; corrupt B / missing marker re-download fresh;
+byte-identical-to-A B still deleted; siblings pruned to the 4
+newest (5 pinned Bs per podcast max, ≈1.25 GB at ~250 MB per B;
+289's B was 250,312,988 bytes). (3c) A-side gate ignores `reverb`
+(dry-island) candidates — a slot whose only candidate overlap is a
+single-vote dry island passes the gate on noise; exactly one such
+slot exists across all 28 raw slots (289's 5926.4–5940.1), and the
+B-side gate does not rescue it.
+
+Measured on the frozen SB set (baseline reproduced exactly first,
+`combined_repro38`): combination SB numbers IDENTICAL to baseline
+on every headline — slot-flow 0.682 (73/107) / FP 42, full 0.701
+(75/107) / FP 47, medians and within-1s flat. On the frozen 289
+pair: 11 blocks (was 12); 23:38 kept as merged 1398.4–1443.3; 98:45
+dropped; 102:41 kept as 6179.0–6228.6, still ~26s early — the start
+overshoot is a separate edge problem, not fixed here. Pin test
+(mocked download/transcription): 3 repeat runs byte-identical
+slots, 0 re-downloads, 0 re-transcriptions; corrupt-B and
+missing-marker both re-download; prune keeps 4 newest siblings.
+
+DISCARDED: (2) deterministic anchor selection — the aligner is
+already deterministic, nothing to fix. (3a) density floor 0.7 and
+(3b) min diff-words ≥ 40 — both drop the 289 noise slot but also
+the real LinkedIn ad (0.677 / 21 words vs noise 0.682 / 30 words:
+no threshold separates them); SB FP 42 → 41 / 47 → 46 looks better
+only because SB never labels dynamic ads. (3a) floor 0.6 — no-op,
+identical to baseline everywhere.
+
+Patch verified: dry-run + apply clean to a fresh live copy,
+compiles, byte-identical to the tested files
+(md5 `db41bdf01f5aaab83fa918a4f4bd46d4`, parent-verified by
+independent dry-run + apply + compile on a fresh copy). Record:
+`sb_eval/ab/slot_determinism/` (NOTE.md, patch, drivers, variant
+results). No live files modified, nothing merged or published.
+
+Corrections to the record: the variant NOTE.md's "29 raw slots"
+is a count error — `gate_evidence.json` has 28 rows (parent
+verified); the decisive finding (exactly one dry-island-only slot)
+is unaffected. The 289 replay's detector stage does not match RUN
+B's log-extracted detector list (7 vs 10 blocks) because the
+extraction reads "refine" lines, which the three Dry-Island blocks
+lack in RUN B's log — a logging/extraction artifact, not a run
+difference; the merged output matches RUN B exactly. The frozen
+pair's baseline differs from the final retry's state by design
+(12 blocks, vsafe extended to 1443.3, 102:41 start 6179.0, vs the
+final retry's 13 blocks, vsafe unextended plus a separate slot,
+102:41 start 6161.1) — the frozen pair uses a different B download
+than the final retry, which is precisely the instability being
+fixed; the combination's 289 numbers are measured on the frozen
+pair, not the final retry's B.
+
+---
+
+## 48. Re-score against the adjudicated truth set — TRUE RECALL 0.787, TRUE FP 1 (2026-11-18)
+
+The SB-keyed numbers understate the pipeline: SB labels cover
+host-read description sponsors only, so 43 real ads the pipeline
+finds have no label. The adjudicated truth set is 107 SB labels +
+43 extras (32 baseline + 5 rescue + 6 slot) = 150 known real ads.
+The full pipeline marks 122 blocks: 118 real paid ads, plus 3
+self-promotional blocks, plus 1 true false block. **True recall
+0.787 (118/150)** vs SB-keyed 0.701 (75/107). **True FP 1** (4
+strict, counting the 3 self-promotional blocks as false).
+
+Per-show (true ads / found / true recall / SB recall / true FP /
+strict FP): 99pi 3/3/1.000/1.000/0/0; Acquired 9/5/0.556/0.000/0/0;
+Huberman Lab 47/39/0.830/0.750/0/2; Lex Fridman 6/4/0.667/0.500/
+0/0; Modern Wisdom 21/15/0.714/0.625/0/1; Security Now 34/28/
+0.824/0.769/1/1; Unsubscribe 18/18/1.000/1.000/0/0; Vergecast
+12/6/0.500/0.500/0/0. Totals: 150/118/0.787/0.701/1/4. Extras
+breakdown closes: baseline 32 (Acquired 5, Huberman 8, Lex 1,
+Modern Wisdom 3, Security Now 8, Unsubscribe 7) + rescue 5
+(Huberman 4, Lex 1) + slot 6 (Huberman 3, Modern Wisdom 2,
+Unsubscribe 1). Block composition closes: 118 real + 3 self-promo
++ 1 true false = 122.
+
+Caveat, precisely: 150 is a lower bound on the true ad count and
+0.787 is an upper bound on true recall — the 32 missed are SB
+labels only, missed dynamic ads are unknown. The true FP of 1 is
+exact for marked blocks (all 122 adjudicated). Edge stats are
+SB-based only (median 4.8s, mean 13.1s, within-1s 26.0%,
+within-2s 36.7%, max 79.3s), covering the 75 SB-matched ads; the
+43 extras have no independent true edges, except unsub-287 where
+owner ground truth shows slot-flow edges closer (Progressive end
+−3.7s → 0.0s exact; LeafFilter −6.1s → +0.9s, −1.7s → +0.5s).
+Record: `sb_eval/ab/adjudicated_score/` (NOTE.md,
+adjudicated_score.json).
+
+---
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
