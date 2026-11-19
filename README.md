@@ -369,9 +369,20 @@ Notes:
   transcript, because deleting the marker file defeats the cache check
   — the 102:41 chapter is in the freshly transcribed tail and is
   correct, but the four earlier merged slots' edges are not yet
-  verified against the fresh download. The fix (make the cache check
-  drop the old transcript when the marker is missing, then a clean
-  re-run and a re-publish if the blocks differ) is an open item.
+  verified against the fresh download. The cache-check fix (entry 51)
+  is live.
+- **Ep 289 clean re-run (2026-11-19, STOP, no re-publish):** with the
+  cache-check fix live and the second download fully re-transcribed,
+  the run was confounded — a new present-destination download check
+  (entry 52) deleted the good cached episode audio because Megaphone
+  rotates the episode on nearly every request, so detection ran on
+  old words over new audio and produced 13 blocks, 3 of them false,
+  with no 102:41 chapter. The published 11-block file stands and is
+  verified unchanged. The download check was REVERTED the same day
+  (live is now the cache-check fix only). Open items: the episode
+  transcript cache needs the same SHA-based invalidation as the
+  second-download cache, and state 289 now lists the 13 confounded
+  blocks against the 11-block published file (decision pending).
 - **Content-length check on downloads (2026-11-19, APPLIED):** the
   download step now compares bytes received against the advertised
   Content-Length and fails loudly on a short read (TESTS.md entry 50).
