@@ -331,7 +331,10 @@ Notes:
   comparison adds no matched ads and no true false blocks; the rescue
   adds 2 matched ads and 5 real ones. The earlier full-pipeline
   figure of 45 was derived arithmetically, not measured; this is the
-  first direct measurement.
+  first direct measurement. A full hand-check of all 35 (TESTS.md
+  entry 46) found 32 are real paid ads, 2 are the show promoting
+  itself, and exactly 1 is a genuine mistake — the true false-block
+  count is 1 (4 counting self-promotion as false).
 - **Ollama / LLM reviewer: evaluated 2026-10-14, REJECTED.** It hallucinated
   sponsor reads, missed real ads, produced garbled timestamps, and was
   too slow and memory-hungry. Do not re-add without a fresh evaluation.
