@@ -3831,6 +3831,149 @@ recorded revision; cross-process load-modify-save
 last-writer-wins across whole runs remains. The re-audit ("run
 the audit again") is a separate step, not yet run.
 
+---
+
+## 55. Re-audit after the fix round — 2026-11-19/20
+
+Owner: "write and apply fixes for all 61 findings, then run the
+audit again." Three fresh teams re-audited the FIXED pipeline,
+read-only, with the same subsystem split. Record:
+`sb_eval/ab/audit_2026-11-20/FINDINGS.md` (736 lines), per-team
+files under team1/, team2/, team3/.
+
+Verification of the original 61: **54 FIXED, 7 PARTIALLY
+FIXED, 0 NOT FIXED.** The 7 partials, with the residual each:
+C1 (publish_github.py has the feed_pushed checkpoints, but
+tmp/republish289.py still saves state before the feed push and
+sets no flag); C2 (the 6.5s shard is gone, but the re-check
+enforces only the 30s floor, not the 45s single-method floor —
+a 40s single-method block is kept; documented design choice);
+M2 (probe-0 and empty-transcript guards work, but 5 words / 5s
+still passes — the rate floor only applies at duration ≥ 60s);
+M23 (snap direction corrected at all three named sites, but a
+raw edge falling strictly inside a silence is never snapped,
+and find_opening / _first_opening_cue_after still return the
+silence start); M34 (flag and attempts persisted immediately
+with a crash cap of 3, but the no-slots streak / flag-clear is
+still in-memory-only); m13 (word ordering fixed and confirmed,
+but the detection horizon is still the last transcribed word,
+not the audio); m19 (corrupt chunk/transcript handling works,
+but IndexError is in neither corrupt-cache except tuple).
+
+**M19 INVALID verdict: CONFIRMED CORRECT.** Team 2 re-ran the
+measurement driver against live slot_align.py: all 18 frozen
+gated slots reproduce exactly; false slot 0.176 vs lowest true
+0.677 (gap 0.501, floor 0.5 sits in it). Options A/B collapse
+or invert the gap. No behaviour change is the right outcome.
+
+A transcript cache fix: FIXED in code, NOT YET REMEDIATED on
+disk. The a_identity.json sidecar works (mismatch and
+missing-identity caches are dropped and re-transcribed), but
+289's A dir is still in its pre-fix state: 35 chunk files /
+19,074 words vs transcript.json 18,830 words / 6068.98s, stale
+chunk_034.json (244 words) still present, no a_identity.json,
+no download sidecar. No run has occurred since the fix
+(nightly paused). A sweep of all 21 on-disk episode dirs found
+289 as the only chunk/transcript mismatch; the stale chunk is
+currently harmless (all live readers filter by duration) and
+will sit there until 289 is re-processed.
+
+289 state repair: VERIFIED COMPLETE. Live state lists exactly
+the 11 published blocks, matching snapshot_pre.json exactly
+(edges, sponsors, sources); ads_marked 11;
+ads_marked_seconds 600.6337190000007; enclosure_bytes 249754974
+and suspects_bytes 12409241 intact; local feed.xml carries
+249754974 once, old 249754901 zero times; 288 untouched (12
+blocks, no enclosure).
+
+Remaining findings — **1 CRITICAL, 7 MAJOR, 22 MINOR (30
+total)** (31 raw team findings minus 1 duplicate merged).
+**CRITICAL: T2-N3 — Generic label parts collide as sponsor
+identity, deleting a whole ad.** `_merge_slots` and the
+heat-map gap-merge compare label parts; every weak-stripped
+block has part `ad` and every voice/reverb-only region has
+part `dry-island`. Repro: two `voice/reverb:ad` blocks + one
+slot → one block, second ad deleted; two voice+reverb regions
+(Acme 100–160s, Beta 175–235s) gap-merge into one block (100,
+236, 'reverb/voice:ad'). Parent confirmed both comparison
+sites in the live code (`_merge_slots`: the C3 collapse test
+`len({_xep_part(...)}) != 1`; gap-merge:
+`merged_blocks[-1][2].split(':')[-1] == l.split(':')[-1]`).
+Fix direction: never collapse/merge on a generic/artifact part
+alone. **MAJOR (7):** T1-N7 (a truncated-but-parseable legacy
+file is blessed permanently, not "once" — measured: an mp3
+truncated to 2% of its bytes still probes at full header
+duration (120.0s), so ffprobe cannot detect truncation; no
+live instance found, but every live file is currently
+sidecar-less); T2-N1 (pause-snapping misses a raw edge inside
+a silence); T2-N2 (find_opening / _first_opening_cue_after
+return the silence START); T2-N4 (split-rescue can emit two
+overlapping blocks for the same sponsor from one region);
+T2-N5 (a slot over an ad block AND a following plug block
+overwrites the plug); T3-N1 (publish_feed.py sets
+feed_pushed=True after a local-only feed regeneration; the
+served feed is never pushed — fix-introduced, the C1 shape
+reintroduced by the fix's own flag assignment); T3-N2
+(publish_github.py reuses a release asset by name + size, so an
+edge-only re-mark silently reuses the stale asset — reproduced:
+two chapter sets, same sponsors/titles, different edges →
+identical size (1,924,259 bytes), different SHA-256; the reuse
+branch selects the stale asset and verification passes
+trivially — fix-introduced). **MINOR (22):** T1-N1…N6, N8–N12
+(cache-drop failures swallowed; rejected pin silently reused;
+plausibility guard has no absolute floor; IndexError still
+missed; slots_only_mode reads the chunk cache with no
+guard/identity check; pre-patch chunks accepted with no
+recorded revision — known limitation (b), confirmed real;
+unverified pinned B accepted on the duration guard alone; XEP
+cache key doesn't bind span parameters; _retry_dynamic_only
+trusts stored transcript + on-disk A with no identity check;
+fetch_transcript small-body error bypasses retry/curl fallback;
+dynamic_slots/align.py still has its own unfiltered
+load_words), T2-N6…N8 (weak-stripped blocks reported as missed
+sponsors; detection horizon still the last transcribed word;
+multi-token matching asymmetric on singular/plural), T3-N3…
+N9, N11 (republish289.py M37 branch clears suspects fields
+while the asset is still live; save_state backup stamp is
+1-second resolution — 8 rapid saves produce 1 .bak, not 5;
+save_state archives a corrupt current state.json as a backup
+without validating it; M30 replace drops verified=true flags —
+23 live verified rows affected; republish_needed is
+edges-only, so a sponsor rename never flags a re-publish;
+no-slots streak still in-memory-only; cross-process
+load-modify-save last-writer-wins remains — fix team's
+recorded limitation (a), confirmed by repro;
+tmp/retry289_final.py is a stale driver that would clobber the
+repaired 289 state if re-run). Fix-introduced findings: T3-N1,
+T3-N2, T3-N3, T3-N6, plus new-code T3-N4, T3-N5, T3-N7 (7).
+
+SB re-measurement: Team 2's independent run of the existing
+harness on the live tree, fresh variant dirs, frozen data only
+— **exact match, zero diff** (detector 0.757 (81/107)/FP
+37/median 4.8s/within-1s 25.9%; detect-only 0.738 (79/107)/FP
+31; slot-flow 0.738 (79/107)/FP 38; full 0.757 (81/107)/FP
+44; headlines, aggregates, and all 25 per-episode scores
+identical to sb_coord_consolidated.json; only difference
+anywhere: a run-time timestamp string in one episode's slot
+log). Coverage: all three teams fully read their subsystems
+end to end; not finished: the detection core (~lines 666–3070
+except cited spots) for Team 3, and cross-team internals
+outside each team's subsystem. Checked-and-benign, not filed:
+detect_narrative_breaks is dead code; find_pause_before/after
+docstrings inverted vs correct code; B-only retry's rescue
+no-op; _save_state_quietly swallowing saves by design;
+publish_feed's unvalidated json.loads (pre-existing); M35's
+missing item-count check. Noted, not filed: stray inert file
+pipeline/run_pipeline.py.orig (178 KB, Nov 18) sits in the live
+pipeline dir. Uncertain items (stated as such, not findings):
+T3-N8 rests on a static trace (no repro run); T1-N7's "no live
+instance" is bounded by the 21 retained transcripts' word
+rates. Live tree unchanged by the re-audit (run_pipeline.py
+md5 still e3f0c558…), confirming read-only. Parent verified:
+FINDINGS.md 736 lines; live md5s unchanged; SB re-measurement
+JSON matches the fix round exactly; both T2-N3 comparison
+sites read in the live code.
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
