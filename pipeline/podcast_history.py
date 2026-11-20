@@ -37,9 +37,11 @@ Rules (see history/README.md for the full format document):
   ad fields blank) so the average ad count stays honest. Rows are
   never written for a failed run: the collector is called only after a
   successful detection.
-- Re-processing an episode does not duplicate its rows: append_episode
-  skips an episode_id that already has rows (first write wins; delete
-  the episode's rows from the CSV to re-record it).
+- Re-processing an episode REPLACES its rows (M30, 2026-11-19):
+  append_episode deletes the episode's existing rows and writes the
+  new ones in one locked atomic rewrite, stamped with the new
+  processed_at / pipeline version. History is a record of what the
+  pipeline currently believes, not of its first run.
 - The loader EXCLUDES house-plug rows from all ad averages and slot
   statistics (they are counted separately). Zero-ad rows count toward
   the episode count but not toward slot statistics.
@@ -51,10 +53,13 @@ Rules (see history/README.md for the full format document):
   reports the count.
 """
 
+import contextlib
 import csv
 import datetime
+import fcntl
 import os
 import statistics
+import tempfile
 from email.utils import parsedate_to_datetime
 
 COLUMNS = [
@@ -253,6 +258,54 @@ def build_rows(episode_id, episode_title, episode_duration_s, pub_date,
     return rows
 
 
+@contextlib.contextmanager
+def _history_lock(history_dir, podcast_id):
+    """Exclusive per-file lock (M31, 2026-11-19).
+
+    Held across load -> dedup/replace decision -> whole-file rewrite,
+    so two concurrent writers cannot both pass the duplicate check
+    and duplicate an episode's rows. The lock file lives next to the
+    CSV and is never deleted."""
+    os.makedirs(history_dir, exist_ok=True)
+    lock_path = history_path(history_dir, podcast_id) + ".lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _title_date_key(title, pub_date):
+    """(normalised title, parsed pub_date): the second dedup key (m20).
+
+    Catches rows written under a different episode_id for the same
+    episode (the live backfill rows use a slug id, the live writer
+    uses the RSS guid). The date must be present on both sides, so
+    undated rows never match by title alone."""
+    t = (title or "").strip().lower()
+    d = parse_pub_date(pub_date)
+    return (t, d) if t and d else None
+
+
+def _load_raw_rows(history_dir, podcast_id):
+    """Raw string rows of a history CSV (no type conversion).
+
+    Used by append_episode for the atomic rewrite: kept rows are
+    written back byte-for-byte instead of round-tripping through
+    load_rows(), which converts verified to bool ("True" vs the
+    file's "true") and floats back to strings."""
+    path = history_path(history_dir, podcast_id)
+    if not os.path.exists(path):
+        return []
+    with open(path, newline="", encoding="utf-8") as f:
+        return [{k: (v or "") for k, v in r.items()}
+                for r in csv.DictReader(f)]
+
+
 def append_episode(history_dir, podcast_id, episode_id, episode_title,
                    episode_duration_s, pub_date, blocks, sources,
                    house_plugs, pipeline_version, processed_at=None,
@@ -260,32 +313,66 @@ def append_episode(history_dir, podcast_id, episode_id, episode_title,
     """Append one episode's rows to history/<podcast_id>.csv.
 
     Never raises: any failure returns {'ok': False, 'error': ...} and
-    the caller (the pipeline) logs and continues. An episode_id that
-    already has rows is skipped (first write wins).
-    Returns {'ok', 'rows_written', 'skipped', 'error'}.
+    the caller (the pipeline) logs and continues.
+    Re-processing an episode REPLACES its rows (M30): the episode's
+    existing rows are deleted and the new rows written in one locked
+    atomic rewrite. An episode is recognised by its episode_id OR by
+    (normalised title, pub_date) (m20), so rows written under a
+    different id for the same episode (slug backfill vs guid writer)
+    are replaced, not duplicated.
+    Returns {'ok', 'rows_written', 'skipped', 'error', 'replaced',
+    'replaced_episode_ids'}; 'skipped' is always None now (kept in
+    the return shape for callers that read it).
     """
     try:
         os.makedirs(history_dir, exist_ok=True)
         path = history_path(history_dir, podcast_id)
-        existing = load_rows(history_dir, podcast_id)
-        if any(r["episode_id"] == episode_id for r in existing):
-            return {"ok": True, "rows_written": 0,
-                    "skipped": "duplicate-episode", "error": None}
         rows = build_rows(episode_id, episode_title, episode_duration_s,
                           pub_date, blocks, sources, house_plugs,
                           pipeline_version, processed_at, verified_map)
-        new_file = not os.path.exists(path)
-        with open(path, "a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=COLUMNS)
-            if new_file:
-                w.writeheader()
-            for r in rows:
-                w.writerow(r)
+        with _history_lock(history_dir, podcast_id):
+            existing = _load_raw_rows(history_dir, podcast_id)
+            new_key = _title_date_key(episode_title, pub_date)
+            matched_ids = set()
+            kept = []
+            for r in existing:
+                same_id = r.get("episode_id", "") == episode_id
+                r_key = _title_date_key(r.get("episode_title", ""),
+                                        r.get("pub_date", ""))
+                same_ep = new_key is not None and r_key == new_key
+                if same_id or same_ep:
+                    matched_ids.add(r.get("episode_id", ""))
+                else:
+                    kept.append(r)
+            # Atomic whole-file rewrite (M31): temp file in the same
+            # directory + os.replace, never open(path, "a").
+            fd, tmp = tempfile.mkstemp(prefix=".history-",
+                                       suffix=".tmp",
+                                       dir=history_dir)
+            try:
+                with os.fdopen(fd, "w", newline="",
+                               encoding="utf-8") as f:
+                    w = csv.DictWriter(f, fieldnames=COLUMNS)
+                    w.writeheader()
+                    for r in kept:
+                        w.writerow({c: r.get(c, "") for c in COLUMNS})
+                    for r in rows:
+                        w.writerow(r)
+                os.replace(tmp, path)
+            except Exception:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                raise
         return {"ok": True, "rows_written": len(rows),
-                "skipped": None, "error": None}
+                "skipped": None, "error": None,
+                "replaced": bool(matched_ids),
+                "replaced_episode_ids": sorted(matched_ids)}
     except Exception as exc:  # never fail an episode run on history
         return {"ok": False, "rows_written": 0,
-                "skipped": None, "error": repr(exc)}
+                "skipped": None, "error": repr(exc),
+                "replaced": False, "replaced_episode_ids": []}
 
 
 # ---------------------------------------------------------------- reader
