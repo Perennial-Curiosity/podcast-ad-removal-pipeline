@@ -28,15 +28,19 @@ mentioned AND an opening cue phrase precedes it AND a closing boundary
 is uncertain for an episode, the episode is left unmarked and flagged.
 """
 
+import contextlib
 import difflib
+import fcntl
 import glob
 import hashlib
 import json
 import os
+import random
 import re
 from datetime import date, datetime, timezone
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from html import unescape
@@ -46,7 +50,6 @@ from html import unescape
 os.environ["HF_HUB_OFFLINE"] = "1"
 
 BASE_DIR = os.path.expanduser("~/workspace/podcast-ads")
-MODEL_DIR = os.path.join(BASE_DIR, "model")
 CONFIG_PATH = os.path.join(BASE_DIR, "podcasts.yaml")
 
 # Ad-block bounds (seconds)
@@ -56,6 +59,24 @@ MIN_AD_LEN = 45
 # 2026-10-26). Single-method blocks keep the 45s floor.
 HEATMAP_MIN_AD_LEN = 30
 MAX_AD_LEN = 12 * 60
+# Orphan-mention gap split (M11, revised 2026-11-20): mentions more
+# than one segment-length apart belong to different reads / content
+# mentions, not to one window. 180s is the segment span cap the URL
+# grouping already uses.
+ORPHAN_GAP_MAX = 180.0
+
+# Shared spoken-URL TLD set (M15): the single canonical list.
+# find_url_positions, extract_sponsors, the single-cluster anchor check,
+# sponsor_root, split_rescue._TLDS and transcript_diff.TRIM_TLDS must
+# all equal this set — a missing TLD is a silent miss (SN 1101,
+# 2026-10-22: ".tools"). Keep in sync; the fix-round driver asserts
+# the sets are equal.
+URL_TLDS = {"com", "net", "org", "io", "ai", "tv", "co", "us", "tools",
+            "app", "dev", "xyz", "online", "store", "tech", "site",
+            "cloud", "me", "cc", "gg", "life", "world", "news", "media",
+            "agency", "digital", "solutions", "systems", "network",
+            "security"}
+URL_TLD_RE = r"\.(" + "|".join(sorted(URL_TLDS, key=len, reverse=True)) + r")$"
 
 # History pre-roll voter (2026-11-14, A/B test — NOT merged): the
 # harness sets HISTORY_PREROLL_WINDOW to (start_s, end_s) or None
@@ -86,6 +107,53 @@ SLOT_PINNED_B_KEEP_SIBLINGS = 4  # pinned B mp3s kept per podcast
 # from the current one invalidates a cached chunk transcript. Missing
 # config = legacy cache (all pre-2026-11-11 caches are base/en/beam5).
 TRANSCRIBE_CONFIG = {"model": "base", "language": "en", "beam_size": 5}
+
+_MODEL_REVISION = None
+
+
+def _model_revision():
+    """Revision/hash of the faster-whisper `base` weights in the local HF
+    cache, or "unknown" when it cannot be determined (no cache, several
+    snapshots). Used only as a cache-invalidation signal, never as a
+    load path: load_model() still loads by name, offline. (m4)"""
+    global _MODEL_REVISION
+    if _MODEL_REVISION is None:
+        _MODEL_REVISION = "unknown"
+        try:
+            snap_dir = os.path.join(
+                os.path.expanduser("~/.cache/huggingface/hub"),
+                "models--Systran--faster-whisper-base", "snapshots")
+            snaps = [d for d in os.listdir(snap_dir)
+                     if os.path.isdir(os.path.join(snap_dir, d))]
+            if len(snaps) == 1:
+                _MODEL_REVISION = snaps[0]
+        except OSError:
+            pass
+    return _MODEL_REVISION
+
+
+def _current_transcribe_config():
+    """TRANSCRIBE_CONFIG plus the model revision (m4)."""
+    cfg = dict(TRANSCRIBE_CONFIG)
+    cfg["model_revision"] = _model_revision()
+    return cfg
+
+
+def _transcribe_config_matches(stored):
+    """True when a stored chunk config matches the current one. Base
+    fields must match exactly. The model revision only invalidates
+    when BOTH sides know it and they differ: pre-patch chunks carry no
+    revision and are accepted (their weights predate tracking)."""
+    if not isinstance(stored, dict):
+        return False
+    for k, v in TRANSCRIBE_CONFIG.items():
+        if stored.get(k, v) != v:
+            return False
+    stored_rev = stored.get("model_revision", "unknown")
+    current_rev = _model_revision()
+    if stored_rev in (None, "unknown") or current_rev == "unknown":
+        return True
+    return stored_rev == current_rev
 
 # Popular podcast sponsors not in the episode description.
 # Used ONLY by the cluster finder (4+ mentions in 1 min) as a safety net
@@ -212,6 +280,24 @@ def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def _validate_feed_xml(text):
+    """Reject a truncated/invalid feed body (fix M35, 2026-11-19).
+    A proxy stall that closes cleanly mid-body used to be returned as
+    a complete feed; parse_items() then silently yielded fewer items.
+    Raises ValueError on any failure so the caller retries / fails
+    loudly instead of processing a short feed as if complete."""
+    import xml.etree.ElementTree as _ET
+    if not text or "</rss>" not in text:
+        raise ValueError("feed body is truncated (no closing </rss>)")
+    try:
+        root = _ET.fromstring(text)
+    except _ET.ParseError as e:
+        raise ValueError(f"feed body is not well-formed XML: {e}")
+    if root.tag != "rss":
+        raise ValueError(f"feed root is {root.tag!r}, expected 'rss'")
+    return text
+
+
 def fetch_feed():
     # Retry on truncated reads (2026-10-29: the TWiT feed twice
     # stalled at ~196KB via urllib while curl fetched all 232KB, so
@@ -223,7 +309,12 @@ def fetch_feed():
         try:
             req = urllib.request.Request(FEED_URL, headers={"User-Agent": "podcast-ad-pipeline/1.0"})
             with urllib.request.urlopen(req, timeout=60) as r:
-                return r.read().decode("utf-8", errors="replace")
+                body = r.read().decode("utf-8", errors="replace")
+            return _validate_feed_xml(body)
+        except ValueError as e:
+            last = e
+            log(f"  fetch_feed attempt {attempt + 1} invalid body ({e}); retrying")
+            time.sleep(10)
         except (_hc.IncompleteRead, urllib.error.URLError) as e:
             last = e
             log(f"  fetch_feed attempt {attempt + 1} failed ({e}); retrying")
@@ -238,8 +329,16 @@ def fetch_feed():
         out = _sp.run(["curl", "-sS", "--max-time", "60", FEED_URL],
                       capture_output=True, timeout=90)
         if out.returncode == 0 and out.stdout:
-            return out.stdout.decode("utf-8", errors="replace")
+            try:
+                return _validate_feed_xml(
+                    out.stdout.decode("utf-8", errors="replace"))
+            except ValueError as e:
+                log(f"  fetch_feed curl fallback returned an invalid "
+                    f"body ({e}); failing loudly")
+                raise
         log(f"  fetch_feed curl fallback failed (rc={out.returncode})")
+    except ValueError:
+        raise
     except Exception as e:
         log(f"  fetch_feed curl fallback error: {e}")
     raise last
@@ -331,7 +430,7 @@ def extract_sponsors(description_html):
         # SN 1101 (2026-10-22) — "canary.tools" kept its ".tools" suffix, so
         # the variant set never contained the spoken word "canary" and all
         # methods reported 0 mentions despite 16+ spoken mentions.
-        root = re.sub(r"\.(com|net|org|io|ai|tv|co|us|tools|app|dev|xyz|online|store|tech|site|cloud|me|cc|gg|life|world|news|media|agency|digital|solutions|systems|network|security)$", "", text)
+        root = re.sub(URL_TLD_RE, "", text)
         variants = {root, root.replace(".", " "), root.replace("-", " ")}
         # Bare domain stem: the host says "Canary", not "canary.tools" —
         # and Whisper tokenizes spoken URLs into separate words (and may
@@ -394,7 +493,7 @@ def extract_sponsors(description_html):
             host = domain.split("/")[0]
             # Same extended TLD list as the sponsored-links branch above;
             # see the SN 1101 note there about silent misses.
-            root = re.sub(r"\.(com|net|org|io|ai|tv|co|us|tools|app|dev|xyz|online|store|tech|site|cloud|me|cc|gg|life|world|news|media|agency|digital|solutions|systems|network|security)$", "", host)
+            root = re.sub(URL_TLD_RE, "", host)
             # strip common marketing prefixes (drink, get, try, take, shop, join)
             root_stripped = re.sub(r"^(drink|get|try|take|shop|join)", "", root)
             if not root or len(root) < 2:
@@ -501,24 +600,250 @@ def parse_channel_link(xml):
     return unescape(m.group(1)).strip() if m else None
 
 
+# How many rotated state backups save_state() keeps (M29, 2026-11-19).
+STATE_BACKUP_KEEP = 5
+
+
+@contextlib.contextmanager
+def state_lock():
+    """Exclusive per-podcast state lock (M28, 2026-11-19).
+
+    Held across load-modify-save by writers that mutate state
+    (publish_github, publish_feed). save_state() itself takes it
+    around the write+replace, so two concurrent saves can no longer
+    share one .tmp path and lose the loser's write. flock is
+    per-open-file-description, so threads in one process contend
+    exactly like separate processes. The lock file lives next to
+    state.json and is never deleted (deleting it would break the
+    mutual exclusion). Re-entrant on the same thread (a threading
+    RLock + depth counter), so save_state() inside an outer
+    state_lock() cannot deadlock on its own flock."""
+    if STATE_PATH is None:
+        raise TypeError("STATE_PATH is None; call init_podcast() first")
+    _depth = getattr(_state_lock_local, "depth", 0)
+    if _depth:
+        _state_lock_local.depth = _depth + 1
+        try:
+            yield
+        finally:
+            _state_lock_local.depth = _depth
+        return
+    _state_lock_rlock.acquire()
+    lock_path = STATE_PATH + ".lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        _state_lock_local.depth = 1
+        try:
+            yield
+        finally:
+            _state_lock_local.depth = 0
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+            _state_lock_rlock.release()
+
+
+_state_lock_rlock = threading.RLock()
+_state_lock_local = threading.local()
+
+
+def _newest_state_backup():
+    """Newest parseable state.json.bak-* backup, or None (M29)."""
+    if STATE_PATH is None:
+        return None
+    cands = sorted(
+        (p for p in glob.glob(STATE_PATH + ".bak-*")
+         if os.path.isfile(p)),
+        key=lambda p: os.path.getmtime(p), reverse=True)
+    for p in cands:
+        try:
+            with open(p) as f:
+                json.load(f)
+            return p
+        except Exception:
+            continue
+    return None
+
+
 def load_state():
+    """Load state.json, falling back to the newest backup (M29).
+
+    A corrupt/truncated state file used to raise JSONDecodeError out
+    of every entry point and brick the whole podcast run. Now the
+    newest state.json.bak-* backup is tried (and logged); only when
+    no backup parses does the error propagate, naming the backups
+    that were tried."""
+    if STATE_PATH is None:
+        raise TypeError("STATE_PATH is None; call init_podcast() first")
     if os.path.exists(STATE_PATH):
-        with open(STATE_PATH) as f:
-            return json.load(f)
+        try:
+            with open(STATE_PATH) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            bak = _newest_state_backup()
+            if bak is not None:
+                log(f"  WARNING: state.json unreadable ({e}); falling "
+                    f"back to backup {bak}")
+                with open(bak) as f:
+                    return json.load(f)
+            raise ValueError(
+                f"state.json unreadable ({e}) and no parseable "
+                f"state.json.bak-* backup exists") from e
     return {"processed": {}, "base_url": ""}
 
 
+def _fsync_dir(path):
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
 def save_state(state):
-    tmp = STATE_PATH + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(state, f, indent=2)
-    os.replace(tmp, STATE_PATH)
+    """Atomic, locked state write with backup rotation (M28/M29).
+
+    Unique temp name per writer (pid + thread + random) so two
+    concurrent writers can no longer share one .tmp path; the file
+    is fsynced before os.replace and the directory fsynced after,
+    so a crash cannot lose the just-written state. The previous
+    state file is rotated to state.json.bak-<timestamp> first
+    (newest STATE_BACKUP_KEEP kept). The write+replace holds the
+    per-podcast state lock."""
+    if STATE_PATH is None:
+        raise TypeError("STATE_PATH is None; call init_podcast() first")
+    with state_lock():
+        if os.path.exists(STATE_PATH):
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            bak = f"{STATE_PATH}.bak-{stamp}"
+            try:
+                import shutil
+                shutil.copyfile(STATE_PATH, bak)
+                olds = sorted(
+                    (p for p in glob.glob(STATE_PATH + ".bak-*")
+                     if os.path.isfile(p)),
+                    key=lambda p: os.path.getmtime(p), reverse=True)
+                for p in olds[STATE_BACKUP_KEEP:]:
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+            except OSError as e:
+                log(f"  WARNING: state backup rotation failed ({e}); "
+                    "continuing without a backup")
+        tmp = (f"{STATE_PATH}.tmp.{os.getpid()}."
+               f"{threading.get_ident()}.{random.randint(0, 1 << 30)}")
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, STATE_PATH)
+        _fsync_dir(os.path.dirname(STATE_PATH) or ".")
+
+
+def _download_sidecar_path(dest):
+    return dest + ".download.json"
+
+
+def _write_download_sidecar(dest, content_length_verified):
+    """Record the identity of a completed download (M1): bytes + SHA-256
+    + ffprobe duration. Written only after a download completed (or a
+    legacy file passed the ffprobe check). Never compared against a
+    live HEAD/length (entry-52 rotation lesson) — only against this
+    sidecar. A sidecar write failure never fails the download."""
+    try:
+        duration = None
+        try:
+            duration = probe_duration(dest)
+        except Exception:
+            pass
+        _atomic_json_dump(_download_sidecar_path(dest), {
+            "bytes": os.path.getsize(dest),
+            "sha256": sha256_file(dest),
+            "duration": duration,
+            "content_length_verified": bool(content_length_verified)})
+    except Exception as exc:
+        log(f"  download sidecar write failed ({exc!r}); continuing")
+
+
+def _verify_download_sidecar(dest):
+    """True when dest matches its sidecar (size + SHA-256)."""
+    try:
+        with open(_download_sidecar_path(dest)) as f:
+            sc = json.load(f)
+        return (os.path.getsize(dest) == sc.get("bytes") and
+                sha256_file(dest) == sc.get("sha256"))
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def _curl_download(url, dest):
+    """One curl attempt (fetch_feed's fallback pattern). Raises on
+    failure; the caller decides what to do with it."""
+    tmp = f"{dest}.curltmp.{os.getpid()}"
+    out = subprocess.run(
+        ["curl", "-fsSL", "--max-time", "600", "-o", tmp, url],
+        capture_output=True, timeout=660)
+    if out.returncode != 0 or not os.path.exists(tmp) or \
+            os.path.getsize(tmp) == 0:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise IOError(f"curl fallback failed (rc={out.returncode})")
+    os.replace(tmp, dest)
+
+
+def _is_retryable_download_error(e):
+    """Permanent failures fail fast (m21): 4xx other than 408/429.
+    Everything else (5xx, 408/429, timeouts, truncated reads,
+    content-length mismatch, network errors) is retryable."""
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code in (408, 429) or e.code >= 500
+    return True
 
 
 def download(url, dest, retries=6):
     if os.path.exists(dest) and os.path.getsize(dest) > 0:
-        log(f"already downloaded: {dest}")
-        return
+        # (M1) A present file is trusted ONLY against its sidecar —
+        # never against a live HEAD/length (Megaphone rotates).
+        if os.path.exists(_download_sidecar_path(dest)):
+            if _verify_download_sidecar(dest):
+                log(f"already downloaded: {dest} (verified against sidecar)")
+                return
+            log(f"  {dest} differs from its download sidecar; "
+                "re-downloading")
+            for p in (dest, _download_sidecar_path(dest)):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        else:
+            # Legacy file with no sidecar: trust it once only if
+            # ffprobe can parse it with a positive duration, and
+            # record the observed identity so later runs verify it.
+            try:
+                legacy_dur = probe_duration(dest)
+            except Exception:
+                legacy_dur = 0.0
+            if legacy_dur <= 0:
+                log(f"  {dest} present but unparseable/zero-duration; "
+                    "re-downloading")
+                try:
+                    os.remove(dest)
+                except OSError:
+                    pass
+            else:
+                log(f"already downloaded: {dest} (legacy, no sidecar; "
+                    "ffprobe OK)")
+                _write_download_sidecar(dest, False)
+                return
     last_err = None
     for attempt in range(1, retries + 1):
         try:
@@ -559,7 +884,9 @@ def download(url, dest, retries=6):
                     raise IOError(
                         f"download truncated: {url}: got {written} "
                         f"bytes, expected {expected} (Content-Length)")
+                cl_verified = expected is not None
             log(f"saved {os.path.getsize(dest)} bytes")
+            _write_download_sidecar(dest, cl_verified)
             return
         except Exception as e:
             last_err = e
@@ -570,10 +897,22 @@ def download(url, dest, retries=6):
             except OSError:
                 pass
             log(f"download attempt {attempt} failed: {type(e).__name__}: {e}")
+            if not _is_retryable_download_error(e):
+                raise
             if attempt < retries:
-                wait = 20 * attempt
+                wait = min(20 * attempt, 60)
                 log(f"retrying download in {wait}s...")
                 time.sleep(wait)
+    # Retries exhausted on a retryable error: one curl fallback
+    # (fetch_feed's pattern for the proxy stalling urllib).
+    try:
+        log("  download urllib retries exhausted; trying curl fallback")
+        _curl_download(url, dest)
+        _write_download_sidecar(dest, False)
+        log(f"saved {os.path.getsize(dest)} bytes (via curl)")
+        return
+    except Exception as exc:
+        log(f"  curl fallback failed ({exc!r})")
     raise last_err
 
 
@@ -581,14 +920,22 @@ def probe_duration(path):
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "csv=p=0", path],
-        capture_output=True, text=True, check=True)
+        capture_output=True, text=True, check=True, timeout=120)
     return float(out.stdout.strip())
 
 
+_MODEL = None
+
+
 def load_model():
-    from faster_whisper import WhisperModel
-    return WhisperModel("base", device="cpu", compute_type="int8",
-                        local_files_only=True)
+    """Load the base Whisper model once per process (m4): A and B
+    transcription in one episode share it instead of loading twice."""
+    global _MODEL
+    if _MODEL is None:
+        from faster_whisper import WhisperModel
+        _MODEL = WhisperModel("base", device="cpu", compute_type="int8",
+                              local_files_only=True)
+    return _MODEL
 
 
 def transcribe_file(model, wav_path, **kwargs):
@@ -601,17 +948,153 @@ def transcribe_file(model, wav_path, **kwargs):
     out = subprocess.run(
         ["ffmpeg", "-v", "error", "-i", wav_path, "-ar", "16000", "-ac", "1",
          "-f", "f32le", "-acodec", "pcm_f32le", "-"],
-        capture_output=True, check=True).stdout
+        capture_output=True, check=True, timeout=300).stdout
     audio = np.frombuffer(out, dtype=np.float32)
     return model.transcribe(audio, **kwargs)
 
 
+def _atomic_json_dump(path, payload):
+    """Write JSON atomically (temp + replace) so a kill mid-write never
+    leaves a truncated file for the next run to choke on (m19)."""
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(payload, f)
+    os.replace(tmp, path)
+
+
+def _drop_transcript_cache(work_dir):
+    """Delete every cached chunk + transcript.json in a work dir."""
+    for f in glob.glob(os.path.join(work_dir, "chunk_*.json")):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    try:
+        os.remove(os.path.join(work_dir, "transcript.json"))
+    except OSError:
+        pass
+
+
+def _prune_out_of_range_chunks(work_dir, duration):
+    """Delete chunk_*.json files whose start is >= duration (M3):
+    chunks from an older, longer cut that glob readers would
+    otherwise include."""
+    for f in glob.glob(os.path.join(work_dir, "chunk_*.json")):
+        try:
+            idx = int(os.path.basename(f)[6:9])
+        except ValueError:
+            continue
+        if idx * TRANSCRIBE_CHUNK >= duration:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+
+def _transcript_cache_complete(work_dir, duration):
+    """True when every in-range chunk file exists with a matching
+    transcribe config (M4 fast-path precondition)."""
+    n_chunks = int(duration // TRANSCRIBE_CHUNK) + 1
+    for i in range(n_chunks):
+        if i * TRANSCRIBE_CHUNK >= duration:
+            break
+        p = os.path.join(work_dir, f"chunk_{i:03d}.json")
+        if not os.path.exists(p):
+            return False
+        try:
+            with open(p) as f:
+                data = json.load(f)
+            if not _transcribe_config_matches(
+                    data.get("transcribe_config", TRANSCRIBE_CONFIG)):
+                return False
+        except (OSError, ValueError, KeyError, AttributeError, TypeError):
+            return False
+    return True
+
+
+def _write_audio_identity(path, sha, size, duration):
+    try:
+        _atomic_json_dump(path, {"sha256": sha, "size": size,
+                                 "duration": duration})
+    except OSError:
+        pass
+
+
 def transcribe_chunked(mp3_path, work_dir):
-    """Transcribe in short chunks with word timestamps; resumable."""
-    from faster_whisper import WhisperModel
+    """Transcribe in short chunks with word timestamps; resumable.
+
+    Cache identity (2026-11-19 fix round, issue (a)): the chunk cache
+    belongs to the exact audio file it was transcribed from.
+    `a_identity.json` records the A mp3's SHA-256 + size; a mismatch
+    (or a missing identity file, i.e. a legacy cache) drops the chunks
+    so a rotated A is never transcribed against a stale transcript.
+    Stale out-of-range chunks (start >= duration) are pruned (M3).
+    A complete cached transcript is returned without probing the mp3
+    or loading the model (M4). A zero/negative probe duration raises
+    instead of writing an empty transcript (M2)."""
     os.makedirs(work_dir, exist_ok=True)
+    # Sweep orphan chunk wavs left by a killed earlier run (m6).
+    for _f in glob.glob(os.path.join(work_dir, "chunk_*.wav")) + \
+            glob.glob(os.path.join(work_dir, "tmp*.wav")):
+        try:
+            os.remove(_f)
+        except OSError:
+            pass
+    # (a) A audio identity — SHA-256 + size, no probe, no model.
+    audio_sha, audio_size = None, None
+    try:
+        audio_sha = sha256_file(mp3_path)
+        audio_size = os.path.getsize(mp3_path)
+    except OSError:
+        log("  A audio unreadable for identity check; "
+            "using cached transcript if complete")
+    identity_path = os.path.join(work_dir, "a_identity.json")
+    if audio_sha is not None:
+        drop = False
+        if os.path.exists(identity_path):
+            try:
+                ident = json.load(open(identity_path))
+                if ident.get("sha256") != audio_sha or \
+                        ident.get("size") != audio_size:
+                    log("  A audio differs from the cached transcript; "
+                        "dropping stale A chunks")
+                    drop = True
+            except (OSError, ValueError):
+                log("  A identity file unreadable; dropping stale A chunks")
+                drop = True
+        else:
+            # Legacy cache with no identity record: no evidence the
+            # chunks belong to this audio (entry-51 rule for the B).
+            if glob.glob(os.path.join(work_dir, "chunk_*.json")) or \
+                    os.path.exists(os.path.join(work_dir, "transcript.json")):
+                log("  no A transcript identity; dropping any stale A chunks")
+                drop = True
+        if drop:
+            _drop_transcript_cache(work_dir)
+    # (M4) Complete-cache fast path: no probe, no model.
+    full = os.path.join(work_dir, "transcript.json")
+    if os.path.exists(full):
+        try:
+            with open(full) as f:
+                tj = json.load(f)
+            dur = float(tj["duration"])
+            cached_words = [(w[0], w[1], w[2]) for w in tj["words"]]
+            if dur > 0 and cached_words and \
+                    _transcript_cache_complete(work_dir, dur):
+                _prune_out_of_range_chunks(work_dir, dur)
+                if audio_sha is not None:
+                    _write_audio_identity(identity_path, audio_sha,
+                                          audio_size, dur)
+                return cached_words, dur
+        except (OSError, ValueError, KeyError, TypeError):
+            pass  # fall through to probe + transcribe
     duration = probe_duration(mp3_path)
-    model = load_model()
+    if duration <= 0:
+        raise ValueError(
+            f"transcribe_chunked: probe_duration returned {duration} "
+            f"for {mp3_path}; refusing to write an empty transcript")
+    _prune_out_of_range_chunks(work_dir, duration)
+    model = None
     words = []  # (start, end, text)
     n_chunks = int(duration // TRANSCRIBE_CHUNK) + 1
     for i in range(n_chunks):
@@ -620,32 +1103,51 @@ def transcribe_chunked(mp3_path, work_dir):
             break
         chunk_json = os.path.join(work_dir, f"chunk_{i:03d}.json")
         if os.path.exists(chunk_json):
-            with open(chunk_json) as f:
-                data = json.load(f)
-            if data.get("transcribe_config", TRANSCRIBE_CONFIG) == TRANSCRIBE_CONFIG:
-                words.extend([(w[0], w[1], w[2]) for w in data["words"]])
-                continue
-            log(f"  chunk {i}: transcribe config changed; re-transcribing")
+            try:
+                with open(chunk_json) as f:
+                    data = json.load(f)
+                if _transcribe_config_matches(
+                        data.get("transcribe_config", TRANSCRIBE_CONFIG)):
+                    words.extend([(w[0], w[1], w[2]) for w in data["words"]])
+                    continue
+            except (OSError, ValueError, KeyError, AttributeError,
+                    TypeError):
+                log(f"  chunk {i}: cached chunk unreadable; re-transcribing")
+            else:
+                log(f"  chunk {i}: transcribe config changed; re-transcribing")
+        if model is None:
+            model = load_model()
         chunk_wav = os.path.join(work_dir, f"chunk_{i:03d}.wav")
-        subprocess.run(
-            ["ffmpeg", "-y", "-v", "error", "-ss", str(start),
-             "-t", str(TRANSCRIBE_CHUNK), "-i", mp3_path,
-             "-ar", "16000", "-ac", "1", chunk_wav],
-            check=True)
-        segments, _ = transcribe_file(model, chunk_wav, word_timestamps=True)
-        cwords = []
-        for seg in segments:
-            for w in (seg.words or []):
-                cwords.append((w.start + start, w.end + start, w.word))
-        with open(chunk_json, "w") as f:
-            json.dump({"words": cwords,
-                       "transcribe_config": TRANSCRIBE_CONFIG}, f)
-        os.remove(chunk_wav)
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-v", "error", "-ss", str(start),
+                 "-t", str(TRANSCRIBE_CHUNK), "-i", mp3_path,
+                 "-ar", "16000", "-ac", "1", chunk_wav],
+                check=True, timeout=300)
+            segments, _ = transcribe_file(model, chunk_wav,
+                                          word_timestamps=True)
+            cwords = []
+            for seg in segments:
+                for w in (seg.words or []):
+                    cwords.append((w.start + start, w.end + start, w.word))
+            _atomic_json_dump(chunk_json,
+                              {"words": cwords,
+                               "transcribe_config":
+                                   _current_transcribe_config()})
+        finally:
+            try:
+                os.remove(chunk_wav)
+            except OSError:
+                pass
         words.extend(cwords)
         log(f"transcribed chunk {i + 1}/{n_chunks}")
-    full = os.path.join(work_dir, "transcript.json")
-    with open(full, "w") as f:
-        json.dump({"words": words, "duration": duration}, f)
+    # m13 (2026-11-19): sort + dedupe words before writing, so a
+    # non-monotonic or duplicated transcript cannot silently change
+    # detection (detect_ad_blocks also sorts on entry).
+    words = _sorted_words(words)
+    _atomic_json_dump(full, {"words": words, "duration": duration})
+    if audio_sha is not None:
+        _write_audio_identity(identity_path, audio_sha, audio_size, duration)
     return words, duration
 
 
@@ -654,7 +1156,7 @@ def find_silences(mp3_path, work_dir, min_dur=1.5):
     out = subprocess.run(
         ["ffmpeg", "-v", "info", "-i", mp3_path, "-af",
          f"silencedetect=noise=-35dB:d={min_dur}", "-f", "null", "-"],
-        capture_output=True, text=True).stderr
+        capture_output=True, text=True, timeout=1200).stderr
     silences = []
     starts = re.findall(r"silence_start: ([\d.]+)", out)
     ends = re.findall(r"silence_end: ([\d.]+)", out)
@@ -666,6 +1168,21 @@ def find_silences(mp3_path, work_dir, min_dur=1.5):
 def norm_words(words):
     """Whitespace-normalized lowercase words for matching (indices align)."""
     return [re.sub(r"\s+", " ", w[2]).strip().lower() for w in words]
+
+
+def _sorted_words(words):
+    """Words sorted by start time, exact duplicates removed (m13).
+
+    Detection assumes non-decreasing word starts (_word_votes bisects
+    on starts; the cluster window and the heat-map duration read
+    words[-1]). A stale/mixed chunk cache can hand detect_ad_blocks a
+    reordered or duplicated list, which silently truncates detection
+    at words[-1][0] and changes votes. Sorting here (and in
+    transcribe_chunked, before the transcript is written) makes
+    detection order-independent. Exact (start, end, text) triples are
+    duplicates; genuine repeated words differ in start time.
+    """
+    return sorted(set(words), key=lambda w: (w[0], w[1], w[2]))
 
 
 def _boundary_match(v, w):
@@ -767,7 +1284,15 @@ def find_mentions(nw, variants):
             continue
         n = len(toks)
         for i in range(L - n + 1):
-            if all(toks[j] in nw[i + j] for j in range(n)):
+            # Exact token equality (+ plural/possessive suffix only):
+            # a substring test per word leaks ("ag" in "again", "1" in
+            # "21", "mint" in "minty" — M16). _boundary_match is NOT
+            # used here: its single-letter-remainder tolerance would
+            # still match "minty mobile" for "mint mobile".
+            if all(nw[i + j] == toks[j] or
+                   nw[i + j] in (toks[j] + "s", toks[j] + "es",
+                                 toks[j] + "'s")
+                   for j in range(n)):
                 hits.append(i)
     return sorted(set(hits))
 
@@ -1192,7 +1717,15 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     must not overlap a marked block — an overhang of a marked ad is not a
     separate suspect.
     """
+    # m13: sort + dedupe once here so every method below (and the
+    # words[-1] duration sites) sees non-decreasing starts.
+    words = _sorted_words(words)
     # Run each method independently, collecting (start, end, label, method)
+    # Empty transcript: no detection is possible, and the chapter
+    # method (plus the words[-1] sites below) would index words[-1]
+    # (M21). Return before any method runs.
+    if not words:
+        return [], []
     candidates = []
     candidates.extend([(s, e, l, 'cta') for s, e, l in _method_cta(words, sponsors, silences, own_domains)])
     candidates.extend([(s, e, l, 'url') for s, e, l in _method_url(words, silences, own_domains)])
@@ -1237,6 +1770,8 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
         labels = sorted(set(l for m, l in entries))
 
         def _part(l):
+            if not l:
+                return ""
             return l.split(':')[-1].strip().lower().replace(' ', '')
 
         def _artifact(l):
@@ -1451,10 +1986,7 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
             if method == 'cluster':
                 import re as _re2
                 from difflib import SequenceMatcher as _SM
-                _tlds = {"com", "net", "org", "io", "tv", "co", "ai",
-                         "me", "tools", "app", "dev", "xyz", "online",
-                         "store", "tech", "site", "cloud", "cc", "gg",
-                         "life", "world", "news", "media"}
+                _tlds = URL_TLDS  # single shared set (M15)
                 _p = label.lower().replace(' ', '')
                 _allowed = {_p}
                 for _sp in sponsors:
@@ -1504,7 +2036,7 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
             # tested and rejected the same day: on Huberman Extinct
             # Species it would extend the Eight Sleep block 73s backward
             # into the preceding Joovv read.
-            _part = label.split(':')[-1].strip().lower().replace(' ', '')
+            _part = (label or "").split(':')[-1].strip().lower().replace(' ', '')
             _merged = False
             for _bi, (_bs, _be, _bl) in enumerate(blocks):
                 if _bl.split(':')[-1].strip().lower().replace(' ', '') != _part:
@@ -1557,7 +2089,7 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     for s, e, label, method in candidates:
         if method != 'brand-orphan':
             continue
-        _part = label.split(':')[-1].strip().lower().replace(' ', '')
+        _part = (label or "").split(':')[-1].strip().lower().replace(' ', '')
         for _bi, (_bs, _be, _bl) in enumerate(blocks):
             if _bl.split(':')[-1].strip().lower().replace(' ', '') != _part:
                 continue
@@ -1662,6 +2194,7 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
         edge_cands.append((cs, ce))
     refined = []
     for s, e, l in blocks:
+        _os, _oe = s, e
         sp_part = l.split(':')[-1].strip().lower()
         match = None
         for sp in sponsors:
@@ -1685,8 +2218,29 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
                 if ne != e:
                     log(f"  refine end '{l}': {e:.0f}s -> {ne:.0f}s")
                     e = ne
+        # Floor re-check (C2): refinement only moves edges inward,
+        # so a block can leave it far below the floors (67s -> 6.5s).
+        # Below the lowest floor (30s), keep the pre-refinement edges
+        # — the block had 2+ votes over its full span.
+        if e - s < HEATMAP_MIN_AD_LEN:
+            log(f"  refine '{l}': {_os:.0f}s-{_oe:.0f}s -> {s:.0f}s-"
+                f"{e:.0f}s below floor; keeping original edges")
+            s, e = _os, _oe
         refined.append((s, e, l))
     blocks = refined
+
+    # Final length validation (M25): the same-label and brand-orphan
+    # merges above can push a block past MAX_AD_LEN. Drop over-long
+    # blocks — a clamp would invent an edge with no evidence, and
+    # every other duration gate in this file drops.
+    _checked = []
+    for s, e, l in blocks:
+        if e - s > MAX_AD_LEN:
+            log(f"  drop block {s:.0f}s-{e:.0f}s ('{l}'): "
+                "exceeds MAX_AD_LEN")
+            continue
+        _checked.append((s, e, l))
+    blocks = _checked
 
     # Suspect reel (2026-10-22, per the owner): low-confidence candidates
     # that did not become marked blocks. Replaces the old cluster-popular
@@ -1788,6 +2342,11 @@ XEP_MIN_OVERLAP_S = 5.0
 
 
 def _xep_part(label):
+    # Labels can be None: the slot flow legitimately emits unnamed
+    # dynamic slots; a None label has no sponsor part (m12 — the same
+    # guard split_rescue._part already has).
+    if not label:
+        return ""
     return label.split(":")[-1].strip().lower().replace(" ", "")
 
 
@@ -1855,6 +2414,14 @@ def _apply_xep_corroboration(blocks, words, sponsors, silences,
                     t = be
                     break
             ne = t
+        if ne - ns > MAX_AD_LEN:
+            # M25: an extension past MAX restores the pre-extension
+            # edges — xep is corroboration only, and the original
+            # block was already valid.
+            log(f"  xep-corroborate '{label}': extension to "
+                f"{ns:.0f}s-{ne:.0f}s exceeds MAX_AD_LEN; keeping "
+                f"{bs:.0f}s-{be:.0f}s")
+            ns, ne = bs, be
         if ns != bs or ne != be:
             log(f"  xep-corroborate '{label}': {bs:.0f}s-{be:.0f}s -> "
                 f"{ns:.0f}s-{ne:.0f}s")
@@ -2021,7 +2588,12 @@ def _method_url(words, silences, own_domains=None):
     groups = []
     for brand, idx in positions:
         t = words[idx][0]
-        if groups and t - groups[-1][-1][1] <= 60:
+        # Chained 60s gaps with no span cap let one extra URL push a
+        # group over the 180s segment limit and drop the whole group
+        # (M24). A group's segment is [first-45, last+10], so split
+        # when the new URL would make first-to-last > 125s.
+        if groups and t - groups[-1][-1][1] <= 60 and \
+                t - groups[-1][0][1] <= 125:
             groups[-1].append((brand, t))
         else:
             groups.append([(brand, t)])
@@ -2029,13 +2601,16 @@ def _method_url(words, silences, own_domains=None):
     for g in groups:
         brand = g[0][0]
         start, end = g[0][1] - 45.0, g[-1][1] + 10.0
+        # Snap to speech, not to silence (M23): the start moves to
+        # the silence END (pe) and the end to the silence START (ps),
+        # as _expand_tight_cluster already does.
         for ps, pe in pauses:
             if ps >= start and ps - start <= 10.0:
-                start = ps
+                start = pe
                 break
         for ps, pe in reversed(pauses):
             if pe <= end and end - pe <= 10.0:
-                end = pe
+                end = ps
                 break
         start = max(0.0, start)
         if not (20 <= end - start <= 180):
@@ -2064,8 +2639,15 @@ def _method_brand_orphan(words, sponsors, silences):
     turn into a block (no opening cue found). Low-confidence: votes in the
     heat map but never cuts alone (like 'voice' and 'cluster-popular').
     Added 2026-10-14 per the owner — Unsubscribe 268 showed DOSE/AG1 mentions
-    being silently dropped this way. Window = mention span padded 45s each
-    side, snapped to pauses, bounded by MIN/MAX_AD_LEN.
+    being silently dropped this way. Window = the densest mention
+    cluster's span padded 45s each side, snapped to pauses, bounded by
+    MIN/MAX_AD_LEN. Mentions are split into clusters at gaps >
+    ORPHAN_GAP_MAX (M11): the whole-episode span fused separate reads /
+    content mentions into one near-episode-long window, but a
+    densest-<=90s window cut genuine reads whose mentions span the
+    whole read (SN-1096 lost 2 ads in SB), and one segment per cluster
+    turned every scattered content mention into its own block (SB FP
+    40 -> 59). A cluster is one read; the densest cluster is the read.
     Returns [(start, end, label)] independently."""
     nw = norm_words(words)
     pauses = get_pauses(words, silences)
@@ -2077,21 +2659,38 @@ def _method_brand_orphan(words, sponsors, silences):
         if _expand_segment(words, nw, silences, hits, sp["label"]):
             continue  # the full brand method already handles it
         times = sorted(words[i][0] for i in hits)
-        start, end = max(0.0, times[0] - 45.0), times[-1] + 45.0
+        # Split into clusters at gaps > ORPHAN_GAP_MAX (M11) and keep
+        # only the DENSEST cluster (most mentions; ties -> earliest):
+        # a genuine read mentions the brand throughout, so it is the
+        # densest cluster and its window spans the whole read; far-apart
+        # mentions are separate reads / content and are ignored. One
+        # segment per sponsor — one segment per cluster (v2) turned
+        # every scattered content mention into its own block
+        # (SB FP 40 -> 59).
+        clusters = [[times[0]]]
+        for _t in times[1:]:
+            if _t - clusters[-1][-1] > ORPHAN_GAP_MAX:
+                clusters.append([_t])
+            else:
+                clusters[-1].append(_t)
+        _cl = max(clusters, key=lambda c: (len(c), -c[0]))
+        start, end = max(0.0, _cl[0] - 45.0), _cl[-1] + 45.0
         # snap to nearby pauses, never into neighboring content
+        # Snap to speech (M23): start to the silence end, end to
+        # the silence start.
         for ps, pe in pauses:
             if ps >= start and ps - start <= 6.0:
-                start = ps
+                start = pe
                 break
         for ps, pe in reversed(pauses):
             if pe <= end and end - pe <= 6.0:
-                end = pe
+                end = ps
                 break
         if not (MIN_AD_LEN <= end - start <= MAX_AD_LEN):
             continue
         results.append((start, end, f"brand-orphan:{sp['label']}"))
         log(f"  brand-orphan '{sp['label']}': {start:.1f}s-{end:.1f}s "
-            f"({len(hits)} mentions, no opening cue)")
+            f"({len(_cl)} mentions in cluster, no opening cue)")
     return results
 
 
@@ -2176,9 +2775,18 @@ def _expand_segment(words, nw, silences, hits, label):
         produced = find_produced_spot(words, nw, hits, silences)
         if produced is None:
             return None
+        if produced[1] - produced[0] > MAX_AD_LEN:
+            log(f"  expand '{label}': produced spot "
+                f"{produced[0]:.1f}s-{produced[1]:.1f}s exceeds "
+                f"MAX_AD_LEN; dropped")
+            return None
         return produced[0], produced[1], "produced spot"
     seg_end = find_closing(words, nw, silences, last, seg_start)
     if seg_end is None:
+        return None
+    if seg_end - seg_start > MAX_AD_LEN:
+        log(f"  expand '{label}': {seg_start:.1f}s-{seg_end:.1f}s "
+            f"exceeds MAX_AD_LEN; dropped (mentions span two reads?)")
         return None
     return seg_start, seg_end, "host read"
 
@@ -2211,6 +2819,11 @@ def _method_voice(words, mp3_path):
         audio = np.frombuffer(frames, dtype=np.int16).astype(float)
         sr = w.getframerate()
         w.close()
+    except Exception as e:
+        # Voice is a low-confidence heat-map-only voter: a bad decode
+        # must degrade to "method silent", not fail the episode (M20).
+        log(f"  voice: audio decode failed ({type(e).__name__}: {e}) — skipping")
+        return []
     finally:
         if os.path.exists(wav_path):
             os.remove(wav_path)
@@ -2291,6 +2904,11 @@ def _method_reverb(words, mp3_path):
         audio = np.frombuffer(w.readframes(w.getnframes()),
                               dtype=np.int16).astype(float) / 32768.0
         w.close()
+    except Exception as e:
+        # As _method_voice (M20): reverb is heat-map-only; a bad
+        # decode degrades to silent, it must not fail the episode.
+        log(f"  reverb: audio decode failed ({type(e).__name__}: {e}) — skipping")
+        return []
     finally:
         if os.path.exists(wav_path):
             os.remove(wav_path)
@@ -2341,7 +2959,7 @@ def find_duplicate_segments(words, min_shingle=8, min_gap=60, min_dur=15):
     # Build shingles: 8 normalized words -> list of timestamps
     shingles = defaultdict(list)
     n = len(nw)
-    for i in range(n - min_shingle):
+    for i in range(n - min_shingle + 1):
         key = tuple(nw[i + k] for k in range(min_shingle))
         if all(key):
             shingles[key].append(words[i][0])
@@ -2494,8 +3112,17 @@ def _merge_chapters(id3_chapters, rss_chapters):
     so one ad chapter doesn't vote twice."""
     merged = list(id3_chapters)
     for sec, title in rss_chapters:
-        if not any(abs(sec - s) < 2.0 for s, _ in merged):
-            merged.append((sec, title))
+        # Dedupe by time AND title class (M22): an RSS ad chapter
+        # starting within 2s of a non-ad chapter is kept — dropping it
+        # loses a high-precision chapter vote. Drop the RSS entry only
+        # when it is not an ad title, or the near chapter is already
+        # an ad title.
+        near_any = any(abs(sec - s) < 2.0 for s, _ in merged)
+        near_ad = any(abs(sec - s) < 2.0 and _is_ad_chapter_title(t)
+                      for s, t in merged)
+        if near_any and (not _is_ad_chapter_title(title) or near_ad):
+            continue
+        merged.append((sec, title))
     return sorted(merged)
 
 
@@ -2509,7 +3136,11 @@ def _method_chapter(words, chapters, silences):
     """
     if not chapters:
         return []
-    duration = words[-1][0]
+    if not words:
+        return []
+    # Last word's END, not its start: the final chapter runs to the
+    # end of the last transcribed word (M21).
+    duration = words[-1][1]
     pauses = get_pauses(words, silences)
     results = []
     ordered = sorted(chapters)
@@ -2519,13 +3150,15 @@ def _method_chapter(words, chapters, silences):
         end = ordered[i + 1][0] if i + 1 < len(ordered) else duration
         # Snap to nearby pauses for clean cuts, never into neighboring
         # content: start snaps forward, end snaps backward (<=4s each).
+        # Snap to speech (M23): start to the silence end, end to
+        # the silence start.
         for ps, pe in pauses:
             if ps >= start and ps - start <= 4.0:
-                start = ps
+                start = pe
                 break
         for ps, pe in reversed(pauses):
             if pe <= end and end - pe <= 4.0:
-                end = pe
+                end = ps
                 break
         if end - start < 5:
             continue
@@ -2538,14 +3171,12 @@ def find_url_positions(nw):
     """All spoken URL positions: {word_index: brand stem}.
 
     Shared by find_url_mentions (CTA-gated anchors) and _method_url
-    (bare URLs). NOTE: keep in sync with extract_sponsors' TLD lists. A
-    missing TLD is a silent miss: SN 1101 (2026-10-22) — the spoken
+    (bare URLs). TLDs come from the single shared URL_TLDS set (M15):
+    a missing TLD is a silent miss: SN 1101 (2026-10-22) — the spoken
     "canary.tools" URL produced no URL anchor because "tools" was not
     in this set.
     """
-    tlds = {"com", "net", "org", "io", "tv", "co", "ai", "me", "tools",
-            "app", "dev", "xyz", "online", "store", "tech", "site",
-            "cloud", "cc", "gg", "life", "world", "news", "media"}
+    tlds = URL_TLDS  # single shared set (M15)
     L = len(nw)
     url_at = {}
     for i in range(L):
@@ -2655,7 +3286,7 @@ def find_url_mentions(nw, own_domains=None):
 def sponsor_root(label):
     """Distinctive word from a sponsor label, e.g. 'material.security' -> 'material'."""
     t = re.sub(r"^https?://(www\.)?", "", label.lower()).split("/")[0]
-    t = re.sub(r"\.(com|net|org|io|ai|tv|co|us|security)$", "", t)
+    t = re.sub(URL_TLD_RE, "", t)
     return t.split()[0] if t else ""
 
 
@@ -2671,10 +3302,23 @@ def check_missed_sponsors(words, sponsors, blocks):
     """
     nw = norm_words(words)
     missed = []
+
+    def _label_part(lbl):
+        # Sponsor part of a block label only, normalised exactly as
+        # _pick_label / split_rescue._part do (M14): a substring test
+        # on the whole label lets "cta:AG10" cover sponsor "AG1".
+        return (lbl or "").split(":")[-1].strip().lower().replace(" ", "")
+
     for sp in sponsors:
-        variants = {v for v in sp.get("variants", set()) if v and len(v) >= 4}
+        # No length filter (M13): short variants are already handled
+        # by _boundary_match in detection, and filtering them here
+        # silently skips short-named sponsors (FUM) entirely. Fall
+        # back to the label itself when no variants exist at all.
+        variants = {v for v in sp.get("variants", set()) if v}
         if not variants:
-            continue
+            variants = {sp["label"].lower()}
+            log(f"  sponsor '{sp['label']}' has no variants; "
+                "checking the label itself")
         hits = find_mentions(nw, variants)
         if not hits:
             # A block naming this sponsor covers it even with zero
@@ -2683,16 +3327,30 @@ def check_missed_sponsors(words, sponsors, blocks):
             # named FUM; Rorra on Huberman, heard "Rora"). The
             # block-label test below already exists for the hits>0
             # path; the zero-hit branch returned before reaching it.
-            if any(sp["label"].lower() in (lbl or "").lower()
+            if any(_label_part(lbl) == sp["label"].lower().replace(" ", "")
                    for _, _, lbl, *_ in blocks):
                 continue
             log(f"  WARNING: sponsor '{sp['label']}' not in audio (0 transcript mentions)")
             missed.append({"label": sp["label"], "mentions": 0})
             continue
+        sp_part = sp["label"].lower().replace(" ", "")
         hit_times = [words[i][0] for i in hits]
-        covered = any(s <= t <= e for t in hit_times for s, e, *_ in blocks)
+        # Time coverage is label-aware (M14): a mention inside a block
+        # labelled for a DIFFERENT sponsor (AG1 inside a cta:AG10
+        # block) does not cover this sponsor — the audit's label test
+        # alone would not fix R25, because the time test fires first.
+        # Unnamed blocks (label None/"") can still cover by time:
+        # they may be this sponsor's ad without a name. Trade-off
+        # with the 2026-10-12 Lore case (a read inside a
+        # differently-labelled merged block now reports missed): that
+        # surfaces for operator review instead of silently assuming
+        # coverage; a missed report is cheap, a silently unmarked ad
+        # is not.
+        covered = any(s <= t <= e for t in hit_times
+                      for s, e, lbl, *_ in blocks
+                      if _label_part(lbl) in ("", sp_part))
         if not covered:
-            covered = any(sp["label"].lower() in (lbl or "").lower()
+            covered = any(_label_part(lbl) == sp_part
                           for _, _, lbl, *_ in blocks)
         if not covered:
             log(f"  WARNING: sponsor '{sp['label']}' not cut "
@@ -2995,10 +3653,8 @@ def insert_ad_chapters(base_chapters, ad_spans, duration):
         return title
 
     out = []
-    prev_end = None
+    prev_kept_end = None
     for a, b in zip(pts, pts[1:]):
-        contiguous = (prev_end == a)
-        prev_end = b
         if b - a < 0.5:
             continue
         title = ad_at(a) or base_at(a) or (base_chapters[0][1] if base_chapters else None)
@@ -3007,10 +3663,16 @@ def insert_ad_chapters(base_chapters, ad_spans, duration):
         # Merge only CONTIGUOUS same-title intervals (e.g. a base boundary
         # inside one ad). Two same-titled ads separated by content must
         # stay separate chapters -- merging them would swallow the content
-        # between them into one long ad chapter.
-        if out and out[-1][1] == title and contiguous:
+        # between them into one long ad chapter. Contiguity is measured
+        # from the last KEPT chapter's end (m11): the old check compared
+        # against the previous interval's end, which is set even for
+        # dropped (<0.5s) intervals — so two same-titled ads separated
+        # by a dropped sliver of content merged into one chapter.
+        if out and out[-1][1] == title and prev_kept_end == a:
+            prev_kept_end = b
             continue
         out.append((a, title))
+        prev_kept_end = b
     return [(int(s * 1000), t) for s, t in out]
 
 
@@ -3095,14 +3757,22 @@ def write_feed(state, site_dir, original_xml):
         # Strip CDATA wrapper if present (html.unescape doesn't handle it)
         if guid.startswith("<![CDATA[") and guid.endswith("]]>"):
             guid = guid[9:-3].strip()
+        ep = marked.get(guid)
         pin = pinned.get(guid)
-        if pin:
+        if ep and pin:
+            # M33 (2026-11-19): a marked episode wins over its pinned
+            # original, loudly. A pin only ever stands in for an
+            # episode that has not been marked yet (no file, no
+            # enclosure_url); the docstring's "clear pinned fields on
+            # marking" is now an explicit step in _build_state_entry.
+            log(f"  WARNING: feed: {guid} has both a marked enclosure "
+                "and a pinned original; serving the marked enclosure")
+        if pin and not ep:
             body = re.sub(
                 r'<enclosure[^>]*>',
                 f'<enclosure url="{pin["pinned_original_url"]}" length="{pin["pinned_original_bytes"]}" type="audio/mpeg"/>',
                 body, count=1)
             return "<item>" + body + "</item>"
-        ep = marked.get(guid)
         if not ep:
             return m.group(0)
         # Direct enclosure URL (e.g. remote-storage link) takes precedence;
@@ -3113,9 +3783,16 @@ def write_feed(state, site_dir, original_xml):
             new_url = base + "/" + ep["file"]
         else:
             return m.group(0)
+        # M32 (2026-11-19): the old eager default ep["bytes"] raised
+        # KeyError and killed the whole feed when an entry had an
+        # enclosure_url but neither enclosure_bytes nor bytes.
+        length = ep.get("enclosure_bytes") or ep.get("bytes") or 0
+        if not length:
+            log(f"  WARNING: feed: {guid} has an enclosure URL but no "
+                "byte count; emitting length=0")
         body = re.sub(
             r'<enclosure[^>]*>',
-            f'<enclosure url="{new_url}" length="{ep.get("enclosure_bytes", ep["bytes"])}" type="audio/mpeg"/>',
+            f'<enclosure url="{new_url}" length="{length}" type="audio/mpeg"/>',
             body, count=1)
         dm = re.search(r"(<description>)(.*?)(</description>)", body, re.S)
         if dm:
@@ -3192,31 +3869,61 @@ def _b_cache_check(b_dir, b_sha256):
         try:
             if open(marker).read().strip() == b_sha256:
                 return  # cache matches this B file
-        except OSError:
-            pass
+        except OSError as e:
+            # m17 (2026-11-19): was a silent pass; a failed marker
+            # read now logs, and the stale chunks are dropped below.
+            log(f"  WARNING: B marker read failed ({e}); dropping "
+                "stale B chunks")
         log("  B audio differs from the cached B transcript; "
             "dropping stale B chunks")
     else:
         log("  no B transcript marker; dropping any stale B chunks")
+    # m17 (2026-11-19): failed deletes used to be silent; they are
+    # now logged. (Whether the marker is still written after a failed
+    # delete is m1 — the survivor check below refuses loudly.)
     for f in glob.glob(os.path.join(b_dir, "chunk_*.json")):
         try:
             os.remove(f)
-        except OSError:
-            pass
+        except OSError as e:
+            log(f"  WARNING: could not drop stale B chunk {f} ({e})")
     try:
         os.remove(os.path.join(b_dir, "transcript.json"))
-    except OSError:
-        pass
+    except OSError as e:
+        log(f"  WARNING: could not drop stale B transcript.json ({e})")
+    # (m1) Verify the drop succeeded before writing the new marker:
+    # a surviving stale chunk would be reused as if it belonged to
+    # the new B. Refuse loudly instead of blessing it.
+    survivors = glob.glob(os.path.join(b_dir, "chunk_*.json"))
+    if os.path.exists(os.path.join(b_dir, "transcript.json")):
+        survivors.append(os.path.join(b_dir, "transcript.json"))
+    if survivors:
+        log(f"  ERROR: stale B chunks could not be removed: {survivors}; "
+            "refusing to write the new B marker")
+        raise RuntimeError(
+            f"_b_cache_check: could not remove stale B cache in {b_dir}: "
+            f"{survivors}")
     with open(marker, "w") as f:
         f.write(b_sha256)
+
+
+def transcribe_b(mp3_path, b_dir, b_sha256=None):
+    """Transcribe a B copy through the guarded path (m8): the marker
+    check runs first, so a stale B transcript cache can never be
+    reused by a direct transcribe_chunked call. All B transcription
+    in the repo must go through this helper."""
+    if b_sha256 is None:
+        b_sha256 = sha256_file(mp3_path)
+    _b_cache_check(b_dir, b_sha256)
+    return transcribe_chunked(mp3_path, b_dir)
 
 
 def _cleanup_b_mp3(b_mp3):
     try:
         if os.path.exists(b_mp3):
             os.remove(b_mp3)
-    except OSError:
-        pass
+    except OSError as e:
+        # m17 (2026-11-19): was a silent pass.
+        log(f"  WARNING: could not remove B mp3 {b_mp3} ({e})")
 
 
 def _prune_pinned_b(work, keep=SLOT_PINNED_B_KEEP_SIBLINGS):
@@ -3233,10 +3940,67 @@ def _prune_pinned_b(work, keep=SLOT_PINNED_B_KEEP_SIBLINGS):
              if os.path.abspath(p) != cur]
     paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     for p in paths[keep:]:
+        # (m7) Prune the whole B transcript cache + marker + download
+        # sidecar together with the mp3; the cache describes audio
+        # that no longer exists.
+        b_dir = os.path.dirname(p)
+        victims = [p]
+        victims += glob.glob(os.path.join(b_dir, "chunk_*.json"))
+        victims += [os.path.join(b_dir, "transcript.json"),
+                    os.path.join(b_dir, "b_sha256.txt"),
+                    _download_sidecar_path(p)]
+        for v in victims:
+            try:
+                os.remove(v)
+            except OSError as e:
+                # m17 (2026-11-19): was a silent pass.
+                log(f"  WARNING: could not prune pinned B {v} ({e})")
+
+
+def _pinned_b_complete(b_mp3, b_dir, a_duration):
+    """Re-validate a pinned B before reuse (m3). Returns True only
+    when the file's live ffprobe duration agrees with the download
+    sidecar (within 2s) and with the A duration (within the 10% slot
+    guard). A missing (legacy) sidecar is accepted once on the
+    duration-vs-A check alone, and a sidecar is then written so later
+    runs verify identity. Any probe failure or duration move drops
+    the pin. SHA alone attests identity, not completeness: a B
+    truncated under chunked transfer keeps its SHA forever."""
+    sidecar = _download_sidecar_path(b_mp3)
+    try:
+        b_dur = probe_duration(b_mp3)
+    except Exception as exc:
+        log(f"  pinned B unprobeable ({exc!r}); dropping pin")
+        return False
+    if a_duration and abs(b_dur - a_duration) / a_duration > \
+            SLOT_GUARD_MAX_DUR_RATIO:
+        log(f"  pinned B duration {b_dur:.0f}s vs A {a_duration:.0f}s "
+            "outside the slot guard; dropping pin")
+        return False
+    if os.path.exists(sidecar):
         try:
-            os.remove(p)
-        except OSError:
-            pass
+            with open(sidecar) as f:
+                sc = json.load(f)
+            if sc.get("sha256") != sha256_file(b_mp3):
+                log("  pinned B differs from its download sidecar; "
+                    "dropping pin")
+                return False
+            if sc.get("duration") is not None and \
+                    abs(b_dur - sc["duration"]) > 2.0:
+                log(f"  pinned B duration moved ({sc['duration']}s "
+                    f"recorded, {b_dur:.0f}s now); dropping pin")
+                return False
+            if not sc.get("content_length_verified"):
+                log("  pinned B completeness unverified (no "
+                    "Content-Length at download); duration guard is "
+                    "the only backstop")
+            return True
+        except (OSError, ValueError, KeyError, TypeError):
+            pass  # unreadable sidecar: fall through to legacy path
+    log("  pinned B has no download sidecar (legacy pin); "
+        "accepting on duration check alone and recording identity")
+    _write_download_sidecar(b_mp3, False)
+    return True
 
 
 def _slot_overlap(a0, a1, b0, b1):
@@ -3249,14 +4013,19 @@ def _slot_gate_a_side(slot, candidates, a_words, nw_a, sponsors, house_plugs):
     falls inside it. Returns evidence string ('detector' | 'mention')
     or None."""
     s, e = slot["start"], slot["end"]
+    # Detector evidence must come from a method that can mark a block
+    # alone (cta/cluster/brand/chapter) and overlap the slot by >=5s
+    # AND >=10% of the slot (M17). A 0.1s graze, or overlap with only
+    # a low-confidence voter (voice, duplicate, cluster-popular,
+    # brand-orphan, url, history-preroll, reverb), is not evidence —
+    # the old test passed on any overlap > 0 with any non-reverb
+    # method, including voice-only evidence.
+    _alone = ("cta", "cluster", "brand", "chapter")
     for cs, ce, _l, m in candidates:
-        # Dry islands are single-vote reverb suspects, not detector
-        # evidence (slot determinism, 2026-11-18, candidate 3c): a slot
-        # whose only candidate overlap is a dry island passes the gate
-        # on noise. Any other method still passes.
-        if m == "reverb":
+        if m not in _alone:
             continue
-        if _slot_overlap(s, e, cs, ce) > 0:
+        ov = _slot_overlap(s, e, cs, ce)
+        if ov >= 5.0 and ov >= 0.10 * (e - s):
             return "detector"
     variants = set()
     for sp in list(sponsors) + list(house_plugs):
@@ -3279,19 +4048,18 @@ def _slot_gate_b_side(slot, b_words, nw_b, sponsors, house_plugs, own_domains):
         variants |= set(sp.get("variants", []))
     if not variants:
         return False
-    brand_hit = False
-    for h in find_mentions(nw_b, variants):
-        if bs <= b_words[h][0] < be:
-            brand_hit = True
-            break
-    if not brand_hit:
+    brand_times = [b_words[h][0] for h in find_mentions(nw_b, variants)
+                   if bs <= b_words[h][0] < be]
+    if not brand_times:
         return False
     url_idx = {i for _b, i in find_url_mentions(nw_b, own_domains)}
     url_idx |= {i for _b, i in find_bare_urls(nw_b, own_domains)}
-    for i in url_idx:
-        if bs <= b_words[i][0] < be:
-            return True
-    return False
+    url_times = [b_words[i][0] for i in url_idx
+                 if bs <= b_words[i][0] < be]
+    # Brand and URL must be near each other (<=60s), not merely in
+    # the same (possibly 700s) window (M18).
+    return any(abs(bt - ut) <= 60.0
+               for bt in brand_times for ut in url_times)
 
 
 def _gate_slot(slot, a_words, nw_a, b_words, nw_b, candidates,
@@ -3320,19 +4088,35 @@ def _slot_name_from_mentions(slot, a_words, nw_a, sponsors, house_plugs):
     sponsor from the orphan path to the brand path (orphan-flip
     constraint, HANDOFF.md 2026-11-10)."""
     s, e = slot["start"], slot["end"]
+    # URL/CTA stems inside the slot (m14): a popular brand is named
+    # only with an anchor — bare short variants ("mint", "seed",
+    # "factor") occur in ordinary speech.
+    _url = [(b, i) for b, i in find_bare_urls(nw_a)]
+    _url += [(b, i) for b, i in find_url_mentions(nw_a)]
+    url_stems = {b.replace(" ", "") for b, i in _url
+                 if s <= a_words[i][0] < e}
     pools = [(list(sponsors), 0), (list(house_plugs), 1),
              (list(POPULAR_BRANDS), 2)]
-    best = None  # (count, -tier, label)
+    best = None  # (key, label); key = (count, anchored, -tier, -first)
     for pool, tier in pools:
         for sp in pool:
             variants = set(sp.get("variants", []))
             if not variants:
                 continue
-            n = sum(1 for h in find_mentions(nw_a, variants)
-                    if s <= a_words[h][0] < e)
-            if n and (best is None or (n, -tier) > (best[0], best[1])):
-                best = (n, -tier, sp["label"])
-    return f"slot:{best[2]}" if best else None
+            hits = [h for h in find_mentions(nw_a, variants)
+                    if s <= a_words[h][0] < e]
+            if not hits:
+                continue
+            stems = {sp["label"].lower().replace(" ", "")}
+            stems |= {v.replace(" ", "") for v in variants
+                      if " " not in v}
+            anchored = bool(stems & url_stems)
+            if tier == 2 and not anchored:
+                continue
+            key = (len(hits), anchored, -tier, -a_words[hits[0]][0])
+            if best is None or key > best[0]:
+                best = (key, sp["label"])
+    return f"slot:{best[1]}" if best else None
 
 
 def _merge_slots(blocks, gated_slots, a_words, candidates, sponsors,
@@ -3340,17 +4124,23 @@ def _merge_slots(blocks, gated_slots, a_words, candidates, sponsors,
     """Merge gated slots with detector blocks (DESIGN.md section 7).
     Returns (merged_blocks, sources) with sources parallel to blocks:
     'detector' | 'slot' | 'merged'. Slot edges are used as-is (no
-    refinement); slot blocks bypass the 30s/45s floors. A slot
-    overlapping a house-plug block never overwrites it — the detector
-    block stands and the overlap is logged for review. Partial-overlap
-    tightening (gate fix, 2026-11-13): a slot overlapping a detector
-    block by <50% of the slot's duration never becomes a standalone
-    block — it is merged INTO the most-overlapped detector block,
-    extending that block to cover the slot (the 286 "cha" slot,
-    899.4-927.1, overlapped the Ghostbed block by only 32% and passed
-    the gate as an unnamed false block). A slot partially overlapping
-    only house-plug blocks is dropped instead; the detector block
-    stands."""
+    refinement); slot blocks bypass the 30s/45s floors. Rules
+    (fix round 2026-11-19):
+    - Density floor (M7): a slot below SLOT_FLOOR_DENSITY_MIN is
+      dropped on EVERY path, not just the standalone one.
+    - Partial overlap (M8): merging into a block needs >=10s AND
+      >=10% of the slot; a grazing touch drops the slot.
+    - Multi-overlap (C3): one slot overlapping several detector
+      blocks collapses them only when they are the SAME ad (same
+      sponsor part); different ads keep their detector blocks.
+    - House plugs (m10): the plug veto is per-block — a slot
+      overlapping a plug AND a real ad block still merges into the
+      ad block; plug blocks are never overwritten.
+    - Final pass (M9, M25): merged blocks are clipped against
+      neighbours so the result never overlaps, and a partial merge
+      that would exceed MAX_AD_LEN keeps the detector block instead.
+    A slot partially overlapping only house-plug blocks is dropped;
+    the detector block stands."""
     starts = [w[0] for w in a_words]
     ends = [w[1] for w in a_words]
     votes = _word_votes(a_words, candidates)
@@ -3365,6 +4155,13 @@ def _merge_slots(blocks, gated_slots, a_words, candidates, sponsors,
         s, e = slot["start"], slot["end"]
         if e - s > MAX_AD_LEN:
             log(f"  slot {s:.1f}-{e:.1f} exceeds MAX_AD_LEN; skipped")
+            continue
+        # Density floor on every path (M7): a low-density slot must
+        # not replace or extend detector edges either — it is a
+        # repeated sign-off / outro tail, not an ad read.
+        if slot.get("density", 0) < SLOT_FLOOR_DENSITY_MIN:
+            log(f"  slot {s:.1f}-{e:.1f} density "
+                f"{slot.get('density')} below floor; skipped")
             continue
         overlapping = []
         partial = []
@@ -3385,8 +4182,25 @@ def _merge_slots(blocks, gated_slots, a_words, candidates, sponsors,
                         best = (ov, i, b)
                 if best is not None:
                     _ov, i, b = best
+                    # Minimum partial overlap (M8): a grazing touch
+                    # must not absorb the whole slot.
+                    if _ov < 10.0 or _ov < 0.10 * (e - s):
+                        log(f"  slot {s:.1f}-{e:.1f} partially overlaps "
+                            f"detector block {b[0]:.1f}-{b[1]:.1f} by "
+                            f"only {_ov:.1f}s; dropped")
+                        continue
                     pct = 100.0 * _ov / (e - s) if e > s else 0.0
                     ns, ne = min(s, b[0]), max(e, b[1])
+                    # A merge that would exceed MAX_AD_LEN keeps the
+                    # detector block instead (M25).
+                    if ne - ns > MAX_AD_LEN:
+                        log(f"  slot {s:.1f}-{e:.1f} merged block "
+                            f"{ns:.1f}-{ne:.1f} exceeds MAX_AD_LEN; "
+                            "keeping detector block")
+                        merged.append(b)
+                        sources.append("detector")
+                        used.add(i)
+                        continue
                     log(f"  slot {s:.1f}-{e:.1f} partially overlaps "
                         f"detector block {b[0]:.1f}-{b[1]:.1f} "
                         f"({_ov:.1f}s, {pct:.0f}% of slot); merged into "
@@ -3399,48 +4213,50 @@ def _merge_slots(blocks, gated_slots, a_words, candidates, sponsors,
                 log(f"  slot {s:.1f}-{e:.1f} partially overlaps only "
                     "house-plug blocks; dropped")
                 continue
-            # Density floor (2026-11-14): a standalone slot whose
-            # A-side words barely differ from B is not an ad read
-            # — it is a repeated sign-off / outro tail (Huberman
-            # Mitochondria, density 0.176, 3 differing words, no
-            # brand, no ad copy). Across all 26 gated slots
-            # measured, densities are 0.176 for the one false slot
-            # and 0.677-1.0 for everything else; 0.5 sits in the
-            # middle of that gap.
-            if slot.get("density", 0) < SLOT_FLOOR_DENSITY_MIN:
-                log(f"  slot {s:.1f}-{e:.1f} density "
-                    f"{slot.get('density')} below floor; skipped")
-                continue
             merged.append((s, e, slot["label"],
                            sharpness(s, "start"), sharpness(e, "end")))
             sources.append("slot")
             continue
-        # House-plug blocks are never overwritten by a slot.
-        plug = None
+        # House-plug blocks are never overwritten by a slot (m10):
+        # the veto is per-block — a slot overlapping a plug AND a
+        # real ad block still merges into the ad block.
+        _nonplug = []
         for _ov, _i, b in overlapping:
             name = ad_chapter_name(b[2], sponsors)
             if name and is_house_plug(name, house_plugs):
-                plug = b
-                break
-        if plug is not None:
-            log(f"  slot {s:.1f}-{e:.1f} overlaps house-plug block "
-                f"{plug[0]:.1f}-{plug[1]:.1f}; detector block stands")
+                continue
+            _nonplug.append((_ov, _i, b))
+        if not _nonplug:
+            log(f"  slot {s:.1f}-{e:.1f} overlaps only house-plug "
+                "blocks; detector block stands")
             continue
+        overlapping = _nonplug
         if len(overlapping) == 1:
             _ov, i, b = overlapping[0]
             label = b[2]
             used.add(i)
+            merged.append((s, e, label, sharpness(s, "start"),
+                           sharpness(e, "end")))
+            sources.append("merged")
+            continue
+        # One slot, several detector blocks (C3): collapse only when
+        # they are the SAME ad (same sponsor part). Different ads keep
+        # their detector blocks — collapsing would delete a whole ad.
+        if len({_xep_part(o[2][2]) for o in overlapping}) != 1:
+            log(f"  slot {s:.1f}-{e:.1f} overlaps "
+                f"{len(overlapping)} different-ad detector blocks; "
+                "keeping detector blocks")
+            continue
+        overlapping.sort(key=lambda t: -t[0])
+        top = overlapping[0][0]
+        tied = [o for o in overlapping if abs(o[0] - top) < 1e-9]
+        labels = {o[2][2] for o in tied}
+        if len(labels) == 1:
+            label = tied[0][2][2]
         else:
-            overlapping.sort(key=lambda t: -t[0])
-            top = overlapping[0][0]
-            tied = [o for o in overlapping if abs(o[0] - top) < 1e-9]
-            labels = {o[2][2] for o in tied}
-            if len(labels) == 1:
-                label = tied[0][2][2]
-            else:
-                label = slot["label"]
-            for _ov, i, _b in overlapping:
-                used.add(i)
+            label = slot["label"]
+        for _ov, i, _b in overlapping:
+            used.add(i)
         merged.append((s, e, label, sharpness(s, "start"),
                        sharpness(e, "end")))
         sources.append("merged")
@@ -3448,8 +4264,27 @@ def _merge_slots(blocks, gated_slots, a_words, candidates, sponsors,
         if i not in used:
             merged.append(b)
             sources.append("detector")
-    order = sorted(range(len(merged)), key=lambda i: merged[i][0])
-    return [merged[i] for i in order], [sources[i] for i in order]
+    # Final pass (M9, M25): sort by start, clip any block that starts
+    # before the previous block's end, drop blocks clipped below 5s,
+    # and drop anything still over MAX_AD_LEN (backstop — the
+    # per-path checks above should already prevent it).
+    out, out_sources = [], []
+    for b, src in sorted(zip(merged, sources), key=lambda p: p[0][0]):
+        s, e = b[0], b[1]
+        if out and s < out[-1][1]:
+            s = out[-1][1]
+            if e - s < 5:
+                log(f"  drop block {b[0]:.1f}-{b[1]:.1f} ('{b[2]}'): "
+                    f"clipped to {e - s:.1f}s by neighbour")
+                continue
+            b = (s, e, b[2], sharpness(s, "start"), b[4])
+        if e - s > MAX_AD_LEN:
+            log(f"  drop block {s:.1f}-{e:.1f} ('{b[2]}'): "
+                "exceeds MAX_AD_LEN")
+            continue
+        out.append(b)
+        out_sources.append(src)
+    return out, out_sources
 
 
 def _write_align_result(work, a_sha256, b_sha256, aligned, gated, rejected,
@@ -3518,13 +4353,21 @@ def run_slot_flow(work, a_words, a_duration, a_mp3_path, a_sha256, b_url,
         if os.path.exists(marker):
             try:
                 if open(marker).read().strip() == sha256_file(b_mp3):
-                    pinned = True
-                    log("  reusing pinned B download "
-                        f"({os.path.getsize(b_mp3)} bytes)")
+                    # (m3) SHA attests identity, not completeness:
+                    # re-validate the pinned file's live duration
+                    # against the download sidecar (and the A) before
+                    # trusting the pin.
+                    pinned = _pinned_b_complete(b_mp3, b_dir, a_duration)
+                    if pinned:
+                        log("  reusing pinned B download "
+                            f"({os.path.getsize(b_mp3)} bytes)")
             except OSError:
                 pass
         if not pinned:
-            os.remove(b_mp3)
+            try:
+                os.remove(b_mp3)
+            except OSError:
+                pass
     try:
         if b_mp3_path is None and not pinned:
             download(b_url, b_mp3, retries=3)
@@ -3542,10 +4385,10 @@ def run_slot_flow(work, a_words, a_duration, a_mp3_path, a_sha256, b_url,
         _cleanup_b_mp3(b_mp3)
         result["status"] = "no_slots"
         return result
-    # The B transcript cache is only valid for this exact B file.
-    _b_cache_check(b_dir, b_sha256)
+    # The B transcript cache is only valid for this exact B file;
+    # transcribe_b runs the marker check first (m8).
     # B transcription (a crash here propagates — crash protocol).
-    b_words, b_duration = transcribe_chunked(b_mp3, b_dir)
+    b_words, b_duration = transcribe_b(b_mp3, b_dir, b_sha256)
     result["b_duration"] = b_duration
     # Alignment.
     try:
@@ -3641,6 +4484,18 @@ def _dynamic_flag_status(pcfg, state):
     return None, None
 
 
+def _save_state_quietly(state):
+    """Persist state now; log (never raise) on failure (M34).
+
+    Used for the dynamic flag / attempts counters, which must reach
+    disk as soon as they change -- not only at the end of a
+    successful process_episode()."""
+    try:
+        save_state(state)
+    except Exception as exc:
+        log(f"  WARNING: immediate state save failed ({exc!r}); continuing")
+
+
 def _record_dynamic_flag(state, status, probe_episode, source):
     state["dynamic_ads"] = {
         "status": bool(status), "checked": date.today().isoformat(),
@@ -3678,6 +4533,7 @@ def _run_dynamic_for_episode(item, pcfg, state, work, mp3_path, words,
         log("  feed carries podcast:transcript tags; skipping second "
             "download (publisher transcript is the comparison)")
         _record_dynamic_flag(state, False, item["title"], "transcript")
+        _save_state_quietly(state)  # M34: persist the flag now
         info["dynamic_status"] = "transcript"
         return info
     if mode in ("config", "flag") and not value:
@@ -3706,10 +4562,12 @@ def _run_dynamic_for_episode(item, pcfg, state, work, mp3_path, words,
                     "feed is static")
                 _cleanup_b_mp3(b_mp3)
                 _record_dynamic_flag(state, False, item["title"], "probe")
+                _save_state_quietly(state)  # M34: persist the flag now
                 info["b_sha256"] = b_sha256
                 return info
             log("  probe: second download differs; feed is dynamic")
             _record_dynamic_flag(state, True, item["title"], "probe")
+            _save_state_quietly(state)  # M34: persist the flag now
             flow = run_slot_flow(work, words, duration, mp3_path, a_sha256,
                                  item["audio_url"], sponsors, desc_sponsors,
                                  HOUSE_PLUGS, own_domains, candidates, blocks,
@@ -3739,6 +4597,17 @@ def _run_dynamic_for_episode(item, pcfg, state, work, mp3_path, words,
     else:
         info["dynamic_attempts"] = 0
         info["dynamic_pending"] = False
+    # M34: persist the attempts / pending counters NOW, not only at
+    # the end of process_episode() -- a crash after the B flow used
+    # to lose them, so the episode was retried forever with no cap.
+    # Stored on the episode entry (minimal entry if this is a first
+    # run); process_episode() overwrites them with the same values.
+    _attempt_entry = state.setdefault("processed", {}).setdefault(
+        item["guid"], {})
+    _attempt_entry.setdefault("title", item["title"])
+    _attempt_entry["dynamic_attempts"] = info["dynamic_attempts"]
+    _attempt_entry["dynamic_pending"] = info["dynamic_pending"]
+    _save_state_quietly(state)
     # No-slots streak: three consecutive dynamic-flagged episodes with
     # no slots clears the flag, so the next episode re-probes. (Config
     # feeds have no flag to clear.)
@@ -3782,6 +4651,12 @@ def slots_only_mode(slug, items, channel_link):
     if not words:
         raise SystemExit("no A transcript cache; process the episode first")
     duration = probe_duration(mp3_path)
+    # (M3) Drop stale out-of-range words a glob reader would otherwise
+    # include (chunks from an older, longer cut).
+    words = [w for w in words if w[0] < duration]
+    if not words:
+        raise SystemExit("no A transcript words within the audio duration; "
+                         "process the episode first")
     sponsors = extract_sponsors(item["description"])
     desc_sponsors = list(sponsors)
     sponsors += [dict(p) for p in HOUSE_PLUGS]
@@ -3838,7 +4713,8 @@ def _record_history(item, blocks, block_sources, duration):
             item["title"], duration, item.get("pubDate", ""),
             blocks, block_sources, HOUSE_PLUGS, version)
         if result["ok"] and result["rows_written"]:
-            log(f"  history: appended {result['rows_written']} rows "
+            _verb = ("replaced" if result.get("replaced") else "appended")
+            log(f"  history: {_verb} {result['rows_written']} rows "
                 f"to {PODCAST_ID}.csv")
         elif result["ok"]:
             log(f"  history: skipped ({result['skipped']})")
@@ -3846,6 +4722,204 @@ def _record_history(item, blocks, block_sources, duration):
             log(f"  history: write failed ({result['error']}); continuing")
     except Exception as exc:  # never fail an episode run on history
         log(f"  history: skipped ({exc!r}); continuing")
+
+
+def _check_transcript_plausible(words, duration, title):
+    """(M2) Never publish a zero/near-zero transcript as "no ads": an
+    empty or implausible transcript means transcription failed, not
+    that the episode has no ads. Frozen SB minimum is 126 words/min;
+    20 words/min is ~6x below any real episode."""
+    if duration <= 0 or not words or (
+            duration >= 60 and len(words) / duration * 60 < 20):
+        raise RuntimeError(
+            f"refusing to publish {title}: implausible transcript "
+            f"({len(words)} words over {duration:.0f}s); transcription "
+            f"failed, not detection")
+
+
+# Sentinel for _build_state_entry(): keep the old value of a field
+# the caller did not recompute (used by the B-only retry, M6).
+_KEEP_OLD = object()
+
+
+def _build_state_entry(old, item, out_name, out_bytes, marked_dur,
+                       state_blocks, dyn, td_result=_KEEP_OLD,
+                       td_corr=_KEEP_OLD, missed=_KEEP_OLD,
+                       suspects_summaries=_KEEP_OLD,
+                       suspects_reel_name=_KEEP_OLD,
+                       suspects_reel_bytes=_KEEP_OLD):
+    """Build the state entry for a (re-)marked episode (M6/M33, 2026-11-19).
+
+    Starts from a copy of the previous entry instead of a bare
+    literal dict, so publish fields (enclosure_*, suspects_*), legacy
+    fields (ads_reel*, ads_removed, removed_seconds, reverted) and
+    any other writer's fields survive a re-run -- the old wholesale
+    rewrite dropped them all (state-repair landmine, known issue 5;
+    M6's feed-enclosure consequence). Explicit steps on every
+    marking: pinned_original_* fields are cleared (the write_feed
+    docstring's promise, now implemented rather than a side effect);
+    skipped/reason are cleared (a processed episode is not skipped).
+    When the episode was already published and its block edges
+    changed, republish_needed is set so publish_github re-publishes
+    it (feed_pushed tracks whether that push was verified)."""
+    entry = dict(old) if old else {}
+    for k in [k for k in entry if k.startswith("pinned_original_")]:
+        entry.pop(k)
+        log(f"  cleared pinned_original field {k} on marking "
+            f"{item['title']}")
+    entry.pop("skipped", None)
+    entry.pop("reason", None)
+    old_blocks = [(b.get("start"), b.get("end")) for b in
+                  (old or {}).get("blocks", [])] if old else []
+    new_blocks = [(b["start"], b["end"]) for b in state_blocks]
+    entry.update({
+        "title": item["title"], "pubDate": item["pubDate"],
+        "file": out_name,
+        "bytes": out_bytes,
+        "ads_marked": len(state_blocks),
+        "ads_marked_seconds": sum(b["end"] - b["start"]
+                                  for b in state_blocks),
+        "duration_seconds": marked_dur,
+        "blocks": state_blocks,
+        "dynamic_status": dyn["dynamic_status"],
+        "dynamic_slots": dyn["dynamic_slots"],
+        "dynamic_slots_rejected": dyn["dynamic_slots_rejected"],
+        "dynamic_attempts": dyn["dynamic_attempts"],
+        "dynamic_pending": dyn["dynamic_pending"],
+    })
+    if td_result is not _KEEP_OLD:
+        entry.update({
+            "transcript_diff_status": td_result["status"],
+            "transcript_diff_coverage": td_result["coverage"],
+            "transcript_diff_gaps": len(td_result["gaps"]),
+        })
+    if td_corr is not _KEEP_OLD:
+        entry.update({
+            "transcript_diff_corroborated": len(td_corr["corroborated"]),
+            "transcript_diff_held": len(td_corr["held"]),
+        })
+    if missed is not _KEEP_OLD:
+        entry["missed_sponsors"] = [m["label"] for m in missed]
+    if suspects_summaries is not _KEEP_OLD:
+        entry["suspects"] = suspects_summaries
+    if suspects_reel_name is not _KEEP_OLD:
+        entry["suspects_reel"] = suspects_reel_name
+    if suspects_reel_bytes is not _KEEP_OLD:
+        entry["suspects_reel_bytes"] = suspects_reel_bytes
+    if old and old.get("enclosure_url"):
+        if old_blocks != new_blocks:
+            entry["republish_needed"] = True
+            log(f"  blocks changed since publish; flagging "
+                f"{item['title']} for re-publish")
+        else:
+            entry.pop("republish_needed", None)
+    return entry
+
+
+def _write_marked_file(mp3_path, out_path, blocks, sponsors, base_chapters,
+                       duration):
+    """ffmpeg -c copy + ad-chapter marking (shared by process_episode
+    and the B-only retry, M6). Returns (ad_spans, marked_chapters)."""
+    ad_spans = _ad_chapter_spans(blocks, sponsors, HOUSE_PLUGS)
+    marked_chapters = insert_ad_chapters(base_chapters, ad_spans, duration)
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", mp3_path,
+                    "-c", "copy", out_path], check=True)
+    if marked_chapters:
+        write_chapters(out_path, marked_chapters, duration)
+        log(f"marked {len(blocks)} ad chapters in "
+            f"{os.path.basename(out_path)}")
+    else:
+        log("no confident ad blocks; publishing whole with original chapters")
+    return ad_spans, marked_chapters
+
+
+def _retry_dynamic_only(item, state, channel_link, pcfg):
+    """B-only retry for a dynamic_pending episode (M6, 2026-11-19).
+
+    Reuses the on-disk A transcript (work/transcript.json) and the
+    stored blocks from state; runs only the B flow + rescue + the
+    marked-file rebuild. Never re-downloads A, never re-transcribes,
+    never re-detects -- so a rotated A cannot change the blocks.
+    Returns (True, "") on success, (False, reason) when the B-only
+    path is unavailable (the caller falls back to full
+    process_episode). Raises on a failure inside the B flow (no
+    fallback: falling back would re-detect on possibly rotated A,
+    the defect itself). Candidates are [] (they exist only as
+    detection output); _merge_slots uses them for sharpness only,
+    so sharpness falls back to slot defaults here."""
+    guid = item["guid"]
+    old = state.get("processed", {}).get(guid) or {}
+    slug = re.sub(r"[^a-z0-9]+", "-", item["title"].lower()).strip("-")[:60]
+    work = os.path.join(EP_DIR, slug)
+    mp3_path = os.path.join(work, "original.mp3")
+    tpath = os.path.join(work, "transcript.json")
+    if not old.get("blocks"):
+        return False, "no stored blocks in state"
+    if not os.path.exists(mp3_path):
+        return False, "A mp3 missing from work dir"
+    if not os.path.exists(tpath):
+        return False, "A transcript.json missing from work dir"
+    try:
+        with open(tpath) as f:
+            tdata = json.load(f)
+        words = [(w[0], w[1], w[2]) for w in tdata["words"]]
+        duration = tdata["duration"]
+    except (OSError, ValueError, KeyError) as e:
+        return False, f"A transcript unreadable ({e})"
+    sponsors = extract_sponsors(item["description"])
+    desc_sponsors = list(sponsors)
+    sponsors += [dict(p) for p in HOUSE_PLUGS]
+    own_domains = extract_own_domains(item["description"], channel_link,
+                                      desc_sponsors)
+    blocks = [(b["start"], b["end"], b.get("sponsor"),
+               b.get("start_sharpness"), b.get("end_sharpness"))
+              for b in old["blocks"]]
+    block_sources = [b.get("source", "detector") for b in old["blocks"]]
+    dyn = _run_dynamic_for_episode(
+        item, pcfg, state, work, mp3_path, words, duration, sponsors,
+        desc_sponsors, own_domains, [], blocks)
+    blocks = dyn["blocks"]
+    block_sources = dyn["sources"]
+    from split_rescue import rescue_fused_blocks
+    blocks, block_sources, _rescues = rescue_fused_blocks(
+        blocks, [], words, sponsors, sources=block_sources)
+    existing_ms = read_chapters(mp3_path)
+    id3_chapters = [(ms / 1000.0, t) for ms, t in existing_ms]
+    chapters = _merge_chapters(id3_chapters, item.get("rss_chapters", []))
+    if chapters:
+        base = chapters
+    else:
+        log("no pre-existing chapters; auto-generating from transcript")
+        base = [(ms / 1000.0, t) for ms, t in generate_chapters(words, duration)]
+    out_name = f"{slug}-marked.mp3"
+    out_path = os.path.join(SITE_DIR, out_name)
+    ad_spans, _mc = _write_marked_file(mp3_path, out_path, blocks,
+                                       sponsors, base, duration)
+    marked_dur = probe_duration(out_path)
+
+    def chapter_for_block(s):
+        for s0, e0, t in ad_spans:
+            if s0 <= s < e0:
+                return t
+        return None
+
+    state_blocks = []
+    for (s, e, l, ss, es), src in zip(blocks, block_sources):
+        name = ad_chapter_name(l, sponsors)
+        title = chapter_for_block(s) or (
+            f"Muse Detected Ad For {name}" if name else "Muse Detected Ad")
+        state_blocks.append({"start": s, "end": e, "sponsor": l,
+                             "seconds": e - s, "chapter": title,
+                             "start_sharpness": ss, "end_sharpness": es,
+                             "source": src})
+    state["processed"][guid] = _build_state_entry(
+        old, item, out_name, os.path.getsize(out_path), marked_dur,
+        state_blocks, dyn)
+    save_state(state)
+    _record_history(item, blocks, block_sources, duration)
+    log(f"done (B-only retry): {item['title']} -- marked {len(blocks)} "
+        "ads as chapters")
+    return True, ""
 
 
 def process_episode(item, state, channel_link=None, pcfg=None):
@@ -3858,6 +4932,7 @@ def process_episode(item, state, channel_link=None, pcfg=None):
     log(f"transcribing {item['title']}")
     words, duration = transcribe_chunked(mp3_path, work)
     log(f"transcript: {len(words)} words, {duration:.0f}s audio")
+    _check_transcript_plausible(words, duration, item["title"])
 
     sponsors = extract_sponsors(item["description"])
     desc_sponsors = list(sponsors)
@@ -3966,7 +5041,14 @@ def process_episode(item, state, channel_link=None, pcfg=None):
         log(f"  transcript-diff: {td_result['status']} "
             f"({td_result.get('error') or 'coverage ' + str(td_result.get('coverage'))}); "
             f"detector-only output")
-    # status "skipped" (no tag / disabled): silent, as today.
+    elif td_result["status"] == "skipped":
+        # m17 (2026-11-19): was explicitly silent ("silent, as
+        # today"); log the reason so a feed losing its transcript
+        # tags (or a config change disabling the diff) is visible.
+        _td_reason = ("disabled in config" if not td_enabled
+                      else "no podcast:transcript tags on this episode")
+        log(f"  transcript-diff: skipped ({_td_reason}); "
+            "detector-only output")
 
     # Chapters model (2026-10-28, per the owner): no cutting. The published
     # file is the full original episode with detected ads marked as
@@ -3978,17 +5060,10 @@ def process_episode(item, state, channel_link=None, pcfg=None):
     else:
         log("no pre-existing chapters; auto-generating from transcript")
         base = [(ms / 1000.0, t) for ms, t in generate_chapters(words, duration)]
-    ad_spans = _ad_chapter_spans(blocks, sponsors, HOUSE_PLUGS)
-    marked_chapters = insert_ad_chapters(base, ad_spans, duration)
     out_name = f"{slug}-marked.mp3"
     out_path = os.path.join(SITE_DIR, out_name)
-    subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", mp3_path,
-                    "-c", "copy", out_path], check=True)
-    if marked_chapters:
-        write_chapters(out_path, marked_chapters, duration)
-        log(f"marked {len(blocks)} ad chapters in {out_name}")
-    else:
-        log("no confident ad blocks; publishing whole with original chapters")
+    ad_spans, marked_chapters = _write_marked_file(
+        mp3_path, out_path, blocks, sponsors, base, duration)
     marked_dur = probe_duration(out_path)
     # Build suspect reel (2026-10-22, per the owner): segments the pipeline
     # was unsure about, pasted chronologically. The owner reviews these
@@ -4051,33 +5126,35 @@ def process_episode(item, state, channel_link=None, pcfg=None):
     with open(os.path.join(work, "report.json"), "w") as f:
         json.dump(report, f, indent=2)
 
-    state["processed"][item["guid"]] = {
-        "title": item["title"], "pubDate": item["pubDate"],
-        "file": out_name,
-        "bytes": os.path.getsize(out_path),
-        "ads_marked": len(blocks),
-        "ads_marked_seconds": sum(e - s for s, e, *_ in blocks),
-        "duration_seconds": marked_dur,
-        "blocks": state_blocks,
-        "dynamic_status": dyn["dynamic_status"],
-        "dynamic_slots": dyn["dynamic_slots"],
-        "dynamic_slots_rejected": dyn["dynamic_slots_rejected"],
-        "dynamic_attempts": dyn["dynamic_attempts"],
-        "dynamic_pending": dyn["dynamic_pending"],
-        "transcript_diff_status": td_result["status"],
-        "transcript_diff_coverage": td_result["coverage"],
-        "transcript_diff_gaps": len(td_result["gaps"]),
-        "transcript_diff_corroborated": len(td_corr["corroborated"]),
-        "transcript_diff_held": len(td_corr["held"]),
-        "missed_sponsors": [m["label"] for m in missed],
-        "suspects": [{"label": l, "seconds": e - s} for s, e, l in suspects],
-        "suspects_reel": suspects_reel_name,
-        "suspects_reel_bytes": os.path.getsize(os.path.join(SITE_DIR, suspects_reel_name)) if suspects_reel_name else 0,
-    }
+    state["processed"][item["guid"]] = _build_state_entry(
+        state["processed"].get(item["guid"]), item, out_name,
+        os.path.getsize(out_path), marked_dur, state_blocks, dyn,
+        td_result, td_corr, missed,
+        [{"label": l, "seconds": e - s} for s, e, l in suspects],
+        suspects_reel_name,
+        os.path.getsize(os.path.join(SITE_DIR, suspects_reel_name))
+        if suspects_reel_name else 0)
     save_state(state)
     _record_history(item, blocks, block_sources, duration)
     log(f"done: {item['title']} -- marked {len(blocks)} ads as chapters")
     return report
+
+
+# Whole-episode crashes before main() stops retrying an episode (M34).
+PROCESS_MAX_CRASHES = 3
+
+
+def _record_process_crash(state, guid, title):
+    """Count a whole-episode crash toward the retry cap (M34).
+
+    Crash counts live in a separate top-level dict (not in the
+    processed entry) so a crashed-but-unprocessed episode stays
+    retryable for crashes 1-2 and is skipped, with a log line, at 3."""
+    crashes = state.setdefault("process_crashes", {})
+    crashes[guid] = crashes.get(guid, 0) + 1
+    log(f"  process crash #{crashes[guid]} for {title} "
+        f"(cap {PROCESS_MAX_CRASHES})")
+    _save_state_quietly(state)
 
 
 def main():
@@ -4113,36 +5190,74 @@ def main():
         return
     # Dynamic-slot B-download retry (DESIGN.md section 9): episodes
     # whose B flow failed get retried before new episodes are processed.
+    # M6 (2026-11-19): the retry is B-only (_retry_dynamic_only) when
+    # the A transcript + stored blocks are on disk; only when that
+    # path is unavailable does it fall back to full process_episode.
+    # M34: episodes that crashed >= PROCESS_MAX_CRASHES times are
+    # skipped, not retried forever.
     pending = [(g, ep) for g, ep in state["processed"].items()
                if ep.get("dynamic_pending")
-               and ep.get("dynamic_attempts", 0) < SLOT_MAX_ATTEMPTS]
+               and ep.get("dynamic_attempts", 0) < SLOT_MAX_ATTEMPTS
+               and state.get("process_crashes", {}).get(g, 0)
+               < PROCESS_MAX_CRASHES]
     if pending:
         by_guid = {it["guid"]: it for it in items}
         for guid, ep in pending:
             item = by_guid.get(guid)
             if not item or not item.get("audio_url"):
+                # m17a (2026-11-19): was a bare continue -- the
+                # pending flag then sat in state forever with no
+                # future run mentioning it.
+                log(f"  WARNING: pending B retry {guid} "
+                    f"({ep.get('title', '?')}) not in feed or has no "
+                    "audio_url; leaving dynamic_pending set")
                 continue
             log(f"retrying B flow for pending episode: {item['title']}")
             try:
-                process_episode(item, state, channel_link, pcfg)
+                done, why = _retry_dynamic_only(item, state, channel_link,
+                                                pcfg)
+                if not done:
+                    log(f"  B-only retry unavailable ({why}); "
+                        "full re-process")
+                    process_episode(item, state, channel_link, pcfg)
             except Exception as exc:
+                _record_process_crash(state, guid, item["title"])
                 log(f"FAILED retry on {item['title']}: {exc!r}")
     new_items = [it for it in reversed(items)
-                 if it["guid"] and it["guid"] not in state["processed"] and it["audio_url"]]
+                 if it["guid"] and it["guid"] not in state["processed"]
+                 and it["audio_url"]
+                 and state.get("process_crashes", {}).get(it["guid"], 0)
+                 < PROCESS_MAX_CRASHES]
+    capped = [it for it in reversed(items)
+              if it["guid"] and it["guid"] not in state["processed"]
+              and it["audio_url"]
+              and state.get("process_crashes", {}).get(it["guid"], 0)
+              >= PROCESS_MAX_CRASHES]
+    for it in capped:
+        log(f"  skipping {it['title']}: crashed {PROCESS_MAX_CRASHES} "
+            "times; needs manual attention (see state process_crashes)")
     if args.limit:
         new_items = new_items[-args.limit:]
     if not new_items:
         log("no new episodes")
-        return
     for item in new_items:
         log(f"processing: {item['title']}")
         try:
             process_episode(item, state, channel_link, pcfg)
         except Exception as exc:
+            _record_process_crash(state, item["guid"], item["title"])
             log(f"FAILED on {item['title']}: {exc!r}")
-            # leave unprocessed so a later run retries
-    write_feed(state, SITE_DIR, xml)
-    log("feed regenerated")
+            # leave unprocessed so a later run retries (up to the cap)
+    # M26 (2026-11-19): the feed is regenerated on EVERY run, not
+    # only when a new episode was processed -- a failed feed write
+    # used to persist forever because the next (empty) run returned
+    # early before write_feed().
+    try:
+        write_feed(state, SITE_DIR, xml)
+        log("feed regenerated")
+    except Exception as exc:
+        log(f"ERROR: feed regeneration failed: {exc!r}")
+        raise
 
 
 if __name__ == "__main__":
