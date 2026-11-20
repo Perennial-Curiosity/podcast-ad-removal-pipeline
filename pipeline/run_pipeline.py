@@ -753,10 +753,12 @@ def _download_sidecar_path(dest):
 
 def _write_download_sidecar(dest, content_length_verified):
     """Record the identity of a completed download (M1): bytes + SHA-256
-    + ffprobe duration. Written only after a download completed (or a
-    legacy file passed the ffprobe check). Never compared against a
-    live HEAD/length (entry-52 rotation lesson) — only against this
-    sidecar. A sidecar write failure never fails the download."""
+    + ffprobe duration. Written only after a download completed — never
+    for a legacy file on trust alone (T1-N7: ffprobe duration cannot
+    prove a file complete, so attesting a legacy file would bless a
+    truncation forever). Never compared against a live HEAD/length
+    (entry-52 rotation lesson) — only against this sidecar. A sidecar
+    write failure never fails the download."""
     try:
         duration = None
         try:
@@ -825,9 +827,14 @@ def download(url, dest, retries=6):
                 except OSError:
                     pass
         else:
-            # Legacy file with no sidecar: trust it once only if
-            # ffprobe can parse it with a positive duration, and
-            # record the observed identity so later runs verify it.
+            # Legacy file with no sidecar. It is NEVER trusted (T1-N7):
+            # ffprobe reports the header duration even for a file
+            # truncated to 2% of its bytes, so a parseable legacy file
+            # may still be truncated — and writing a sidecar for it
+            # would bless that truncation forever. Re-download once;
+            # the fresh download writes its own sidecar and is pinned
+            # from then on. Never verified against a live HEAD/length
+            # (entry-52 rotation lesson).
             try:
                 legacy_dur = probe_duration(dest)
             except Exception:
@@ -840,10 +847,45 @@ def download(url, dest, retries=6):
                 except OSError:
                     pass
             else:
-                log(f"already downloaded: {dest} (legacy, no sidecar; "
-                    "ffprobe OK)")
-                _write_download_sidecar(dest, False)
-                return
+                log(f"  {dest} present with no download sidecar "
+                    "(legacy); ffprobe duration cannot prove it is "
+                    "complete, re-downloading once")
+                keep = dest + ".legacy-keep"
+                try:
+                    os.replace(dest, keep)
+                except OSError as exc:
+                    # Cannot preserve the file: fall back to deleting
+                    # it and re-downloading (the unparseable shape
+                    # above). A verified copy is the only safe
+                    # outcome; the download loop already accepts
+                    # this shape.
+                    log(f"  could not set aside legacy file ({exc!r}); "
+                        "deleting and re-downloading")
+                    try:
+                        os.remove(dest)
+                    except OSError:
+                        pass
+                    keep = None
+                if keep is not None:
+                    try:
+                        download(url, dest, retries=retries)
+                    except Exception:
+                        # Fresh download failed: restore the legacy
+                        # file intact and re-raise. A failed download
+                        # never destroys the only copy.
+                        try:
+                            os.replace(keep, dest)
+                        except OSError:
+                            pass
+                        log(f"  fresh download failed; legacy file "
+                            f"restored: {dest}")
+                        raise
+                    try:
+                        os.remove(keep)
+                    except OSError as exc:
+                        log(f"  could not remove set-aside legacy file "
+                            f"{keep} ({exc!r}); leaving it in place")
+                    return
     last_err = None
     for attempt in range(1, retries + 1):
         try:
@@ -1387,7 +1429,19 @@ def find_opening(words, nw, silences, first):
     cue_start = open_idx
     win_start = max(0, open_idx - 8)
     for j in range(win_start, open_idx + 1):
-        if any(cue in " ".join(nw[j:j + 7]) for cue in OPEN_CUES):
+        # T2-N2: locate the cue phrase by exact match at j, not by
+        # substring over a 7-word window — the substring test can land
+        # up to ~6 words before the cue, which makes the pause loop
+        # below skip the silence before the cue entirely (its
+        # p_end <= cue_t test fails on the too-early cue_t).
+        _hit = False
+        for cue in OPEN_CUES:
+            _k = len(cue.split())
+            _w = [w.strip(".,!?;:'\"") for w in nw[j:j + _k]]
+            if " ".join(_w) == cue:
+                _hit = True
+                break
+        if _hit:
             cue_start = j
             break
     cue_t = words[cue_start][0]
@@ -1405,7 +1459,9 @@ def find_opening(words, nw, silences, first):
             return w[1]
     for p_start, p_end in reversed(get_pauses(words, silences)):
         if p_end <= cue_t and p_end >= cue_t - 30 and (p_end - p_start) >= 0.6:
-            return p_start
+            # T2-N2: return the silence END (the speech-side boundary
+            # for a start edge), not its start.
+            return p_end
     return max(0.0, words[max(0, open_idx - 10)][0] - 0.5)
 
 
@@ -1469,7 +1525,9 @@ def _first_opening_cue_after(words, nw, silences, t0, t1):
             for p_start, p_end in reversed(get_pauses(words, silences)):
                 if p_end <= cue_t and p_end >= cue_t - 30 and \
                         (p_end - p_start) >= 0.6:
-                    return p_start
+                    # T2-N2: return the silence END (the speech-side
+                    # boundary for a start edge), not its start.
+                    return p_end
             return max(0.0, cue_t - 0.5)
     return None
 
@@ -1545,6 +1603,22 @@ _WEAK_LABEL_METHODS = frozenset(
     {"duplicate", "reverb", "voice", "history-preroll"})
 _WEAK_ARTIFACT_NAMES = frozenset(
     {"dry-island", "voice-anomaly", "history-prior"})
+
+
+def _is_generic_part(part):
+    """True when a label part names no advertiser and must never serve
+    as ad identity in a same-ad comparison (T2-N3): 'ad' (the
+    weak-strip / own-identity-strip output), the weak-artifact names,
+    and 'duplicate-N'. A part is normalised like _xep_part (lower,
+    spaces stripped); normalise again here so callers can pass a raw
+    split(':')[-1] part."""
+    import re as _re
+    if not part:
+        return False
+    p = part.strip().lower().replace(" ", "")
+    if p == "ad" or p in _WEAK_ARTIFACT_NAMES:
+        return True
+    return _re.fullmatch(r"duplicate-\d+", p) is not None
 
 
 def _is_weak_label(label):
@@ -1918,9 +1992,14 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
         # label change let 287 Leaf Filter #2 (labeled PONCHO by the
         # old picker) fuse into the Poncho block, which the
         # mention-span cap then trimmed away — eating a real ad.
+        # T2-N3: never merge on a generic part alone — every
+        # weak-stripped block has part 'ad' and every voice/reverb-only
+        # region has part 'dry-island', so equal generic parts are
+        # not evidence of one ad.
         if merged_blocks and bs - merged_blocks[-1][1] < 20 and \
                 be - merged_blocks[-1][0] <= MAX_AD_LEN and \
-                merged_blocks[-1][2].split(':')[-1] == l.split(':')[-1]:
+                merged_blocks[-1][2].split(':')[-1] == l.split(':')[-1] and \
+                not _is_generic_part(l.split(':')[-1]):
             ps, pe, pl = merged_blocks[-1]
             merged_blocks[-1] = (ps, max(pe, be), pl)
         else:
@@ -2605,10 +2684,21 @@ def _method_url(words, silences, own_domains=None):
         # the silence END (pe) and the end to the silence START (ps),
         # as _expand_tight_cluster already does.
         for ps, pe in pauses:
+            if ps <= start < pe:
+                # T2-N1: a raw edge strictly INSIDE a silence snaps to
+                # the speech side (the silence end), as the adjacent
+                # case below already does.
+                start = pe
+                break
             if ps >= start and ps - start <= 10.0:
                 start = pe
                 break
         for ps, pe in reversed(pauses):
+            if ps < end <= pe:
+                # T2-N1: a raw edge strictly INSIDE a silence snaps to
+                # the speech side (the silence start).
+                end = ps
+                break
             if pe <= end and end - pe <= 10.0:
                 end = ps
                 break
@@ -2679,10 +2769,20 @@ def _method_brand_orphan(words, sponsors, silences):
         # Snap to speech (M23): start to the silence end, end to
         # the silence start.
         for ps, pe in pauses:
+            if ps <= start < pe:
+                # T2-N1: a raw edge strictly INSIDE a silence snaps to
+                # the speech side (the silence end).
+                start = pe
+                break
             if ps >= start and ps - start <= 6.0:
                 start = pe
                 break
         for ps, pe in reversed(pauses):
+            if ps < end <= pe:
+                # T2-N1: a raw edge strictly INSIDE a silence snaps to
+                # the speech side (the silence start).
+                end = ps
+                break
             if pe <= end and end - pe <= 6.0:
                 end = ps
                 break
@@ -3153,10 +3253,20 @@ def _method_chapter(words, chapters, silences):
         # Snap to speech (M23): start to the silence end, end to
         # the silence start.
         for ps, pe in pauses:
+            if ps <= start < pe:
+                # T2-N1: a raw edge strictly INSIDE a silence snaps to
+                # the speech side (the silence end).
+                start = pe
+                break
             if ps >= start and ps - start <= 4.0:
                 start = pe
                 break
         for ps, pe in reversed(pauses):
+            if ps < end <= pe:
+                # T2-N1: a raw edge strictly INSIDE a silence snaps to
+                # the speech side (the silence start).
+                end = ps
+                break
             if pe <= end and end - pe <= 4.0:
                 end = ps
                 break
@@ -4149,6 +4259,34 @@ def _merge_slots(blocks, gated_slots, a_words, candidates, sponsors,
         v = _edge_sharpness(starts, ends, votes, t, side)
         return round(v, 2) if v is not None else None
 
+    def _clip_against_plugs(ns, ne):
+        """Clip a slot-derived span [ns, ne] against house-plug blocks
+        overlapping it, on either side (T2-N5). The m10 veto only covers
+        plugs the slot overlaps by >=50%; a plug it overlaps partially
+        — typically the FOLLOWING plug, which the M9 final clip then
+        carves instead of the slot block because the slot block sorts
+        first — must survive intact. Returns (ns, ne), or None when the
+        merge must be dropped: a plug entirely inside the span (one
+        merged block cannot represent a hole), or a clipped remainder
+        under 5s (the M9 drop threshold)."""
+        for b in blocks:
+            if b[1] <= ns or b[0] >= ne:
+                continue
+            name = ad_chapter_name(b[2], sponsors)
+            if not (name and is_house_plug(name, house_plugs)):
+                continue
+            if b[0] <= ns and b[1] < ne:
+                ns = b[1]  # plug straddles the left edge
+            elif b[1] >= ne and b[0] > ns:
+                ne = b[0]  # plug straddles the right edge
+            else:
+                return None  # plug entirely inside the span
+            if ne - ns < 5:
+                return None
+        if ne - ns < 5:
+            return None
+        return (ns, ne)
+
     merged, sources = [], []
     used = set()
     for slot in sorted(gated_slots, key=lambda s: s["start"]):
@@ -4201,6 +4339,15 @@ def _merge_slots(blocks, gated_slots, a_words, candidates, sponsors,
                         sources.append("detector")
                         used.add(i)
                         continue
+                    # T2-N5: the merged span must not swallow a
+                    # partially-overlapped plug block.
+                    _clipped = _clip_against_plugs(ns, ne)
+                    if _clipped is None:
+                        log(f"  slot {s:.1f}-{e:.1f} merged span "
+                            f"{ns:.1f}-{ne:.1f} would overwrite a "
+                            "house-plug block; dropped")
+                        continue
+                    ns, ne = _clipped
                     log(f"  slot {s:.1f}-{e:.1f} partially overlaps "
                         f"detector block {b[0]:.1f}-{b[1]:.1f} "
                         f"({_ov:.1f}s, {pct:.0f}% of slot); merged into "
@@ -4234,15 +4381,28 @@ def _merge_slots(blocks, gated_slots, a_words, candidates, sponsors,
         if len(overlapping) == 1:
             _ov, i, b = overlapping[0]
             label = b[2]
+            # T2-N5: clip the slot span against partially-overlapped
+            # plug blocks on either side before emitting it.
+            _clipped = _clip_against_plugs(s, e)
+            if _clipped is None:
+                log(f"  slot {s:.1f}-{e:.1f} would overwrite a "
+                    "house-plug block; dropped")
+                continue
+            ns, ne = _clipped
             used.add(i)
-            merged.append((s, e, label, sharpness(s, "start"),
-                           sharpness(e, "end")))
+            merged.append((ns, ne, label, sharpness(ns, "start"),
+                           sharpness(ne, "end")))
             sources.append("merged")
             continue
         # One slot, several detector blocks (C3): collapse only when
         # they are the SAME ad (same sponsor part). Different ads keep
         # their detector blocks — collapsing would delete a whole ad.
-        if len({_xep_part(o[2][2]) for o in overlapping}) != 1:
+        # T2-N3: a single common part that is generic ('ad',
+        # 'dry-island', ...) is not an identity — two different ads
+        # both stripped to 'ad' must not collapse.
+        _c3_parts = {_xep_part(o[2][2]) for o in overlapping}
+        if len(_c3_parts) != 1 or \
+                _is_generic_part(next(iter(_c3_parts))):
             log(f"  slot {s:.1f}-{e:.1f} overlaps "
                 f"{len(overlapping)} different-ad detector blocks; "
                 "keeping detector blocks")
@@ -4255,10 +4415,18 @@ def _merge_slots(blocks, gated_slots, a_words, candidates, sponsors,
             label = tied[0][2][2]
         else:
             label = slot["label"]
+        # T2-N5: clip the collapsed span against partially-overlapped
+        # plug blocks, as in the single-overlap path above.
+        _clipped = _clip_against_plugs(s, e)
+        if _clipped is None:
+            log(f"  slot {s:.1f}-{e:.1f} would overwrite a "
+                "house-plug block; dropped")
+            continue
+        ns, ne = _clipped
         for _ov, i, _b in overlapping:
             used.add(i)
-        merged.append((s, e, label, sharpness(s, "start"),
-                       sharpness(e, "end")))
+        merged.append((ns, ne, label, sharpness(ns, "start"),
+                       sharpness(ne, "end")))
         sources.append("merged")
     for i, b in enumerate(blocks):
         if i not in used:
