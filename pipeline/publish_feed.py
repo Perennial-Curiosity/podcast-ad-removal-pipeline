@@ -13,6 +13,10 @@
 5. Regenerates the podcast's feed-site/feed.xml from the live
    upstream feed via run_pipeline.write_feed.
 
+The served feed is pushed by publish_github.py, never here: this
+script leaves feed_pushed=False (checkpoint-1 marker) so the
+episode is re-selected for the real push (T3-N1, 2026-11-20).
+
 M27 (2026-11-19): this script could never run -- it never called
 init_podcast(), so run_pipeline.load_state() raised TypeError on
 STATE_PATH=None, and its own local STATE_PATH pointed at a file
@@ -135,13 +139,19 @@ def main():
     # C1 order: save only after the feed carrying the new enclosure
     # has been regenerated. Re-load inside the lock (M28) so a
     # concurrent pipeline run's state is not clobbered.
+    # T3-N1 (2026-11-20): this script performs NO feed push -- the
+    # served feed is the GitHub raw feed and feed-site/ is a plain
+    # directory -- so it must never claim one. feed_pushed stays
+    # False (checkpoint-1 marker): the enclosure is recorded, the
+    # push is unverified, and publish_github re-selects the episode,
+    # pushes the served feed and verifies before setting True.
     with state_lock():
         st = load_state()
         ep2 = st["processed"][guid]
         ep2["enclosure_url"] = info["url"]
         ep2["enclosure_bytes"] = info["bytes"]
         ep2["enclosure_expires_at"] = info["expires_at"]
-        ep2["feed_pushed"] = True
+        ep2["feed_pushed"] = False
         ep2.pop("republish_needed", None)
         save_state(st)
     print(f"enclosure_url={info['url']}")
