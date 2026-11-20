@@ -3974,6 +3974,141 @@ FINDINGS.md 736 lines; live md5s unchanged; SB re-measurement
 JSON matches the fix round exactly; both T2-N3 comparison
 sites read in the live code.
 
+---
+
+## 56. Fix round for the re-audit's 1 critical + 7 major — APPLIED 2026-11-20
+
+Owner (2026-11-20): "fix the critical and major findings
+first" — the 22 minor findings stay deferred. Three fix teams
+(same subsystem split), test-first, applied only if clean.
+Result: **8 FIXED, 0 held, 0 invalid.** No live episode was
+processed, nothing was re-published. Records:
+`sb_eval/ab/fix_round_2026-11-20/` (team NOTEs with frozen
+designs, test results, patch lists, SB before/after; patches
+in team1/patches/ (1), team2/patches/ (5), team3/patches/
+(2); consolidated SB results in
+`coord/results/coord_final_results.json`).
+
+**T2-N3 (CRITICAL) — FIXED.** Generic label parts no longer
+serve as ad identity: new `_is_generic_part()` (`ad`,
+`dry-island`, `voice-anomaly`, `history-prior`,
+`duplicate-N`); the `_merge_slots` C3 collapse now requires
+one common part that is *not* generic, and the heat-map
+gap-merge refuses to merge on a generic part alone. Repro:
+two `voice/reverb:ad` blocks + one slot now stay two blocks
+(was one, second ad deleted); two voice+reverb regions stay
+separate; same-sponsor collapse and different-sponsor keep
+controls still pass. SB after N3: identical to baseline, zero
+block diffs — no instance in the frozen set.
+
+**T1-N7 — FIXED** (held by the team, applied by the
+coordinator). The team's patch was held only because Team 2
+was still landing fixes on the same live file; once Team 2
+finished the coordinator applied it to the final live file —
+dry-run clean, backup md5-verified, py_compile clean. A
+parseable legacy file with no sidecar is now moved aside to
+`.legacy-keep` and re-downloaded fresh once (the fresh
+download writes its own sidecar); the kept copy is removed on
+success or restored byte-identical on failure. Repro against
+live: 18 checks, 0 holes, 0 failures. Behaviour change: the
+first run after application re-downloads each sidecar-less A/B
+once at processing time (all live files are currently
+sidecar-less). If an enclosure URL is dead, the episode fails
+that run — but the legacy file is restored intact.
+
+**T2-N1 — FIXED.** All three snap loops now snap a raw edge
+strictly inside a pause to the speech-side boundary. Repro
+passes; SB headlines identical (only suspects and one
+sharpness flag moved — the old wrong-early snap being
+corrected).
+
+**T2-N2 — FIXED.** `find_opening` and
+`_first_opening_cue_after` now return `p_end` (speech side),
+and `find_opening` locates the cue by exact phrase match.
+Repro passes; SB recall/FP/median unchanged, **within-1s
+improved 25.9→26.5% and within-2s 37.0→38.3%**.
+
+**T2-N4 — FIXED.** `split_rescue.rescue_fused_blocks` now
+iterates `new_blocks` (originals + rescues so far) in the
+already-has-block test and both clip loops. Repro: exactly
+one Y rescue, no overlaps. SB identical, rescue logs
+identical.
+
+**T2-N5 — FIXED.** New `_clip_against_plugs()` in
+`_merge_slots`, applied in the single-overlap, C3-collapse,
+and partial-merge paths; a slot-derived span is clipped
+against partially-overlapped plug blocks, and a plug entirely
+inside the span (or a <5s remainder) drops the slot. Repro:
+ad (120,200), plug intact (200,280). SB identical, zero block
+diffs.
+
+**T3-N1 — FIXED.** `publish_feed.py` now sets
+`feed_pushed=False` (checkpoint-1 marker) instead of `True`
+after the local-only regen, so `publish_github` re-selects the
+episode, pushes the served feed, verifies, and only then sets
+`True`. Repro (real `main()`, mocked upload): 7/7 pass. Also
+verified no live episode was ever stranded.
+
+**T3-N2 — FIXED.** Asset reuse now requires name + size +
+content identity: the local file's SHA-256 must equal the
+episode's stored `enclosure_sha256`, recorded in state at
+upload time on every upload (self-healing); no stored hash or
+a mismatch → never reuse. A same-name asset that isn't reused
+is deleted first via a new `_delete_release_asset` helper
+(otherwise GitHub 422s on the duplicate name). Repro (audit's
+two-chapter-sets case, both 1,924,259 bytes, different
+SHA-256): 4/4 pass. Mock limitation: the driver's mocked
+`gh("DELETE")` returns `{}`; a real successful delete returns
+204, which `gh.py` surfaces as `GhError(status=None)` — the
+helper treats that as success. If a delete silently failed,
+the following UPLOAD fails loudly with 422, so no false
+"published" claim can result. Not verified against live
+GitHub (no real GitHub calls allowed).
+
+Consolidated SB (coordinator's own run on the final live
+tree, fresh variant dirs): detector **0.757 (81/107) / FP 37 /
+median 4.8s / within-1s 26.5% / within-2s 38.3%** (baseline
+25.9% / 37.0%); detect-only **0.738 (79/107) / FP 31**
+(within-1s 27.2% / within-2s 39.2%); slot-flow **0.738
+(79/107) / FP 38**; full **0.757 (81/107) / FP 44**
+(within-1s 26.5% / within-2s 38.3%). Recall, FP, median,
+mean, and max are unchanged everywhere; the only headline
+movement is the T2-N2 edge-accuracy improvement, explained
+per-episode (SN-1099 start errors moved toward truth).
+Headlines, aggregates, and per-episode scores are all exactly
+equal to Team 2's `sb_after_n4.json` — zero diffs, so T1-N7
+is SB-neutral as expected.
+
+Coordinator verification: all four repro drivers re-run
+against the live files (T1-N7 18 checks, T2-N1..N5 17 checks,
+T3-N1 7/7, T3-N2 4/4 — all pass); changed code read and
+confirmed against the frozen designs at each site;
+consolidated SB harness run on the final live tree (live md5s
+asserted at import); 289's state still lists the 11 published
+blocks with publish fields intact and 288 untouched (12
+blocks, `b_failed`, no enclosure). Parent verified: all live
+md5s match the coordinator's claims; py_compile clean; T2-N3
+sites present in the live code (`_is_generic_part` defined
+line 1608, used at the gap-merge line 2002 and the C3
+collapse line 4405); T3-N1 `feed_pushed = False` at
+publish_feed.py:154; T3-N2 `enclosure_sha256` /
+`_delete_release_asset` present in publish_github.py;
+consolidated SB JSON matches the table above; 289 state 11
+blocks / publish fields intact; 288 (guid
+551638f2-d62c-11f1-8c05-87721ef2056a) 12 blocks, `b_failed`,
+no enclosure.
+
+New live md5s: run_pipeline.py
+`75887aab434e024ea0a6578d0d36beb4` (5,432 lines, was 5,264);
+split_rescue.py `6799d9d4ab682122590f36466eefc643`;
+publish_github.py `96137e70cffc5bd211a2a9afe8817166`;
+publish_feed.py `67fa630f0fa9c92f2e57995a3d6643fa`. All other
+pipeline files unchanged from the pre-round values. Out of
+scope, noted only: the suspects-reel upload always re-uploads
+with no reuse check or delete, so it carries the same latent
+422 exposure on republishes. Left as-is. The 22 minor
+findings remain deferred per the owner's direction.
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
