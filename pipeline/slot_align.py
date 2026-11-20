@@ -45,12 +45,16 @@ DENSITY_THRESH = 0.6
 MIN_SLOT_S = 8.0
 
 
-def load_words(d):
+def load_words(d, duration=None):
     words = []
     for f in sorted(glob.glob(os.path.join(d, "chunk_*.json"))):
         words.extend(json.load(open(f))["words"])
     # words: [start, end, text] with absolute times; sort defensively
     words.sort(key=lambda w: w[0])
+    if duration is not None:
+        # (M3/m8) Drop stale out-of-range words from an older, longer
+        # cut: chunks past the end of the current audio.
+        words = [w for w in words if w[0] < duration]
     return words
 
 
@@ -148,6 +152,18 @@ def density_slots(regions, wa, ka, window=DENSITY_WINDOW, thresh=DENSITY_THRESH,
     bridge; ENDS use token-diff extension — the first run of 3+
     matching tokens marks real content resumption, and density overshot
     ends by ~2-3s. Cap 60 tokens (~20s) each side.
+
+    Density definition (M19, measured 2026-11-19 — do NOT "fix" to a
+    matching numerator/denominator without re-measuring the floor):
+    density = differing tokens in the coarse (windowed) slot /
+    tokens in the refined span. The mismatch is deliberate: the
+    refined-span denominator penalises slots whose extension is
+    mostly matching words. On the 18 frozen gated slots the live
+    scale separates the one false slot (Huberman Mitochondria outro,
+    0.176) from the lowest true slot (0.677); counting differing
+    tokens over the refined span instead collapses that gap to
+    0.824 vs 0.839, and counting over the coarse span alone puts the
+    false slot at 1.0. The 0.5 floor is calibrated to the live scale.
     """
     n = len(ka)
     differs = [False] * n
@@ -336,9 +352,19 @@ def align_words(a_words, b_words):
     }
 
 
+def _transcript_duration(d):
+    """Duration recorded in a dir's transcript.json, or None."""
+    try:
+        with open(os.path.join(d, "transcript.json")) as f:
+            return float(json.load(f)["duration"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def align_dirs(a_dir, b_dir):
     """Load chunk_*.json from two directories and align them."""
-    return align_words(load_words(a_dir), load_words(b_dir))
+    return align_words(load_words(a_dir, _transcript_duration(a_dir)),
+                       load_words(b_dir, _transcript_duration(b_dir)))
 
 
 def main():
