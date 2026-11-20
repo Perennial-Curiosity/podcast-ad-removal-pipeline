@@ -321,8 +321,11 @@ def rescue_fused_blocks(blocks, candidates, words, sponsors, sources=None):
                     return
             apart = _part(best_a["label"])
             # The other sponsor must not already have a block
-            # overlapping the extension.
-            for (os_, oe, ol, _ss, _es) in blocks:
+            # overlapping the extension — T2-N4: check the blocks
+            # rescued earlier in this same call as well as the
+            # originals, or a tail rescue and a head rescue for the
+            # same sponsor both fire out of one region.
+            for (os_, oe, ol, _ss, _es) in new_blocks:
                 if _part(ol) == apart and os_ < ext_hi and oe > ext_lo:
                     return
             if is_head:
@@ -338,8 +341,11 @@ def rescue_fused_blocks(blocks, candidates, words, sponsors, sources=None):
                     # mention here.
                     start = max(start, best_ts[0] - 30.0)
                 end = bs
-                # Clip against a preceding block.
-                for (os_, oe, _ol, _ss, _es) in blocks:
+                # Clip against a preceding block — T2-N4: including
+                # rescues appended earlier in this call, so a head
+                # rescue cannot overlap a tail rescue for the same
+                # sponsor from the same region.
+                for (os_, oe, _ol, _ss, _es) in new_blocks:
                     if oe <= bs and oe > start:
                         start = max(start, oe)
                 if end - start < HEATMAP_MIN_AD_LEN:
@@ -356,7 +362,9 @@ def rescue_fused_blocks(blocks, candidates, words, sponsors, sources=None):
                     end = edge if edge is not None else re
                     end = min(end, best_ts[-1] + 30.0)
                 start = be
-                for (os_, oe, _ol, _ss, _es) in blocks:
+                # T2-N4: clip against following blocks AND rescues
+                # appended earlier in this call (see head clip above).
+                for (os_, oe, _ol, _ss, _es) in new_blocks:
                     if os_ >= be and os_ < end:
                         end = min(end, os_)
                 if end - start < HEATMAP_MIN_AD_LEN:
