@@ -76,6 +76,7 @@ Status strings (stored in report/state ``transcript_diff``):
 """
 
 import difflib
+import hashlib
 import html
 import json
 import math
@@ -206,13 +207,56 @@ def best_transcript(tags):
 def fetch_transcript(url, timeout=60):
     """Fetch a publisher transcript. Returns bytes.
 
-    Raises on any failure; callers that must degrade gracefully use
-    run_transcript_diff() instead of calling this directly.
+    Retries transient failures and falls back to curl, mirroring
+    fetch_feed (same proxy stalls urllib mid-body); validates the
+    advertised Content-Length when present and refuses implausibly
+    small bodies. Raises on any failure; callers that must degrade
+    gracefully use run_transcript_diff() instead of calling this
+    directly.
     """
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "podcast-ad-pipeline/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+    import http.client as _hc
+    import subprocess as _sp
+    last = None
+    for _attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "podcast-ad-pipeline/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = r.read()
+                try:
+                    clen = r.getheader("Content-Length")
+                except AttributeError:
+                    clen = r.headers.get("Content-Length") \
+                        if hasattr(r, "headers") else None
+                if clen is not None:
+                    try:
+                        if len(data) != int(clen):
+                            raise IOError(
+                                f"fetch_transcript truncated: {url}: got "
+                                f"{len(data)} bytes, expected {clen} "
+                                "(Content-Length)")
+                    except (TypeError, ValueError):
+                        pass
+                if len(data) < 100:
+                    raise ValueError(
+                        f"fetch_transcript implausibly small: {url}: "
+                        f"{len(data)} bytes")
+                return data
+        except (_hc.IncompleteRead, urllib.error.URLError, IOError) as e:
+            # IOError covers the Content-Length mismatch above: a
+            # truncated read is retryable, like in fetch_feed.
+            last = e
+            time.sleep(10)
+    # Last resort: curl fetches cleanly where the proxy stalls urllib.
+    try:
+        out = _sp.run(["curl", "-fsSL", "--max-time", str(timeout), url],
+                      capture_output=True, timeout=timeout + 30)
+        if out.returncode == 0 and len(out.stdout) >= 100:
+            return out.stdout
+    except Exception as e:
+        last = last or e
+    raise last if last is not None else IOError(
+        f"fetch_transcript failed: {url}")
 
 
 # ---------------------------------------------------------------------------
@@ -919,12 +963,24 @@ def run_transcript_diff(whisper_words, item_body_xml, work_dir=None,
     result["transcript_type"] = best["type"] or None
     cache_path = (os.path.join(work_dir, "transcript_diff.json")
                   if work_dir else None)
+    # Whisper-content hash (M12): the cache key must reflect the
+    # Whisper transcript, not just the publisher URL + age — a
+    # re-transcription within 24 h (e.g. the rotating-A case) would
+    # otherwise return gaps computed from the old transcript.
+    try:
+        _whisper_hash = hashlib.sha256("\n".join(
+            f"{float(s):.3f}|{float(e):.3f}|{w}"
+            for s, e, w in (whisper_words or [])).encode()).hexdigest()
+    except Exception:
+        _whisper_hash = None
     if cache_path and os.path.exists(cache_path):
         try:
             with open(cache_path) as f:
                 cached = json.load(f)
             if cached.get("transcript_url") == best["url"] and \
                     cached.get("status") == "ok" and \
+                    _whisper_hash is not None and \
+                    cached.get("whisper_sha256") == _whisper_hash and \
                     time.time() - cached.get("fetched_at", 0) < \
                     CACHE_MAX_AGE_SECONDS:
                 cached["from_cache"] = True
@@ -950,6 +1006,7 @@ def run_transcript_diff(whisper_words, item_body_xml, work_dir=None,
             os.makedirs(work_dir, exist_ok=True)
             stored = dict(result)
             stored["fetched_at"] = time.time()
+            stored["whisper_sha256"] = _whisper_hash
             with open(cache_path, "w") as f:
                 json.dump(stored, f, indent=2)
         except Exception:
