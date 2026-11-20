@@ -126,9 +126,13 @@ def _mention_times(nw, words, variants, lo, hi):
     return sorted(words[h][0] for h in hits if lo <= words[h][0] <= hi)
 
 
+# Single shared TLD set (M15): must equal run_pipeline.URL_TLDS and
+# transcript_diff.TRIM_TLDS — a missing TLD is a silent miss.
 _TLDS = {"com", "net", "org", "io", "tv", "co", "ai", "me", "tools",
          "app", "dev", "xyz", "online", "store", "tech", "site",
-         "cloud", "cc", "gg", "life", "world", "news", "media"}
+         "cloud", "cc", "gg", "life", "world", "news", "media",
+         "agency", "digital", "solutions", "systems", "network",
+         "security", "us"}
 
 
 def _stem_matches(stem, sponsor):
@@ -359,7 +363,7 @@ def rescue_fused_blocks(blocks, candidates, words, sponsors, sources=None):
                     return
                 if end - start > MAX_AD_LEN:
                     return
-            methods_prefix = bl.rsplit(":", 1)[0] if ":" in bl else ""
+            methods_prefix = bl.rsplit(":", 1)[0] if (bl and ":" in bl) else ""
             label = (f"{methods_prefix}:{best_a['label']}"
                      if methods_prefix else best_a["label"])
             new_blocks.append((round(start, 2), round(end, 2), label,
