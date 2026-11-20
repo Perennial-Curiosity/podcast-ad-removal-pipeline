@@ -3648,6 +3648,189 @@ only. No fixes were made — analysis only; no pipeline or live
 file was modified; no episode was processed; no downloads were
 made.
 
+---
+
+## 54. Fix round for all 61 audit findings — APPLIED 2026-11-19/20
+
+Owner: "write and apply fixes for all 61 findings, then run the
+audit again." Three fix teams (same subsystem split as the
+audit) fixed every finding, test-first, applied only if clean.
+Result: **60 FIXED, 1 INVALID as proposed, 0 held, 0
+unproven.** Both uncertain findings (m13, m14) were confirmed
+by reproduction and fixed. No live episode was processed,
+nothing was re-published. Records:
+`sb_eval/ab/fix_round_2026-11-19/` (team NOTEs with frozen
+designs, test results, patch lists, SB before/after; patches in
+team1/patches/ (5), team2/patches/ (11), team3/*.patch (5);
+consolidated SB results in
+`team2/results/sb_coord_consolidated.json`).
+
+Consolidated SB results (coordinator's own run on the fully
+patched tree, fresh variant dirs): detector **0.757 (81/107) /
+FP 37 / median 4.8s / within-1s 25.9%** (was 0.701 (75/107) /
+FP 40 / median 4.8s / within-1s 26.0%); detect-only **0.738
+(79/107) / FP 31** (was 0.682 (73/107) / FP 35); slot-flow
+**0.738 (79/107) / FP 38** (was 0.682 (73/107) / FP 42);
+full **0.757 (81/107) / FP 44** (was 0.701 (75/107) / FP 47).
+Recall +6 matched on every path, FP −3 to −4, edge accuracy
+essentially unchanged. Every change is explained by four fixes,
+verified per-episode: M11 v3 (orphan window now the densest
+mention cluster, one segment per sponsor — SN-1096 5/6→6/6,
+SN-1097 4/6→5/6, SN-1099 4/5→5/5), m9 (duplicate off-by-one —
+willpower 2/4 FP 2→4/4 FP 0), M15 (TLD sync — 3 extra `material`
+URL anchors on SN-1096), M24 (URL group split — one new `face`
+FP on SN-1096 that replaces the base joindeleteme FP, net
+SN-1096 FP unchanged). Two new single FPs from M11 v3, both
+explained: sydney-sweeney `Find William` (content mentions are
+the densest cluster) and unsub-287 `RIDGE` (verified
+"Rattlesnake Ridge" conversation, not a Ridge read).
+
+Critical — all FIXED: **C1** (publish now: release → upload →
+checkpoint-1 state with `feed_pushed: False` → regen feed →
+push feed → re-GET and confirm enclosure, checkpoint 2;
+selection includes `feed_pushed is False` /
+`republish_needed`); **C2** (refined block < 30s restores
+pre-refinement edges); **C3** (one slot over two different-ad
+blocks keeps both detector blocks; same-ad collapse preserved).
+
+Team 1 (download/caching/transcription) — all 16 FIXED: M1
+(sidecar `<dest>.download.json` with bytes + SHA-256 + ffprobe
+duration; no live HEAD/length check anywhere, entry-52 rule
+honoured); M2 (raise on probe duration ≤ 0; plausibility check
+< 20 words/min); M3 (out-of-range chunks pruned; glob readers
+duration-filtered); M4 (complete-cache fast path, lazy model
+load); M5 (xep cache key = content SHA-256 + version); m1
+(survivor check raises, marker not written); m2
+(fetch_transcript retries + curl fallback + length validation);
+m3 (pin re-validated against sidecar duration + A ±10%); m4
+(model revision recorded in chunks; MODEL_DIR deleted; model
+cached per-process); m5 (timeouts on all transcribe-path
+subprocess calls); m6 (per-chunk try/finally wav removal +
+entry sweep); m7 (prune removes B cache + marker + sidecar);
+m8 (`transcribe_b()` helper; all B transcription routed
+through it); m19 (corrupt chunk JSON treated as cache miss;
+atomic chunk/transcript writes); m21 (4xx except 408/429 fail
+fast; capped backoff; curl fallback). **(a) A transcript cache
+— FIXED:** `a_identity.json` sidecar (SHA-256 + size +
+duration); mismatch or missing identity drops all A chunks +
+transcript.json. Team 1 SB: identical on all four paths.
+
+Team 2 (detection/slot flow/chapters) — 26 FIXED, 1 INVALID:
+M7 (density floor on every merge path), M8 (partial merge needs
+≥10s AND ≥10% of slot), M9 (final pass clips overlaps, drops
+blocks clipped below 5s), M10 (MAX_AD_LEN cap in
+`_expand_segment`), M11 (v3 densest cluster, one segment per
+sponsor — v1 and v2 measured and rejected, results preserved),
+M12 (transcript-diff cache gains `whisper_sha256`), M13
+(dropped the `len>=4` variant filter), M14 (label-aware
+coverage on both tests), M15 (shared 29-entry `URL_TLDS`;
+split_rescue synced), M16 (exact token equality +
+plural/possessive, not `_boundary_match` — deviation recorded,
+because the boundary tolerance would still match "minty
+mobile"), M17 (A-side gate: cta/cluster/brand/chapter only,
+overlap ≥5s AND ≥10%), M18 (B-side gate: brand and URL within
+60s), **M19 INVALID as proposed** (re-measured all 18 frozen
+gated slots: live false 0.176 vs lowest true 0.677 — the
+"mismatch" is the calibrated discriminator; audit options A/B
+both destroy it; comment-only docstring patch applied, no
+behaviour change), M20 (try/except around ffmpeg decode,
+returns []), M21 (empty-transcript guard; final-chapter end uses
+last word's END), M22 (ad-title-aware chapter dedupe), M23
+(pause-snapping corrected to start→pe, end→ps), M24 (URL groups
+split when span > 125s), M25 (final MAX validation after all
+extensions), m9 (range off-by-one), m10 (plug veto per-block),
+m11 (contiguity from last KEPT chapter), m12 (`_part` guards
+incl. split_rescue), m13 (CONFIRMED — disordered words missed
+a late ad entirely; `_sorted_words` at top of
+detect_ad_blocks and end of transcribe_chunked), m14
+(CONFIRMED — 3 content uses of "seed"/"mint"/"factor" misnamed
+slots; popular-brand pool now requires a bare-URL/CTA anchor).
+
+Team 3 (state/history/publishing/errors) — all 19 FIXED: M6
+(`_retry_dynamic_only()` reuses on-disk A transcript and
+stored blocks, 0 A calls; `_build_state_entry()` preserves
+publish/legacy fields), M26 (write_feed runs unconditionally
+at end of every run), M27 (publish_feed.py calls
+`init_podcast()` with `--podcast`), M28 (unique temp names +
+fsync + re-entrant state lock; 0 errors in 20 rounds × 2
+threads vs audit's 19/40), M29 (load_state falls back to newest
+parseable `state.json.bak-*`; save_state rotates 5 backups with
+fsync), M30 (re-process replaces the episode's rows), M31
+(per-file flock across load→dedup→rewrite), M32 (eager-default
+KeyError fixed; missing length → 0 with warning), M33 (marked
+entry wins over pinned for same guid), M34 (dynamic
+flags/attempts saved immediately; crash cap 3 with persisted
+per-guid counter), M35 (`_validate_feed_xml()` on both fetch
+paths), M36 (GET-by-tag before POST; reuse on 200), M37 (local
+suspects file verified before any delete; missing file clears
+suspects fields with ERROR log), m15 (`GhError(status,
+message)` replaces `sys.exit(2)`; only 404 means "missing"),
+m16 (missing audio file skips to next candidate; newest by
+pubDate; live-enclosure episodes not re-published), m17
+(warning logs for all silent skips), m18 (mkstemp payloads,
+removed in finally), m20 (dedup on episode id OR (normalised
+title, parsed pub_date)). Team 3 SB: identical on all four
+paths.
+
+**(b) 289 state repair — DONE:** backup
+`team3/state_unsubscribe_pre289repair_2026-11-20.json` (md5
+`f442e1e7…`, verified identical to pre-repair live state).
+Restored the 11 published blocks verbatim, `ads_marked` 13 →
+11. Publish fields kept exactly (enclosure_bytes 249754974,
+suspects_bytes 12409241). Verified against live release
+445857775 (assets match exactly) and the served feed (289
+enclosure 249754974, old length 0 occurrences, feed md5
+`05f337a3…` unchanged). Ep 288 untouched. History still holds
+the stale 10 rows for 289 by design (M30 replaces them on the
+next re-process; automatic run paused, no hand-edit). No
+re-processing, no re-publishing. Residual, parent-verified: the
+state's `bytes` field still reads 243330993 (the confounded
+run's local marked file, which no longer exists on disk) — the
+feed uses `enclosure_bytes` (249754974), so listeners are
+unaffected, but the field does not describe the published
+asset.
+
+Application: all patches applied in staging (`apply2/`) in
+order team1 (5) → team2 (11) → team3 (5). Two cross-team
+conflicts resolved by hand, preserving both fixes (Team 2's
+`_sorted_words` hunk at the end of `transcribe_chunked`;
+Team 3's m17 logging hunks on top of m1's survivor check).
+Coordinator re-ran all team verify drivers against the
+consolidated staging tree (Team 2 verify_all 33/33; Team 1
+verify_download 14/14 + verify_transcribe 22 + verify_bcache
+7/7 + verify_misc 12/12; Team 3 Suite A 24/24 + Suite B 20/20)
+and the consolidated SB harness on the fully patched tree
+(exit 0), then promoted to live after md5-verified backups
+(`backup_pre_fix_round/`) and re-ran Team 2's verify driver
+against the live files (33/33 pass). Parent verified: all 10
+live md5s match the coordinator's claims; py_compile clean;
+C1 `feed_pushed` checkpoints present in publish_github.py; C2
+floor re-check present (line 2163 `ne - ns >= MIN_AD_LEN`,
+line 2225 `e - s < HEATMAP_MIN_AD_LEN`); consolidated SB JSON
+(`team2/results/sb_coord_consolidated.json`) matches the table
+above with live md5s; 289 state 11 blocks / ads_marked 11 /
+publish fields intact, verified against the live release and
+served feed (feed md5 unchanged).
+
+New live md5s: run_pipeline.py
+`e3f0c558ffa43d684946be4006d79310` (5,264 lines, was 4,149);
+split_rescue.py `4d1d120ffba14f8a69c1412757b917f3`;
+slot_align.py `9fbf2d48c0ff380bd563429ab465961b`;
+transcript_diff.py `20dbe3eb765eeb6fe2f99ccf94887c1d`;
+xep_recurrence.py `0c9448e50610f92c237bd990d4a7d863`;
+podcast_history.py `ee9b03cbe193acc42292435889de5b1b`;
+publish_github.py `ede369e35dff4f0895c6570016efd4cf`;
+publish_feed.py `a2305775a60ae6702604d63e5cb1b1be`;
+tmp/republish289.py `bf235a51eaf562a266ef92a312998367`;
+dynamic_slots/transcribe_287B.py
+`cda1c870d07ef69786b2f191d2a50ebf`. Live verified == staging
+(md5s match on all 10 files). Known limitations recorded in
+the team NOTEs: M1 still trusts a truncated-but-ffprobe-
+parseable legacy file once; m4 accepts pre-patch chunks with no
+recorded revision; cross-process load-modify-save
+last-writer-wins across whole runs remains. The re-audit ("run
+the audit again") is a separate step, not yet run.
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
