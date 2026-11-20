@@ -411,6 +411,13 @@ Notes:
   in the slot merge and the heat-map gap merge, deleting a whole
   ad. The test-set numbers were independently re-measured and
   match exactly (detector 0.757, FP 37).
+- **Fix round for the re-audit's 1 critical + 7 major (2026-11-20,
+  APPLIED):** 8 FIXED, 0 held (TESTS.md entry 56). Generic label
+  parts no longer serve as ad identity; the feed script no longer
+  claims the feed is pushed after a local-only regeneration; asset
+  reuse now requires a matching SHA-256. Edge accuracy improved
+  slightly (within-1s 25.9% → 26.5%). The 22 minor findings stay
+  deferred.
 - **Content-length check on downloads (2026-11-19, APPLIED):** the
   download step now compares bytes received against the advertised
   Content-Length and fails loudly on a short read (TESTS.md entry 50).
