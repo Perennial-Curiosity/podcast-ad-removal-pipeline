@@ -395,6 +395,14 @@ Notes:
   block and the second ad disappears. The episode transcript
   cache has no identity check (confirmed open); two more caches
   share that gap.
+- **Fix round for all 61 findings (2026-11-19/20, APPLIED):** 60
+  FIXED, 1 INVALID as proposed (M19 — the density "mismatch" is
+  the calibrated discriminator), 0 held (TESTS.md entry 54). The
+  test set improved: detector recall 0.701 → **0.757** (75→81 of
+  107), FP 40 → 37, edge accuracy unchanged. The episode
+  transcript cache now has an identity sidecar, and 289's state
+  blocks were restored to the published 11. The re-audit ("run
+  the audit again") is a separate step.
 - **Content-length check on downloads (2026-11-19, APPLIED):** the
   download step now compares bytes received against the advertised
   Content-Length and fails loudly on a short read (TESTS.md entry 50).
