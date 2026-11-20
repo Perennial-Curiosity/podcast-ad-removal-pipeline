@@ -3506,6 +3506,148 @@ non-rotating hosts). Record:
 `sb_eval/ab/present_dest_check/` (NOTE.md, patch, drivers,
 results JSONs).
 
+---
+
+## 53. Full pipeline audit — DONE 2026-11-19 (analysis only, no fixes)
+
+Owner: "do a full analysis of the pipeline looking for bugs — that
+should be faster than just retrying again and again." Three teams
+read the pipeline end to end (run_pipeline.py all 4,149 lines,
+slot_align.py, split_rescue.py, transcript_diff.py,
+xep_recurrence.py, podcast_history.py, publish_feed.py,
+publish_github.py, regen_feed.py, tmp/republish289.py,
+tmp/retry289_final.py, gh.py, tmp/pin_unsub_upload.py, plus live
+state/history/feed); the coordinator verified every finding
+against the code or live data. Result: **3 CRITICAL, 37 MAJOR,
+21 MINOR — 61 consolidated findings** (66 raw minus 5
+duplicates merged). Full record:
+`sb_eval/ab/audit_2026-11-19/FINDINGS.md` (498 lines), per-team
+files under team1/, team2/, team3/. Parent verified all three
+CRITICAL findings against the live code personally.
+
+CRITICAL: **C1** — publish saves state BEFORE the feed push
+(`publish_github.py:86–109`): release created, asset uploaded,
+`enclosure_url`/`enclosure_bytes` written and `save_state()`
+called, then the feed is regenerated and pushed; if the feed
+push fails, the episode is never selected again (selection is
+episodes *without* `enclosure_url`), and `regen_feed.py` never
+pushes — listeners keep getting unmarked audio for an episode
+the operator believes is published. **C2** — edge refinement
+can shrink a block far below the floors with no re-check
+(`detect_ad_blocks` ~1660–1700): after the mention-span cap,
+each edge moves inward to the nearest method-segment boundary
+and `refined.append((s, e, l))` runs with no duration test;
+mocked repro refined a 67 s heat-map block to 100.0–106.5 s
+(6.5 s) and returned it as a block — the 30 s / 45 s floors are
+void after this step. **C3** — one slot overlapping two
+detector blocks collapses both into a single block
+(`_merge_slots` 3425–3450): all overlapped blocks are marked
+`used` and replaced by one merged block `(slot start, slot end,
+one label)`; mocked repro — BrandA 90–150 s and BrandB 150–210
+s, slot 100–200 s → one block 100–200 s labelled `slot:BrandA`,
+BrandB gone entirely, and `split_rescue` cannot recover it.
+
+MAJOR (37), grouped: download/pinning/caching/transcription
+(6) — M1 early return trusts any non-empty file (unmitigated
+after the entry-52 revert); M2 a zero/near-zero transcript
+publishes silently as "no ads"; M3 stale out-of-range chunk
+files never pruned (live 289 A dir: 35 chunk files, 19,074
+words vs transcript.json 18,830 words — stale chunk_034, 244
+words); M4 entry work runs before any cache check; M5
+cross-episode span cache keyed on mtime + size only; M6 a B-flow
+retry reprocesses the whole episode against whatever A is on
+disk now, and live `base_url` is `''` for both podcasts, so a
+feed regen after such a retry silently points back at unmarked
+publisher audio. Detection/slot flow/chapters (19) — M7 density
+floor bypassed on slot-detector overlap; M8 partial-overlap
+merge has no minimum (a 5% touch absorbs a whole slot); M9
+slot merges can produce overlapping published blocks; M10/M11
+brand and orphan methods return unbounded segments (863 s and
+690 s in repro); M12 transcript-diff cache keyed only on URL +
+age; M13/M14 missed-sponsor check skips short-variant sponsors
+and uses a substring "covered" test; M15 TLD lists out of sync
+again (`find_url_positions` lacks `us`, `agency`, `digital`,
+`solutions`, `systems`, `network`, `security`); M16
+`find_mentions` multi-token variants match by substring per
+word; M17 slot A-side gate passes on any overlap > 0 incl.
+voice-only evidence; M18 slot B-side gate requires brand + URL
+in the same window but not near each other; M19 slot density
+uses a mismatched numerator/denominator (reported 0.767, true
+0.930 in repro); M20 voice/reverb audio failures propagate and
+fail the episode; M21 `_method_chapter` crashes on an empty
+transcript when chapters exist; M22 `_merge_chapters` drops an
+RSS ad chapter starting within 2 s of an ID3 chapter; M23
+URL/orphan/chapter pause-snapping uses the wrong side of the
+silence; M24 URL grouping chains transitively (one extra URL
+can delete a whole group); M25 post-detection extensions never
+re-check `MAX_AD_LEN`. State/history/publishing/errors (12) —
+M26 `main()` returns early with no new episodes, so a failed
+feed regen is never retried; M27 `publish_feed.py` can never
+run (no `init_podcast()`, wrong `STATE_PATH`); M28 concurrent
+`save_state()` writers share one fixed `.tmp` path (19/40 saves
+raised `FileNotFoundError` in a 20-round test); M29
+`load_state()` has no error handling and no backup; M30 history
+first-write-wins keeps stale blocks (live 289: history 10 rows
+from 2026-11-15 vs state 13 blocks); M31 history
+check-then-append is not atomic; M32 `write_feed()` crashes
+with `KeyError: 'bytes'`; M33 `write_feed()` lets a pinned
+original silently shadow a marked episode; M34 dynamic-flag
+state is mutated in memory and only persisted at the end, and a
+crashing episode retries forever with no cap; M35 `fetch_feed()`
+curl fallback returns any non-empty response with no
+validation; M36 `publish_github.py` creates a release with no
+existing-tag check; M37 `republish289.py` deletes the old
+suspects asset then leaves state pointing at it when the local
+file is missing.
+
+MINOR (21) — m1 `_b_cache_check` swallows chunk-delete
+failures then writes the marker anyway; m2 `fetch_transcript`
+is a single attempt with no truncation check; m3 a pinned B can
+entrench a truncation the length check cannot see; m4 model
+cache has no version identity, `MODEL_DIR` is dead; m5 no
+timeouts anywhere on the transcribe path; m6 `transcribe_chunked`
+leaves `chunk_*.wav` files behind on exception; m7
+`_prune_pinned_b` deletes the B audio but keeps its transcript
+cache and marker; m8 B-transcript readers outside the live path
+bypass `_b_cache_check`; m9 duplicate detection misses a repeat
+occurring only in the last 8 words; m10 a slot overlapping a
+house-plug block is dropped even when it also overlaps a real
+ad block; m11 `insert_ad_chapters` "contiguous" check is always
+true; m12 `_part` None-guard exists only in `split_rescue`;
+m13 detection assumes word timestamps are monotonic (UNCERTAIN,
+no repro); m14 slot misnaming on short popular-brand variants
+(UNCERTAIN, no repro); m15 `publish_github.py` treats ANY `gh()`
+failure on the feed GET as "feed missing"; m16 one missing audio
+file blocks the whole publish queue, and `publish_feed.py`
+re-publishes the newest episode on every run; m17 silent failure
+modes (pending-retry skip, missing suspects reel, silent
+transcript-diff skip); m18 fixed shared temp/payload paths are
+a cross-process race; m19 corrupt transcript-chunk cache
+crashes the episode instead of re-transcribing; m20 history
+dedup key is inconsistent across writers; m21 `download()`
+retries non-retryable errors 6 times with long sleeps (404s
+included).
+
+Confirmed known issues: truncated-B check fixed; B-cache fix
+fixed; HEAD check correctly reverted; A transcript cache still
+OPEN (with new sub-issue M3); state landmine OPEN and wider
+than known (rewrite also drops all seven `pinned_original_*`
+fields plus `skipped`/`reason` and legacy `ads_*` fields).
+Completeness answers: `_b_cache_check` covers every LIVE
+B-transcript reader (only `transcribe_chunked` from
+`run_slot_flow`); content-length check covers every FRESH
+download but not the early return (M1) or pinned-B reuse (m3);
+two more caches share the A identity gap — transcript-diff
+cache (M12) and xep span cache (M5). Not finished: Team 1 did
+not finish detection-method internals and
+`publish_github.py`/`publish_feed.py` (grep-verified only);
+Team 3 did not finish the detection core (~lines 666–3070) and
+`tmp/retry289_final.py`; the frozen `dynamic_slots/align.py`
+prototype and `sb_eval/ab/*` harness scripts were background
+only. No fixes were made — analysis only; no pipeline or live
+file was modified; no episode was processed; no downloads were
+made.
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
