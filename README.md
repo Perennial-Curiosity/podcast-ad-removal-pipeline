@@ -383,6 +383,18 @@ Notes:
   transcript cache needs the same SHA-based invalidation as the
   second-download cache, and state 289 now lists the 13 confounded
   blocks against the 11-block published file (decision pending).
+- **Full pipeline audit (2026-11-19, analysis only, no fixes):** three
+  teams read the pipeline end to end; **3 CRITICAL, 37 MAJOR, 21
+  MINOR — 61 findings** (TESTS.md entry 53; record in
+  `sb_eval/ab/audit_2026-11-19/FINDINGS.md`). Critical: publish
+  saves state before the feed push, so a failed feed push leaves
+  the episode marked published and never selected again; edge
+  refinement can shrink a block far below the 30 s / 45 s floors
+  with no re-check (67 s → 6.5 s in a mocked repro); one slot
+  overlapping two detector blocks collapses both into a single
+  block and the second ad disappears. The episode transcript
+  cache has no identity check (confirmed open); two more caches
+  share that gap.
 - **Content-length check on downloads (2026-11-19, APPLIED):** the
   download step now compares bytes received against the advertised
   Content-Length and fails loudly on a short read (TESTS.md entry 50).
