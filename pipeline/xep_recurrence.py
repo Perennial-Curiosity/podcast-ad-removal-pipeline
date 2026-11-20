@@ -38,6 +38,9 @@ SHINGLE_SIZE = 8
 MIN_PRIOR_EPISODES = 2
 MIN_SPAN_SECONDS = 5.0
 MAX_GAP_TOKENS = 4  # bridge short mistranscription/ad-lib gaps
+# Span-cache version (M5): bump when the span logic changes; the
+# version is part of the cache key so a logic change invalidates it.
+XEP_CACHE_VERSION = "v1"
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
 
@@ -145,13 +148,27 @@ def find_recurring_spans(words, prior_word_lists,
     return spans
 
 
+def _sha256_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1 << 20)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _cache_key(ep_dir, slug, priors):
-    key = [slug]
+    """Cache key on transcript CONTENT (M5): SHA-256 of each
+    transcript.json's bytes, plus the span-logic version. Two different
+    transcripts with the same size and mtime no longer collide, and a
+    span-logic change invalidates the cache."""
+    key = [slug, XEP_CACHE_VERSION]
     for p in priors:
-        st = os.stat(os.path.join(ep_dir, p, "transcript.json"))
-        key.append(f"{p}:{st.st_mtime}:{st.st_size}")
-    st = os.stat(os.path.join(ep_dir, slug, "transcript.json"))
-    key.append(f"self:{st.st_mtime}:{st.st_size}")
+        key.append(f"{p}:{_sha256_file(os.path.join(ep_dir, p, 'transcript.json'))}")
+    key.append(f"self:{_sha256_file(os.path.join(ep_dir, slug, 'transcript.json'))}")
     return "|".join(key)
 
 
