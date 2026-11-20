@@ -8,7 +8,13 @@
 2. Creates a GitHub release (tag = episode slug) and uploads the full
    original with ad chapters as a release asset (GitHub allows 2GB/asset).
    An existing release for the tag is reused, and an existing
-   same-name/same-size asset is reused instead of re-uploaded.
+   same-name/same-size asset is reused instead of re-uploaded
+   ONLY when the episode's stored enclosure_sha256 (recorded at
+   upload time) matches the local file's SHA-256 (T3-N2). Without
+   a matching stored hash the old asset is deleted and the file
+   is uploaded fresh: an edge-only re-mark has the same size but
+   different bytes, so name+size alone would silently reuse the
+   stale asset.
 3. Records the asset's browser_download_url in state as enclosure_url
    with feed_pushed=False (checkpoint 1), so a failure after this
    point leaves an explicit pending flag instead of a silent
@@ -32,7 +38,7 @@ GH = os.path.expanduser("~/workspace/skills/github/bin/gh.py")
 sys.path.insert(0, os.path.join(BASE_DIR, "pipeline"))
 from run_pipeline import (
     write_feed, fetch_feed, load_state, save_state, init_podcast,
-    state_lock,
+    state_lock, sha256_file,
 )
 
 # Sentinel for _update_episode_fields(): delete the key.
@@ -80,6 +86,38 @@ def _update_episode_fields(guid, **fields):
             else:
                 ep[k] = v
         save_state(st)
+
+
+def _delete_release_asset(owner, repo, asset):
+    """Delete a release asset by id (T3-N2, 2026-11-20).
+
+    Needed before a fresh upload of the same name: GitHub rejects a
+    duplicate asset name on a release (422), so a fresh upload
+    cannot overwrite in place. A successful delete returns 204 No
+    Content, which gh.py surfaces as GhError with status None (its
+    JSON reader raises on the empty body and gh.py exits with a
+    traceback, carrying no HTTP status); that is the expected
+    success case. A 404 means the asset is already gone. Any other
+    HTTP failure aborts: the upload would 422 and the old asset
+    must not be left half-replaced silently. If the delete
+    silently failed for another reason (also status None), the
+    following UPLOAD fails loudly with 422 instead of claiming a
+    publish, so the failure cannot masquerade as success."""
+    asset_id = asset.get("id")
+    if asset_id is None:
+        print(f"ERROR: existing asset {asset.get('name')!r} has no id; "
+              "cannot delete it before re-upload", file=sys.stderr)
+        raise SystemExit(1)
+    try:
+        gh("DELETE", f"/repos/{owner}/{repo}/releases/assets/{asset_id}")
+    except GhError as e:
+        if e.status is None or e.status == 404:
+            print(f"asset delete for {asset.get('name')!r} returned "
+                  "no JSON / 404 (treated as deleted)", file=sys.stderr)
+        else:
+            print(f"asset delete failed (HTTP {e.status}); not "
+                  "proceeding", file=sys.stderr)
+            raise SystemExit(1)
 
 
 def _slug(title):
@@ -172,15 +210,28 @@ def main():
                 os.remove(payload_path)
             except OSError:
                 pass
-    # 2. Upload the main marked asset (reuse an existing
-    # same-name/same-size asset instead of uploading a duplicate).
+    # 2. Upload the main marked asset. An existing asset is reused
+    # ONLY on name + size + content identity (T3-N2): the stored
+    # enclosure_sha256 from upload time must match the local file.
+    # Without a matching stored hash (legacy entry, or the file
+    # changed since upload) the old asset is deleted first and the
+    # file uploaded fresh -- an edge-only re-mark has the same size
+    # but different bytes, and GitHub rejects a duplicate asset
+    # name on a release (422), so a fresh upload cannot overwrite
+    # in place.
     assets = {a["name"]: a for a in rel.get("assets", [])}
     base = os.path.basename(master)
-    if base in assets and assets[base]["size"] == local_size:
+    local_sha = sha256_file(master)
+    stored_sha = ep.get("enclosure_sha256")
+    if (base in assets and assets[base]["size"] == local_size
+            and stored_sha is not None and stored_sha == local_sha):
         asset = assets[base]
-        print(f"reusing existing asset {base} ({local_size} bytes)",
+        print(f"reusing existing asset {base} ({local_size} bytes, "
+              f"sha256 {local_sha[:12]} matches stored hash)",
               file=sys.stderr)
     else:
+        if base in assets:
+            _delete_release_asset(OWNER, REPO, assets[base])
         try:
             asset = gh("UPLOAD", rel["upload_url"], master, "audio/mpeg")
         except GhError as e:
@@ -196,7 +247,14 @@ def main():
     ep["enclosure_bytes"] = asset["size"]
     ep.pop("enclosure_expires_at", None)
     ep["feed_pushed"] = False
+    # T3-N2: record the uploaded file's content hash in state at
+    # upload time, so a later run can prove the local file is
+    # byte-identical to the release asset before reusing it. On
+    # the reuse path the same value is re-stored (it already
+    # matched), which also repairs a state entry that lost it.
+    ep["enclosure_sha256"] = local_sha
     fields = {"enclosure_url": durl, "enclosure_bytes": asset["size"],
+              "enclosure_sha256": local_sha,
               "feed_pushed": False, "enclosure_expires_at": _POP}
     # 2b. upload suspect reel if present (2026-10-22, per the owner).
     # Not a feed item — linked in the nightly message for his review.
