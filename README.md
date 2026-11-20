@@ -401,8 +401,16 @@ Notes:
   test set improved: detector recall 0.701 → **0.757** (75→81 of
   107), FP 40 → 37, edge accuracy unchanged. The episode
   transcript cache now has an identity sidecar, and 289's state
-  blocks were restored to the published 11. The re-audit ("run
-  the audit again") is a separate step.
+  blocks were restored to the published 11.
+- **Re-audit after the fix round (2026-11-19/20, analysis only):**
+  54 of the original 61 FIXED, 7 PARTIALLY FIXED, 0 NOT FIXED
+  (TESTS.md entry 55; record in
+  `sb_eval/ab/audit_2026-11-20/FINDINGS.md`). Remaining: **1
+  CRITICAL, 7 MAJOR, 22 MINOR — 30 total.** Critical: generic
+  label parts (`ad`, `dry-island`) collide as sponsor identity
+  in the slot merge and the heat-map gap merge, deleting a whole
+  ad. The test-set numbers were independently re-measured and
+  match exactly (detector 0.757, FP 37).
 - **Content-length check on downloads (2026-11-19, APPLIED):** the
   download step now compares bytes received against the advertised
   Content-Length and fails loudly on a short read (TESTS.md entry 50).
