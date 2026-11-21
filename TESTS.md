@@ -4504,6 +4504,128 @@ unresolved technical question from this run; it needs an
 owner decision on a scoped gate refinement before any
 re-process could pass the gate on an episode like this.
 
+---
+
+## 60. Resumable long runs — APPLIED 2026-11-21
+
+Owner (2026-11-21): "make long runs resumable across the
+60-minute limit". Single agent. Result: **FIXED, live.**
+Record: `sb_eval/ab/resumable_runs/` (NOTE.md with design,
+tests, application; DESIGN.md frozen design; drivers
+`test_kill_write`, `test_resume_episode`, `run_sb`;
+results `results/sb_resumable.json`, `sb_full.log`).
+HANDOFF.md item 37. The trigger: the 289 re-process first
+run was killed by SIGTERM at ~59 minutes during
+`_write_marked_file`, leaving a partial marked file
+(75,716,151 bytes); the resume took 7.6 minutes with warm
+caches.
+
+Frozen design: 8 stages recorded in
+`<work>/checkpoint.json`, version 1, written atomically with
+`_atomic_json_dump` after each stage completes:
+`download_a`, `transcribe_a`, `detect`, `dynamic`,
+`rescue_diff`, `write_marked`, `write_suspects`,
+`state_saved`. Each stage carries artifact identity (bytes /
+SHA-256 / duration / words / chunks / a block fingerprint =
+SHA-256 of canonical block JSON, floats rounded to 3
+decimals). Resume rule: a checkpoint is a record, never
+proof. Every claimed stage is verified against its on-disk
+artifact at that stage's boundary before it is trusted.
+Download/transcribe/dynamic re-execute and reuse their
+existing caches; detection is always re-run (cheap,
+deterministic — the fingerprint is a tripwire that logs a
+warning if it changes, fresh result wins);
+`write_marked`/`write_suspects` are explicitly skipped when
+the final file verifies (size + SHA-256 + probe duration +
+block/suspects fingerprint). Recording a stage overwrites
+only that stage — later claims are never dropped (a kill
+after `write_marked` must still let the resume skip the
+ffmpeg mux). On resume, the run first logs which
+already-completed stages verify. Atomic write:
+`_write_marked_file` and `build_segment_reel` now write to a
+temp sibling in the same directory, fsync, `os.replace` to
+the final path, fsync the directory. A kill can never leave a
+partial file at the final path. `report.json` now goes
+through `_atomic_json_dump` (indent preserved).
+`download()` unchanged (sidecar gate). No detection,
+slot-flow, chapter, or publish-gate logic touched.
+
+Test results, all pass: (a) Kill during
+`_write_marked_file` — the previous complete file at the
+final path survives a killed rewrite intact (SHA
+`56d9bc63d1bc`, 250,561,752 bytes); a fresh final path stays
+absent after a kill (only an inert temp
+`fresh-marked.tmp.9678.mp3` remains); a re-run produces a
+complete file (250,561,752 bytes, 6249.6s, 2 chapters). (b)
+Kill between stages — staged 600s episode (24,325,981
+bytes, test podcast, fully offline). Run B killed by SIGTERM
+after `transcribe_a` (4 chunks on disk; checkpoint stages
+`[download_a, transcribe_a]`). Run C via `--resume`
+finished in **35s vs 273s uninterrupted**, with **0
+re-transcribed chunks** and chunk mtimes unchanged. (c)
+Equivalence — report.json blocks identical; marked-file SHA
+identical (`e2dcadda0969`). Mutagen's save is deterministic
+across runs. (d) Write skip (added test) — resuming again on
+the completed episode took **18s**, with both writes skipped
+("skipping the ffmpeg write", "skipping the reel build") and
+SHA unchanged. SB set (25 episodes, all four paths):
+identical to baseline — detector 0.757 (81/107) / FP 37 /
+median 4.8s / within-1s 26.5% / within-2s 38.3%; detect-only
+0.738 (79/107) / FP 31; slot-flow 0.738 (79/107) / FP 38;
+full 0.757 (81/107) / FP 44. The sole difference anywhere is
+a run-time timestamp string in one episode's slot log.
+
+One limitation: the staged episode yielded **0 blocks** (the
+fresh A cut's pre-roll ad carries no description-sponsor
+mentions, so it stays a suspect), so the block fingerprint
+path was exercised with an empty list. The
+resume/equivalence/skip mechanics are fully proven; a
+non-empty-block resume test would be a follow-up, not a gap
+in the required tests. **Bug caught by the tests:** ffmpeg
+cannot infer the output format from a temp name with no
+`.mp3` extension — fixed with `_tmp_path()` (temp sibling
+keeps the extension) before anything was applied.
+**Recovery incident (own goal, fixed):** while preparing the
+SB run, a bulk `cp pipeline/*.py staging/` overwrote the
+modified staging file with the live version. Caught
+immediately by the staging md5; the test was stopped, and
+all edits were re-applied from the recorded diff — the
+recovered file's md5 is again `4231b091…` (byte-exact), and
+test (a) was re-run after recovery and passed.
+
+Application: file changed `pipeline/run_pipeline.py` only
+(the sibling modules copied into staging were byte-identical
+to live and were not copied back). New live md5:
+`4231b091856bbc9f192485952d644e45` (6,247 lines, was 5,917).
+Live was verified still `6175c75f…` before the copy; backup
+at `sb_eval/ab/resumable_runs/coord/backups/run_pipeline.py.pre-resumable`
+(md5-verified). py_compile clean; diff live vs tested
+staging file empty. Post-apply checks: checkpoint helpers
+present, `--resume` in `--help`. Exact resume command:
+`python3 pipeline/run_pipeline.py --podcast <podcast-id>
+--resume <slug> [--checkpoint <path>]` (slug as in the work
+dir; checkpoint defaults to `<work>/checkpoint.json`).
+Resolves the episode from the feed, exits non-zero on an
+unknown slug, ignores a checkpoint from a different pipeline
+version or episode (full run), and regenerates the feed
+afterwards per M26. Safety verified: 289 state untouched (11
+blocks, `ads_marked` 11, `enclosure_bytes` 249754974); 288
+untouched (12 blocks, `b_failed`). No live episode was
+processed or published. Parent verified: live md5 and line
+count match the agent's claims; py_compile clean; the backup
+is the pre-change live file (`6175c75f…`); `--resume` and
+`--checkpoint` in `--help` with the documented semantics;
+checkpoint helpers present in the live code (`_tmp_path`,
+`_atomic_json_dump`, checkpoint.json references); the SB
+results file (`results/sb_resumable.json`, live md5 asserted
+inside) matches the table above on all four paths; 289 11
+blocks / publish fields intact; 288 12 blocks, `b_failed`.
+
+Left open: the M17 slot-gate consequence is unchanged by
+this work and still awaits an owner decision. A
+non-empty-block resume test would strengthen coverage of the
+block-fingerprint skip, if wanted later.
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
