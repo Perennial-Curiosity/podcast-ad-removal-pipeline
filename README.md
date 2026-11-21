@@ -444,6 +444,17 @@ Notes:
   SponsorBlock labels are description sponsors only. The A folder
   is now remediated (identity file present, stale chunk gone), and
   the published file and state stand unchanged.
+- **Resumable long runs (2026-11-21, APPLIED):** a checkpointed
+  driver records 8 stages in `<work>/checkpoint.json` after each
+  completes, and `--resume <slug>` re-enters at the first
+  incomplete stage, verifying each claimed stage's artifact
+  before trusting it (TESTS.md entry 60). The marked file and
+  suspects reel are now written atomically (temp sibling + fsync
+  + rename), so a kill can never leave a partial file at the final
+  path. A killed-and-resumed run finishes in 35s vs 273s
+  uninterrupted with zero re-transcribed chunks, and produces
+  byte-identical output. The test set is unchanged on all four
+  paths.
 - **Content-length check on downloads (2026-11-19, APPLIED):** the
   download step now compares bytes received against the advertised
   Content-Length and fails loudly on a short read (TESTS.md entry 50).
