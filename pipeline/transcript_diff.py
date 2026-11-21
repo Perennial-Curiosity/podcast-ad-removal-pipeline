@@ -238,7 +238,10 @@ def fetch_transcript(url, timeout=60):
                     except (TypeError, ValueError):
                         pass
                 if len(data) < 100:
-                    raise ValueError(
+                    # IOError, not ValueError (N11): a truncated body
+                    # is a transient failure — retryable, then the
+                    # curl fallback below. ValueError bypassed both.
+                    raise IOError(
                         f"fetch_transcript implausibly small: {url}: "
                         f"{len(data)} bytes")
                 return data
