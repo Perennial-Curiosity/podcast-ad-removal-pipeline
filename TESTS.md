@@ -4346,6 +4346,164 @@ inside) matches the table above on all four paths; 289 state
 11 blocks / publish fields intact; 288 12 blocks, `b_failed`,
 no enclosure.
 
+---
+
+## 59. Unsubscribe 289 re-process with the fixed pipeline — PUBLISH GATE FAILED, NOT re-published 2026-11-20/21
+
+Owner (2026-11-20): "do them both" — the second half, after
+T2-N7 (entry 58). Single agent, driver
+`tmp/retry289_n7.py` (new; retry289_final.py was deleted in
+the minor round and was NOT recreated or re-run), log
+`tmp/retry289_n7_2026-11-20.log`, gate record
+`tmp/retry289_n7_gate.json`, state snapshot
+`tmp/state_unsubscribe_pre_n7_2026-11-20.json` (md5
+`ca70dd9707143993015eca3be36bac75`), gate diagnostic
+`tmp/gate_diag289.py`. HANDOFF.md item 36. Result: the new
+run produced 11 blocks, but only 1 of the 11 matches the
+published 11 within 2 seconds. The published file stands
+unchanged, and the state was restored to the pre-run snapshot
+so it stays consistent with the served feed.
+
+The run: pipeline verified before starting
+(run_pipeline.py md5 `6175c75fec20536d719d4ab6f3aa5b9b`,
+5,917 lines). **First run killed by SIGTERM at ~59 minutes**
+(the runtime's ~60-minute background limit) during
+`_write_marked_file`, after the A download + full A
+re-transcription + detection + B re-transcription + slot flow
+had all completed. The feed-site marked file was left partial
+(75,716,151 bytes). The state was unharmed (the 289 entry
+was byte-identical to the snapshot; only `dynamic_ads
+consecutive_no_slots` moved 0 → 1). **Resume run completed
+in ~7.6 minutes, exit 0**, with warm caches.
+
+Fresh A (Megaphone rotation) and pinned B: fresh A
+250,312,988 bytes, sha256 `a24107c7…`, duration 6,249.613s —
+the **full cut**, not the short ~6,069s cut, so the 102:41
+tail block was in range (the expected caveat about a missing
+tail block did not apply). B stayed pinned throughout: sha
+`c48dc606`, 245,506,466 bytes, 6,129.5s, marker matches
+(verified before and after). Its transcript chunks were
+re-transcribed once (35 chunks, 18,780 words) because the
+A-identity check found no `a_identity.json` in the B dir on
+the first run; the B dir now carries one, plus `b_pin.json`
+(uses: 1, unverified, expires after 5) and a sidecar, so
+future runs reuse the B cache.
+
+What the run proved about the fixes: **T1-N7 engaged.** The
+sidecar-less A was moved aside to `.legacy-keep` and
+re-downloaded fresh once; the sidecar was written with
+`content_length_verified: True`; `.legacy-keep` was removed
+on success. **A-cache fix engaged and the A dir is now
+remediated.** Stale chunks were dropped and the A was fully
+re-transcribed (35 chunks, 19,172 words). `a_identity.json`
+is present; the stale `chunk_034` is gone (fresh `chunk_034`:
+256 words, 6120.0–6248.44s, ending "Experian!"). Chunk word
+sum (19,172) equals `transcript.json` (19,172). Max word end
+6,248.4s. **T2-N7 guard did NOT fire — correctly.** No
+"dropped: horizon-dependent" line in either run's log. The
+tail block 6214–6246 sits fully inside the word horizon
+(last word 6,248.44s), so no horizon-dependent block arose,
+and no cross-promo false block appeared. The guard is present
+and not misfiring, but it was not exercised by a true
+cross-promo case on this episode. **Slot flow: zero gated
+slots.** The aligner found 9 slots (differing-token rate
+0.1263, 12,386 anchors, a_duration 6,248.4, b_duration
+6,126.6); the gate rejected all 9 for `no_ad_evidence`.
+`dynamic_status=no_slots`; `dynamic_ads
+consecutive_no_slots` is now 2.
+
+Gate diagnosis — the key finding (why all 9 slots failed):
+`tmp/gate_diag289.py` (exact `_slot_gate_b_side` calls + a
+vote-based A-side detector check against the cached
+transcripts) shows **all 9 slots fail all three sub-gates**:
+A-side mention: none — no description-sponsor or house-plug
+mention falls inside any slot. A-side detector: none — no
+cta/cluster/brand/chapter candidate overlaps any slot by ≥5s
+and ≥10%. The detector blocks in those regions were built
+from duplicate/reverb/voice/url/brand-orphan votes only.
+B-side: FAIL — no brand mention in any mapped B span; only
+one slot has any URL fragments (1417 slot: `.com.` at
+1446.72, `.org` at 1410.4), with no brand to pair. **Root
+cause, confirmed against the 2026-11-19 second re-run log:
+the M17 gate tightening from the 61-fix round.** On the old
+pipeline the same Vsafe slot gated with `evidence=detector`
+(old gate: any non-reverb overlap > 0; the Vsafe candidates
+were duplicate/reverb/url). Under M17 those methods no longer
+count, so dynamic ads for non-description brands (Carvana,
+Vsafe, Experian, the three unnamed ads) cannot gate — and the
+B-side cannot save them because the B's replacement ads are
+for brands outside the description sponsors. The SB
+validation set never caught this: SponsorBlock labels are
+description sponsors only. This is a **design consequence of
+M17, not a code bug** — a scoped refinement (e.g. accepting
+"slot overlaps a 2+-vote detector block" as evidence) needs
+the owner's direction. It was not fixed unilaterally.
+
+New blocks vs published 11 (per-block diff, start, end):
+published 11 (state, verified unchanged): Carvana 0.0–30.0
+merged; Poncho 920.16–965.3 detector; Vsafe 1398.44–1443.3
+merged; Stop Box 1900.0–1935.58 detector; Ad 2298.8–2327.1
+merged; Take Ultra 2847.8–2971.78 detector; Ad 3329.9–3368.0
+merged; FUM 3660.0–3745.0 detector; Ad 4224.4–4253.3 merged;
+Perfect Jean 4483.006281–4600.38 detector; Ad 6205.2–6228.6
+slot. New 11 (all detector, `dynamic_status=no_slots`):
+0.00–41.00 Ad; 920.16–965.30 Ponchooutdoors; 1420.00–1465.00
+Ad; 1905.00–1940.72 Stopboxusa; 2290.00–2350.00 Ad;
+2855.90–2953.52 Takeultra; 3335.00–3376.00 Ad;
+3715.00–3760.00 Fum; 4235.00–4276.00 Ad; 4499.20–4605.00 The
+Perfect Jean; 6214.00–6246.00 Experian. Diffs: #0 (0.0,
++11.0), unnamed; #1 (0.0, 0.0) **PASS** (Poncho, the only
+match); #2 (+21.56, +21.7), unnamed; #3 (+5.0, +5.14); #4
+(−8.8, +22.9); #5 (+8.1, −18.26); #6 (+5.1, +8.0); #7 (+55.0,
++15.0) — FUM's start moved 55s; #8 (+10.6, +22.7); #9 (+16.2,
++4.62); #10 (+8.8, +17.4), renamed — the tail is now labeled
+**Experian** (the fresh A cut carries an Experian ad at the
+tail instead of the Fockers copy). Gate: 1 of 11 match →
+**FAIL**.
+
+Live state after the run (verified): 289 state entry
+identical to the pre-run snapshot (restored): exactly the
+published 11 blocks, `ads_marked` 11, `enclosure_bytes`
+249754974, `suspects_bytes` 12409241, `enclosure_url`
+matches, `republish_needed` cleared. The residual `bytes`
+field (243330993, the confounded run's local file) is
+unchanged and harmless. Release 445857775 unchanged: marked
+249,754,974 bytes, suspects 12,409,241 bytes. Served feed
+unchanged: md5 `05f337a3…`; 289 enclosure length 249754974 (1
+occurrence), old length 249754901 (0 occurrences). 288
+untouched: 12 blocks, `b_failed`, no enclosure. History:
+M30 replaced 289's rows — 11 new rows (episode_id = guid
+`55863d46-d62c-11f1-8c05-43d5e288331b`, `pipeline_version`
+6175c75fec20, `processed_at` 2026-11-21, duration 6249.6).
+Local feed-site files diverged from the published assets
+(this run's files, not published): marked 250,563,359 bytes,
+md5 `b921933f3b7c4ab8da228df21044b72f` (published 249,754,974
+/ `405ff645…`); suspects 10,409,523 bytes (published
+12,409,241). The marked file is complete (duration
+6,249.613s, 11 ad chapters). Also noted: `missed_sponsors`
+lists `stopboxusa` with **0 transcript mentions** on the
+fresh A — the Stop Box block (1905–1940.72) was named from
+the URL stem `boxusa` alone. The run log warned "sponsor
+'stopboxusa' not in audio (0 transcript mentions)" in both
+runs.
+
+Parent verified: state entry identical to the pre-run
+snapshot (exact equality); gate record `passed: false` with
+the per-block diffs above (Poncho the only match, edges
+0.0/0.0); release assets unchanged; served feed md5
+unchanged with the correct enclosure length; A dir
+remediated (a_identity.json present with the fresh A's SHA
+`a24107c7…`, size 250312988, duration 6249.612878; chunk word
+sum 19,172 equals transcript.json 19,172; fresh chunk_034
+256 words, 6120.0–6248.44s, ending "Experian!"); 288 12
+blocks, `b_failed`, no enclosure; history 11 new 289 rows
+(pipeline_version 6175c75fec20, processed_at 2026-11-21).
+Open: the M17 slot-gate consequence (zero gated slots for
+dynamic ads of non-description brands) is the main
+unresolved technical question from this run; it needs an
+owner decision on a scoped gate refinement before any
+re-process could pass the gate on an episode like this.
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
