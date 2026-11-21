@@ -418,6 +418,14 @@ Notes:
   reuse now requires a matching SHA-256. Edge accuracy improved
   slightly (within-1s 25.9% → 26.5%). The 22 minor findings stay
   deferred.
+- **Fix round for the re-audit's 22 minor (2026-11-20, APPLIED):**
+  21 FIXED, 1 HELD (TESTS.md entry 57). The held one is T2-N7 —
+  the audio-duration detection horizon is correct in design but
+  adds one false block on the test set (Leo's sign-off cross-promo
+  for a sister show), so the patch is preserved, not applied. The
+  test set is otherwise identical on all four paths, and the stale
+  289 driver that could have clobbered the repaired state is
+  deleted.
 - **Content-length check on downloads (2026-11-19, APPLIED):** the
   download step now compares bytes received against the advertised
   Content-Length and fails loudly on a short read (TESTS.md entry 50).
