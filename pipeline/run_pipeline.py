@@ -95,6 +95,9 @@ SLOT_PROBE_RECHECK_DAYS = 30   # re-probe a feed this often
 SLOT_MAX_ATTEMPTS = 3          # B-download retries before giving up
 SLOT_GUARD_MAX_DIFF_RATE = 0.25  # differing-token rate above this: abort slots
 SLOT_GUARD_MAX_DUR_RATIO = 0.10  # |B dur - A dur| / A dur above this: abort
+MAX_UNVERIFIED_PIN_USES = 5  # (N8) reuses of a pinned B whose download
+# was never Content-Length verified before the pin is dropped and a
+# fresh B downloaded. Verified pins never expire on uses.
 SLOT_GUARD_MAX_SLOT_SHARE = 0.25  # gated slots > 25% of episode: abort
 SLOT_B_MARGIN_S = 10.0         # B-side gate window margin around mapped B span
 SLOT_FLOOR_DENSITY_MIN = 0.5  # standalone slot density below this: drop (not an ad read)
@@ -668,14 +671,103 @@ def _newest_state_backup():
     return None
 
 
-def load_state():
-    """Load state.json, falling back to the newest backup (M29).
+# T3-N9: the state this process loaded (snapshot = the exact dict
+# object load_state() returned; baseline = its JSON-normalised copy).
+# save_state() merges the caller's diff against the baseline onto the
+# fresh disk state. Both start as None (no load yet in this process).
+_state_baseline = None
+_state_snapshot = None
 
-    A corrupt/truncated state file used to raise JSONDecodeError out
-    of every entry point and brick the whole podcast run. Now the
-    newest state.json.bak-* backup is tried (and logged); only when
-    no backup parses does the error propagate, naming the backups
-    that were tried."""
+
+def _one_level_diff(old, new):
+    """(set, del) between two flat dicts: keys whose value changed or
+    is new, and keys that disappeared. Values are compared by ==."""
+    sets = {k: v for k, v in new.items()
+            if k not in old or old[k] != v}
+    dels = [k for k in old if k not in new]
+    return sets, dels
+
+
+def _state_diff(old, new):
+    """Diff between the loaded baseline and the caller's state (T3-N9).
+
+    Returns {"set", "del", "sub"}: whole-value top-level sets/deletes,
+    and per-subkey diffs for dict-valued top-level keys. "processed"
+    gets one more level (per-episode add/drop, per-entry-key set/del)
+    so a marking run and a publish run touching the same episode
+    keep each other's fields; "process_crashes" and "dynamic_ads"
+    get per-subkey diffs the same way. Entry/subkey values are
+    compared by ==."""
+    diff = {"set": {}, "del": [], "sub": {}}
+    for k, v in new.items():
+        if k not in old:
+            diff["set"][k] = v
+        elif k == "processed":
+            old_p = old[k] or {}
+            new_p = v or {}
+            entry = {}
+            for g, e in new_p.items():
+                if g not in old_p:
+                    entry[g] = {"add": e}
+                else:
+                    s, d = _one_level_diff(old_p[g], e)
+                    if s or d:
+                        entry[g] = {"set": s, "del": d}
+            drops = [g for g in old_p if g not in new_p]
+            if entry or drops:
+                diff["sub"][k] = {"entry": entry, "drop": drops}
+        elif isinstance(v, dict) and isinstance(old[k], dict):
+            s, d = _one_level_diff(old[k], v)
+            if s or d:
+                diff["sub"][k] = {"set": s, "del": d}
+        elif old[k] != v:
+            diff["set"][k] = v
+    for k in old:
+        if k not in new:
+            diff["del"].append(k)
+    return diff
+
+
+def _state_apply_diff(fresh, diff):
+    """Apply a _state_diff onto a freshly loaded state (T3-N9).
+
+    Everything the diff does not touch is taken from `fresh` as-is,
+    so a concurrent writer's changes survive the save."""
+    out = dict(fresh)
+    out.update(diff["set"])
+    for k in diff["del"]:
+        out.pop(k, None)
+    for k, sd in diff["sub"].items():
+        if "entry" in sd:  # "processed": per-episode merge
+            proc = dict(out.get(k, {}) or {})
+            for g, ch in sd["entry"].items():
+                if "add" in ch:
+                    proc[g] = ch["add"]
+                else:
+                    e = dict(proc.get(g, {}))
+                    e.update(ch["set"])
+                    for dk in ch["del"]:
+                        e.pop(dk, None)
+                    proc[g] = e
+            for g in sd["drop"]:
+                proc.pop(g, None)
+            out[k] = proc
+        else:  # other dict-valued top-level key: per-subkey merge
+            cur = dict(out.get(k, {}) or {})
+            cur.update(sd["set"])
+            for dk in sd["del"]:
+                cur.pop(dk, None)
+            out[k] = cur
+    return out
+
+
+def _load_state_raw():
+    """Read the current disk state WITHOUT touching the T3-N9
+    baseline/snapshot (used by the final-save rebuild in
+    process_episode() / _retry_dynamic_only()). Falls back to the
+    newest backup like load_state(); returns a fresh empty state
+    when no state file exists. Raises ValueError when nothing
+    parses."""
     if STATE_PATH is None:
         raise TypeError("STATE_PATH is None; call init_podcast() first")
     if os.path.exists(STATE_PATH):
@@ -685,14 +777,54 @@ def load_state():
         except (json.JSONDecodeError, OSError, ValueError) as e:
             bak = _newest_state_backup()
             if bak is not None:
-                log(f"  WARNING: state.json unreadable ({e}); falling "
-                    f"back to backup {bak}")
                 with open(bak) as f:
                     return json.load(f)
             raise ValueError(
                 f"state.json unreadable ({e}) and no parseable "
                 f"state.json.bak-* backup exists") from e
     return {"processed": {}, "base_url": ""}
+
+
+def load_state():
+    """Load state.json, falling back to the newest backup (M29).
+
+    A corrupt/truncated state file used to raise JSONDecodeError out
+    of every entry point and brick the whole podcast run. Now the
+    newest state.json.bak-* backup is tried (and logged); only when
+    no backup parses does the error propagate, naming the backups
+    that were tried.
+
+    T3-N9: the returned dict is recorded as this process's loaded
+    snapshot (_state_snapshot) with a JSON-normalised copy as the
+    baseline (_state_baseline). save_state() merges the caller's
+    diff against that baseline onto the fresh disk state instead of
+    overwriting the whole file, so a concurrent writer's changes
+    survive. One live snapshot per process: a second load_state()
+    resets both; a state dict that was not produced by load_state()
+    in this process is saved whole-file, exactly as before."""
+    global _state_baseline, _state_snapshot
+    if STATE_PATH is None:
+        raise TypeError("STATE_PATH is None; call init_podcast() first")
+    if os.path.exists(STATE_PATH):
+        try:
+            with open(STATE_PATH) as f:
+                state = json.load(f)
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            bak = _newest_state_backup()
+            if bak is not None:
+                log(f"  WARNING: state.json unreadable ({e}); falling "
+                    f"back to backup {bak}")
+                with open(bak) as f:
+                    state = json.load(f)
+            else:
+                raise ValueError(
+                    f"state.json unreadable ({e}) and no parseable "
+                    f"state.json.bak-* backup exists") from e
+    else:
+        state = {"processed": {}, "base_url": ""}
+    _state_snapshot = state
+    _state_baseline = json.loads(json.dumps(state))
+    return state
 
 
 def _fsync_dir(path):
@@ -715,12 +847,49 @@ def save_state(state):
     so a crash cannot lose the just-written state. The previous
     state file is rotated to state.json.bak-<timestamp> first
     (newest STATE_BACKUP_KEEP kept). The write+replace holds the
-    per-podcast state lock."""
+    per-podcast state lock.
+
+    T3-N4: the backup stamp carries microseconds, so rapid saves no
+    longer collide on one 1-second stamp and the rotation really
+    keeps 5 backups. T3-N5: the current state is parsed before it
+    is archived -- a corrupt current state is never written over a
+    good backup. T3-N9: when `state` is this process's loaded
+    snapshot, only the caller's diff against its load-time baseline
+    is applied onto the freshly read disk state, so a concurrent
+    writer's changes (e.g. a publish record) survive this save; a
+    state that was not loaded here, or a disk state that does not
+    parse, falls back to the whole-file write, exactly as before."""
+    global _state_baseline
     if STATE_PATH is None:
         raise TypeError("STATE_PATH is None; call init_podcast() first")
     with state_lock():
+        # T3-N9: read the current disk state once, under the lock --
+        # the merge base, and (T3-N5) the proof it parses.
+        fresh = None
+        fresh_from_disk = False
         if os.path.exists(STATE_PATH):
-            stamp = time.strftime("%Y%m%d-%H%M%S")
+            try:
+                with open(STATE_PATH) as f:
+                    fresh = json.load(f)
+                fresh_from_disk = True
+            except (OSError, ValueError):
+                # Disk state is corrupt: do not merge onto a stale
+                # backup (it could drop keys the caller saw) and do
+                # not archive the corrupt file (T3-N5). The
+                # whole-file write below replaces it.
+                log("  WARNING: current state.json unreadable; not "
+                    "archiving it as a backup and not merging onto "
+                    "a backup (T3-N5/T3-N9)")
+        to_write = state
+        merged = False
+        if (fresh_from_disk and state is _state_snapshot
+                and _state_baseline is not None):
+            to_write = _state_apply_diff(
+                fresh, _state_diff(_state_baseline, state))
+            merged = True
+        if fresh_from_disk:
+            stamp = time.strftime("%Y%m%d-%H%M%S") + ".%06d" % (
+                int(time.time() * 1000000) % 1000000)
             bak = f"{STATE_PATH}.bak-{stamp}"
             try:
                 import shutil
@@ -740,11 +909,23 @@ def save_state(state):
         tmp = (f"{STATE_PATH}.tmp.{os.getpid()}."
                f"{threading.get_ident()}.{random.randint(0, 1 << 30)}")
         with open(tmp, "w") as f:
-            json.dump(state, f, indent=2)
+            json.dump(to_write, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, STATE_PATH)
         _fsync_dir(os.path.dirname(STATE_PATH) or ".")
+        if state is _state_snapshot:
+            # The baseline advances to what is now on disk. After a
+            # merged save the caller's dict is refreshed in place to
+            # the merged content: without this, the next save would
+            # diff the caller's stale values against the new baseline
+            # and re-apply them as changes, clobbering a concurrent
+            # writer's newer values. (A whole-file save needs no
+            # refresh -- the caller already holds what was written.)
+            _state_baseline = json.loads(json.dumps(to_write))
+            if merged:
+                state.clear()
+                state.update(json.loads(json.dumps(to_write)))
 
 
 def _download_sidecar_path(dest):
@@ -1005,7 +1186,12 @@ def _atomic_json_dump(path, payload):
 
 
 def _drop_transcript_cache(work_dir):
-    """Delete every cached chunk + transcript.json in a work dir."""
+    """Delete every cached chunk + transcript.json in a work dir.
+
+    (N1) The drop is verified, the m1 pattern from _b_cache_check:
+    a surviving file raises RuntimeError instead of letting the
+    caller return the stale cache and re-bless it with a fresh
+    a_identity.json."""
     for f in glob.glob(os.path.join(work_dir, "chunk_*.json")):
         try:
             os.remove(f)
@@ -1015,6 +1201,15 @@ def _drop_transcript_cache(work_dir):
         os.remove(os.path.join(work_dir, "transcript.json"))
     except OSError:
         pass
+    survivors = glob.glob(os.path.join(work_dir, "chunk_*.json"))
+    if os.path.exists(os.path.join(work_dir, "transcript.json")):
+        survivors.append(os.path.join(work_dir, "transcript.json"))
+    if survivors:
+        log(f"  ERROR: stale A chunks could not be removed: {survivors}; "
+            "refusing to reuse the cache")
+        raise RuntimeError(
+            f"_drop_transcript_cache: could not remove stale A cache in "
+            f"{work_dir}: {survivors}")
 
 
 def _prune_out_of_range_chunks(work_dir, duration):
@@ -1060,6 +1255,31 @@ def _write_audio_identity(path, sha, size, duration):
                                  "duration": duration})
     except OSError:
         pass
+
+
+def _stored_config_has_revision(stored):
+    """True when a stored transcribe config records a model revision
+    (N6). Pre-patch chunks carry none; their weights predate tracking
+    and are accepted by design."""
+    return isinstance(stored, dict) and "model_revision" in stored
+
+
+def _has_unstamped_chunk(work_dir, duration):
+    """True when any in-range cached chunk carries no model revision
+    (N6): accepted, but the exposure is worth one warning per run."""
+    n_chunks = int(duration // TRANSCRIBE_CHUNK) + 1
+    for i in range(n_chunks):
+        if i * TRANSCRIBE_CHUNK >= duration:
+            break
+        try:
+            with open(os.path.join(work_dir, f"chunk_{i:03d}.json")) as f:
+                data = json.load(f)
+            if not _stored_config_has_revision(
+                    data.get("transcribe_config")):
+                return True
+        except (OSError, ValueError, KeyError, AttributeError, TypeError):
+            continue
+    return False
 
 
 def transcribe_chunked(mp3_path, work_dir):
@@ -1124,11 +1344,18 @@ def transcribe_chunked(mp3_path, work_dir):
             if dur > 0 and cached_words and \
                     _transcript_cache_complete(work_dir, dur):
                 _prune_out_of_range_chunks(work_dir, dur)
+                # (N6) Pre-patch chunks carry no model revision:
+                # accepted by design, but flag the exposure once.
+                if _has_unstamped_chunk(work_dir, dur):
+                    log("  WARNING: cached chunk(s) carry no model "
+                        "revision (pre-patch chunks); accepted, model "
+                        "provenance unknown")
                 if audio_sha is not None:
                     _write_audio_identity(identity_path, audio_sha,
                                           audio_size, dur)
                 return cached_words, dur
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, AttributeError, TypeError,
+                IndexError):
             pass  # fall through to probe + transcribe
     duration = probe_duration(mp3_path)
     if duration <= 0:
@@ -1137,6 +1364,7 @@ def transcribe_chunked(mp3_path, work_dir):
             f"for {mp3_path}; refusing to write an empty transcript")
     _prune_out_of_range_chunks(work_dir, duration)
     model = None
+    unstamped_warned = False
     words = []  # (start, end, text)
     n_chunks = int(duration // TRANSCRIBE_CHUNK) + 1
     for i in range(n_chunks):
@@ -1150,10 +1378,19 @@ def transcribe_chunked(mp3_path, work_dir):
                     data = json.load(f)
                 if _transcribe_config_matches(
                         data.get("transcribe_config", TRANSCRIBE_CONFIG)):
+                    # (N6) Pre-patch chunks carry no model revision:
+                    # accepted by design, but flag the exposure once.
+                    if not unstamped_warned and \
+                            not _stored_config_has_revision(
+                                data.get("transcribe_config")):
+                        unstamped_warned = True
+                        log("  WARNING: cached chunk(s) carry no model "
+                            "revision (pre-patch chunks); accepted, model "
+                            "provenance unknown")
                     words.extend([(w[0], w[1], w[2]) for w in data["words"]])
                     continue
             except (OSError, ValueError, KeyError, AttributeError,
-                    TypeError):
+                    TypeError, IndexError):
                 log(f"  chunk {i}: cached chunk unreadable; re-transcribing")
             else:
                 log(f"  chunk {i}: transcribe config changed; re-transcribing")
@@ -1282,6 +1519,19 @@ def _prefix_guard_ok(v, w):
     return suf in ("s", "es", "'s", "")
 
 
+def _stem_plural(t):
+    """Strip a trailing plural suffix for symmetric comparison (T2-N8):
+    "greens" -> "green", "boxes" -> "box", "1s" -> "1". Only a trailing
+    "es"/"s" is stripped — never a substring — so "minty" is untouched
+    and the M16 "minty mobile" guard still holds. Length floors keep
+    1-2 letter tokens ("us", "s", "es") from stemming to a stub."""
+    if t.endswith("es") and len(t) > 2:
+        return t[:-2]
+    if t.endswith("s") and len(t) > 1:
+        return t[:-1]
+    return t
+
+
 def find_mentions(nw, variants):
     """Word indices mentioning a brand.
 
@@ -1331,9 +1581,17 @@ def find_mentions(nw, variants):
             # "21", "mint" in "minty" — M16). _boundary_match is NOT
             # used here: its single-letter-remainder tolerance would
             # still match "minty mobile" for "mint mobile".
+            # T2-N8: the suffix test is one-sided (plural SPEECH
+            # matches a singular variant, not vice versa), so a
+            # plural variant token never matches singular speech
+            # ("athletic greens" vs "athletic green"). Stemming both
+            # sides (trailing s/es only) restores symmetry. This is
+            # not fuzzy matching: "mint" vs "minty" still fails
+            # (no trailing s), so M16 stays fixed.
             if all(nw[i + j] == toks[j] or
                    nw[i + j] in (toks[j] + "s", toks[j] + "es",
-                                 toks[j] + "'s")
+                                 toks[j] + "'s") or
+                   _stem_plural(nw[i + j]) == _stem_plural(toks[j])
                    for j in range(n)):
                 hits.append(i)
     return sorted(set(hits))
@@ -3455,10 +3713,15 @@ def check_missed_sponsors(words, sponsors, blocks):
         # differently-labelled merged block now reports missed): that
         # surfaces for operator review instead of silently assuming
         # coverage; a missed report is cheap, a silently unmarked ad
-        # is not.
+        # is not. T2-N6: a block whose part is GENERIC (names no
+        # advertiser — 'ad' from the weak/own-identity strips,
+        # 'dry-island', 'voice-anomaly', 'history-prior',
+        # 'duplicate-N') is likewise unnamed for coverage: the ad IS
+        # marked, only its name was stripped.
         covered = any(s <= t <= e for t in hit_times
                       for s, e, lbl, *_ in blocks
-                      if _label_part(lbl) in ("", sp_part))
+                      if _label_part(lbl) in ("", sp_part)
+                      or _is_generic_part(_label_part(lbl)))
         if not covered:
             covered = any(_label_part(lbl) == sp_part
                           for _, _, lbl, *_ in blocks)
@@ -4067,6 +4330,70 @@ def _prune_pinned_b(work, keep=SLOT_PINNED_B_KEEP_SIBLINGS):
                 log(f"  WARNING: could not prune pinned B {v} ({e})")
 
 
+def _pin_record_path(b_dir):
+    return os.path.join(b_dir, "b_pin.json")
+
+
+def _read_pin_record(b_dir):
+    """The N8 pin record, or None when missing/unreadable."""
+    try:
+        with open(_pin_record_path(b_dir)) as f:
+            rec = json.load(f)
+        if isinstance(rec, dict) and rec.get("sha256"):
+            return rec
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _unverified_pin_expired(b_dir, b_sha):
+    """True when an unverified pin has already been reused
+    MAX_UNVERIFIED_PIN_USES times (N8). A SHA mismatch means a new
+    file, so the count restarts. Expiry deletes the record so the
+    fresh download starts a new cycle instead of expiring again."""
+    try:
+        old = _read_pin_record(b_dir)
+        if old is None or old.get("sha256") != b_sha:
+            return False
+        if int(old.get("uses", 0)) + 1 > MAX_UNVERIFIED_PIN_USES:
+            try:
+                os.remove(_pin_record_path(b_dir))
+            except OSError:
+                pass
+            return True
+    except (OSError, ValueError, TypeError):
+        pass
+    return False
+
+
+def _record_pin_acceptance(b_mp3, b_dir, verified, b_dur, b_sha=None):
+    """Record the completeness evidence for an accepted pin (N8):
+    the file's SHA/bytes/ffprobe duration at pin time, whether the
+    download was Content-Length verified, and how many runs have
+    reused the pin. Never fails the pin: record errors are logged,
+    not raised."""
+    try:
+        if b_sha is None:
+            b_sha = sha256_file(b_mp3)
+        old = _read_pin_record(b_dir)
+        if old is not None and old.get("sha256") == b_sha:
+            uses = int(old.get("uses", 0)) + 1
+            first = old.get("accepted_at")
+        else:
+            uses = 1
+            first = None
+        _atomic_json_dump(_pin_record_path(b_dir), {
+            "sha256": b_sha,
+            "bytes": os.path.getsize(b_mp3),
+            "duration": b_dur,
+            "content_length_verified": bool(verified),
+            "accepted_at": first or date.today().isoformat(),
+            "uses": uses})
+    except (OSError, ValueError, TypeError) as exc:
+        log(f"  WARNING: could not record pinned-B acceptance ({exc!r}); "
+            "continuing")
+
+
 def _pinned_b_complete(b_mp3, b_dir, a_duration):
     """Re-validate a pinned B before reuse (m3). Returns True only
     when the file's live ffprobe duration agrees with the download
@@ -4075,7 +4402,10 @@ def _pinned_b_complete(b_mp3, b_dir, a_duration):
     duration-vs-A check alone, and a sidecar is then written so later
     runs verify identity. Any probe failure or duration move drops
     the pin. SHA alone attests identity, not completeness: a B
-    truncated under chunked transfer keeps its SHA forever."""
+    truncated under chunked transfer keeps its SHA forever. (N8) Each
+    acceptance records the completeness evidence in b_pin.json; an
+    unverified pin expires after MAX_UNVERIFIED_PIN_USES reuses so a
+    fresh B is eventually downloaded."""
     sidecar = _download_sidecar_path(b_mp3)
     try:
         b_dur = probe_duration(b_mp3)
@@ -4091,7 +4421,8 @@ def _pinned_b_complete(b_mp3, b_dir, a_duration):
         try:
             with open(sidecar) as f:
                 sc = json.load(f)
-            if sc.get("sha256") != sha256_file(b_mp3):
+            b_sha = sha256_file(b_mp3)
+            if sc.get("sha256") != b_sha:
                 log("  pinned B differs from its download sidecar; "
                     "dropping pin")
                 return False
@@ -4100,16 +4431,27 @@ def _pinned_b_complete(b_mp3, b_dir, a_duration):
                 log(f"  pinned B duration moved ({sc['duration']}s "
                     f"recorded, {b_dur:.0f}s now); dropping pin")
                 return False
-            if not sc.get("content_length_verified"):
+            verified = bool(sc.get("content_length_verified"))
+            if not verified:
                 log("  pinned B completeness unverified (no "
                     "Content-Length at download); duration guard is "
                     "the only backstop")
+                # (N8) An unverified pin is completeness evidence
+                # only for a bounded number of reuses: expire it so
+                # a fresh B is eventually downloaded.
+                if _unverified_pin_expired(b_dir, b_sha):
+                    log(f"  unverified pinned B reused "
+                        f"{MAX_UNVERIFIED_PIN_USES} times; dropping pin "
+                        "so a fresh B is downloaded")
+                    return False
+            _record_pin_acceptance(b_mp3, b_dir, verified, b_dur, b_sha)
             return True
         except (OSError, ValueError, KeyError, TypeError):
             pass  # unreadable sidecar: fall through to legacy path
     log("  pinned B has no download sidecar (legacy pin); "
         "accepting on duration check alone and recording identity")
     _write_download_sidecar(b_mp3, False)
+    _record_pin_acceptance(b_mp3, b_dir, False, b_dur)
     return True
 
 
@@ -4536,6 +4878,17 @@ def run_slot_flow(work, a_words, a_duration, a_mp3_path, a_sha256, b_url,
                 os.remove(b_mp3)
             except OSError:
                 pass
+            # (N2) A failed delete must not fall through to download():
+            # download() trusts any present file matching its sidecar,
+            # so the rejected B would be reused with 0 network calls.
+            # Degrade to detector-only instead.
+            if os.path.exists(b_mp3):
+                log(f"  ERROR: rejected pinned B {b_mp3} could not be "
+                    "removed; refusing to download over it "
+                    "(detector-only output)")
+                result["rejected"] = [{"reason": "pin_drop_failed",
+                                       "detail": b_mp3}]
+                return result
     try:
         if b_mp3_path is None and not pinned:
             download(b_url, b_mp3, retries=3)
@@ -4791,13 +5144,16 @@ def _run_dynamic_for_episode(item, pcfg, state, work, mp3_path, words,
                 state.pop("dynamic_ads", None)
         elif flow["status"] == "slots":
             rec["consecutive_no_slots"] = 0
+        # T3-N8: persist the streak / flag-clear NOW, as the attempts
+        # already are -- a crash after the B flow used to lose it.
+        _save_state_quietly(state)
     return info
 
 
 def slots_only_mode(slug, items, channel_link):
     """Standalone slot inspection (DESIGN.md section 10): print the
     gated slots for one already-processed episode as a manual-marking
-    aid. Writes no pipeline state and publishes nothing (the B
+    aid. Writes no pipeline state and publishes nothing (the A/B
     transcript and align_result.json caches may be written; state.json
     is not)."""
     item = None
@@ -4813,12 +5169,17 @@ def slots_only_mode(slug, items, channel_link):
     if not os.path.exists(mp3_path):
         raise SystemExit(f"no A download at {mp3_path}; "
                          "process the episode first")
-    words = []
-    for f in sorted(glob.glob(os.path.join(work, "chunk_*.json"))):
-        words += [tuple(w) for w in json.load(open(f))["words"]]
+    # (N5) Load the A transcript through the guarded live path
+    # (transcribe_chunked): identity-checked, corrupt chunks treated
+    # as misses and re-transcribed — never align from a stale cache.
+    # A stale cache is re-transcribed here instead of being used.
+    words, duration = transcribe_chunked(mp3_path, work)
     if not words:
         raise SystemExit("no A transcript cache; process the episode first")
-    duration = probe_duration(mp3_path)
+    try:
+        _check_transcript_plausible(words, duration, item["title"])
+    except RuntimeError as exc:
+        raise SystemExit(str(exc))
     # (M3) Drop stale out-of-range words a glob reader would otherwise
     # include (chunks from an older, longer cut).
     words = [w for w in words if w[0] < duration]
@@ -4896,8 +5257,11 @@ def _check_transcript_plausible(words, duration, title):
     """(M2) Never publish a zero/near-zero transcript as "no ads": an
     empty or implausible transcript means transcription failed, not
     that the episode has no ads. Frozen SB minimum is 126 words/min;
-    20 words/min is ~6x below any real episode."""
-    if duration <= 0 or not words or (
+    20 words/min is ~6x below any real episode. (N3) Absolute floors,
+    independent of the rate test: a transcript under 60s or under 20
+    words is implausible whatever its rate — a 5-word/5s transcript
+    at a normal rate used to pass."""
+    if not words or duration < 60 or len(words) < 20 or (
             duration >= 60 and len(words) / duration * 60 < 20):
         raise RuntimeError(
             f"refusing to publish {title}: implausible transcript "
@@ -4937,9 +5301,11 @@ def _build_state_entry(old, item, out_name, out_bytes, marked_dur,
             f"{item['title']}")
     entry.pop("skipped", None)
     entry.pop("reason", None)
-    old_blocks = [(b.get("start"), b.get("end")) for b in
+    old_blocks = [(b.get("start"), b.get("end"), b.get("sponsor"),
+                   b.get("source")) for b in
                   (old or {}).get("blocks", [])] if old else []
-    new_blocks = [(b["start"], b["end"]) for b in state_blocks]
+    new_blocks = [(b["start"], b["end"], b.get("sponsor"),
+                   b.get("source")) for b in state_blocks]
     entry.update({
         "title": item["title"], "pubDate": item["pubDate"],
         "file": out_name,
@@ -5032,8 +5398,28 @@ def _retry_dynamic_only(item, state, channel_link, pcfg):
             tdata = json.load(f)
         words = [(w[0], w[1], w[2]) for w in tdata["words"]]
         duration = tdata["duration"]
-    except (OSError, ValueError, KeyError) as e:
+    except (OSError, ValueError, KeyError, IndexError, TypeError) as e:
         return False, f"A transcript unreadable ({e})"
+    # (N10) Verify the stored transcript belongs to the on-disk A
+    # before trusting it: a rotated/restored A with a stale
+    # transcript.json would rebuild chapters for the wrong audio.
+    # Any failure here returns unavailable; the caller falls back
+    # to full process_episode (which re-downloads + re-transcribes).
+    try:
+        a_sha = sha256_file(mp3_path)
+        a_size = os.path.getsize(mp3_path)
+        ident = json.load(open(os.path.join(work, "a_identity.json")))
+        if ident.get("sha256") != a_sha or ident.get("size") != a_size:
+            return False, "A transcript identity mismatch with on-disk A"
+        if ident.get("duration") is not None and \
+                abs(float(ident["duration"]) - float(duration)) > 1.0:
+            return False, "A transcript duration mismatch with identity"
+    except (OSError, ValueError, KeyError, AttributeError, TypeError) as e:
+        return False, f"A transcript identity unreadable ({e})"
+    try:
+        _check_transcript_plausible(words, duration, item["title"])
+    except RuntimeError as e:
+        return False, f"A transcript implausible ({e})"
     sponsors = extract_sponsors(item["description"])
     desc_sponsors = list(sponsors)
     sponsors += [dict(p) for p in HOUSE_PLUGS]
@@ -5080,10 +5466,37 @@ def _retry_dynamic_only(item, state, channel_link, pcfg):
                              "seconds": e - s, "chapter": title,
                              "start_sharpness": ss, "end_sharpness": es,
                              "source": src})
-    state["processed"][guid] = _build_state_entry(
-        old, item, out_name, os.path.getsize(out_path), marked_dur,
-        state_blocks, dyn)
-    save_state(state)
+    # T3-N9: rebuild the entry from the freshly read disk entry, so
+    # a concurrent writer's fields for this episode (e.g. a publish
+    # record) survive the re-mark; fall back to the in-memory entry
+    # when the disk state cannot be read. Held under the state lock
+    # together with the save so no writer can slip between the read
+    # and the write. (Coord integration: state_lock() itself raises
+    # TypeError when the podcast was never initialised, so the whole
+    # locked block is guarded -- a lock failure falls back to the
+    # pre-N9 build-from-memory + save, which is what the N10 driver
+    # exercises.)
+    try:
+        with state_lock():
+            try:
+                _fresh_old = _load_state_raw().get(
+                    "processed", {}).get(guid)
+            except Exception as exc:
+                log(f"  WARNING: fresh state re-read failed ({exc!r}); "
+                    "rebuilding the entry from the in-memory state")
+                _fresh_old = old
+            state["processed"][guid] = _build_state_entry(
+                _fresh_old, item, out_name, os.path.getsize(out_path),
+                marked_dur, state_blocks, dyn)
+            save_state(state)
+    except TypeError:
+        log("  WARNING: state lock unavailable (podcast not "
+            "initialised); rebuilding the entry from the in-memory "
+            "state")
+        state["processed"][guid] = _build_state_entry(
+            old, item, out_name, os.path.getsize(out_path),
+            marked_dur, state_blocks, dyn)
+        save_state(state)
     _record_history(item, blocks, block_sources, duration)
     log(f"done (B-only retry): {item['title']} -- marked {len(blocks)} "
         "ads as chapters")
@@ -5294,15 +5707,45 @@ def process_episode(item, state, channel_link=None, pcfg=None):
     with open(os.path.join(work, "report.json"), "w") as f:
         json.dump(report, f, indent=2)
 
-    state["processed"][item["guid"]] = _build_state_entry(
-        state["processed"].get(item["guid"]), item, out_name,
-        os.path.getsize(out_path), marked_dur, state_blocks, dyn,
-        td_result, td_corr, missed,
-        [{"label": l, "seconds": e - s} for s, e, l in suspects],
-        suspects_reel_name,
-        os.path.getsize(os.path.join(SITE_DIR, suspects_reel_name))
-        if suspects_reel_name else 0)
-    save_state(state)
+    # T3-N9: rebuild the entry from the freshly read disk entry, so
+    # a concurrent writer's fields for this episode (e.g. a publish
+    # record) survive the re-mark; fall back to the in-memory entry
+    # when the disk state cannot be read. Held under the state lock
+    # together with the save so no writer can slip between the read
+    # and the write. (Coord integration: same guard as the
+    # _retry_dynamic_only block -- a state_lock() failure falls back
+    # to the pre-N9 build-from-memory + save.)
+    try:
+        with state_lock():
+            try:
+                _fresh_old = _load_state_raw().get(
+                    "processed", {}).get(item["guid"])
+            except Exception as exc:
+                log(f"  WARNING: fresh state re-read failed ({exc!r}); "
+                    "rebuilding the entry from the in-memory state")
+                _fresh_old = state["processed"].get(item["guid"])
+            state["processed"][item["guid"]] = _build_state_entry(
+                _fresh_old, item, out_name,
+                os.path.getsize(out_path), marked_dur, state_blocks, dyn,
+                td_result, td_corr, missed,
+                [{"label": l, "seconds": e - s} for s, e, l in suspects],
+                suspects_reel_name,
+                os.path.getsize(os.path.join(SITE_DIR, suspects_reel_name))
+                if suspects_reel_name else 0)
+            save_state(state)
+    except TypeError:
+        log("  WARNING: state lock unavailable (podcast not "
+            "initialised); rebuilding the entry from the in-memory "
+            "state")
+        state["processed"][item["guid"]] = _build_state_entry(
+            state["processed"].get(item["guid"]), item, out_name,
+            os.path.getsize(out_path), marked_dur, state_blocks, dyn,
+            td_result, td_corr, missed,
+            [{"label": l, "seconds": e - s} for s, e, l in suspects],
+            suspects_reel_name,
+            os.path.getsize(os.path.join(SITE_DIR, suspects_reel_name))
+            if suspects_reel_name else 0)
+        save_state(state)
     _record_history(item, blocks, block_sources, duration)
     log(f"done: {item['title']} -- marked {len(blocks)} ads as chapters")
     return report
