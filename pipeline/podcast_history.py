@@ -319,7 +319,11 @@ def append_episode(history_dir, podcast_id, episode_id, episode_title,
     atomic rewrite. An episode is recognised by its episode_id OR by
     (normalised title, pub_date) (m20), so rows written under a
     different id for the same episode (slug backfill vs guid writer)
-    are replaced, not duplicated.
+    are replaced, not duplicated. T3-N6: the matched old rows'
+    verified flags are carried onto the replacement rows (same
+    (start, end) edges -- the key build_rows uses for its
+    verified_map); a row whose edges moved gets no carried flag,
+    and an explicit caller verified_map wins on collision.
     Returns {'ok', 'rows_written', 'skipped', 'error', 'replaced',
     'replaced_episode_ids'}; 'skipped' is always None now (kept in
     the return shape for callers that read it).
@@ -327,13 +331,11 @@ def append_episode(history_dir, podcast_id, episode_id, episode_title,
     try:
         os.makedirs(history_dir, exist_ok=True)
         path = history_path(history_dir, podcast_id)
-        rows = build_rows(episode_id, episode_title, episode_duration_s,
-                          pub_date, blocks, sources, house_plugs,
-                          pipeline_version, processed_at, verified_map)
         with _history_lock(history_dir, podcast_id):
             existing = _load_raw_rows(history_dir, podcast_id)
             new_key = _title_date_key(episode_title, pub_date)
             matched_ids = set()
+            matched = []
             kept = []
             for r in existing:
                 same_id = r.get("episode_id", "") == episode_id
@@ -342,8 +344,27 @@ def append_episode(history_dir, podcast_id, episode_id, episode_title,
                 same_ep = new_key is not None and r_key == new_key
                 if same_id or same_ep:
                     matched_ids.add(r.get("episode_id", ""))
+                    matched.append(r)
                 else:
                     kept.append(r)
+            # T3-N6: carry the matched old rows' verified flags.
+            carried = {}
+            for r in matched:
+                if (r.get("verified", "") or "").strip().lower() != "true":
+                    continue
+                try:
+                    key = (round(float(r.get("start_s", "")), 1),
+                           round(float(r.get("end_s", "")), 1))
+                except (TypeError, ValueError):
+                    continue
+                carried[key] = (True, r.get("verified_source", ""))
+            merged_map = dict(carried)
+            if verified_map:
+                merged_map.update(verified_map)
+            rows = build_rows(episode_id, episode_title,
+                              episode_duration_s, pub_date, blocks,
+                              sources, house_plugs, pipeline_version,
+                              processed_at, merged_map)
             # Atomic whole-file rewrite (M31): temp file in the same
             # directory + os.replace, never open(path, "a").
             fd, tmp = tempfile.mkstemp(prefix=".history-",
