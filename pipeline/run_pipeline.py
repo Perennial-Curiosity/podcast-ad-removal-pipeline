@@ -847,6 +847,20 @@ def _fsync_dir(path):
         pass
 
 
+def _fsync_file(path):
+    """Flush a file to disk before an atomic replace (same mechanism as
+    _fsync_dir; kept separate so the call sites read correctly)."""
+    _fsync_dir(path)
+
+
+def _tmp_path(path):
+    """Temp sibling for an atomic write, keeping the extension: ffmpeg
+    infers the output format from it, so <out>.tmp.<pid> (no .mp3)
+    would make ffmpeg refuse the mux. E.g. foo.mp3 -> foo.tmp.123.mp3."""
+    root, ext = os.path.splitext(path)
+    return f"{root}.tmp.{os.getpid()}{ext}"
+
+
 def save_state(state):
     """Atomic, locked state write with backup rotation (M28/M29).
 
@@ -1185,12 +1199,12 @@ def transcribe_file(model, wav_path, **kwargs):
     return model.transcribe(audio, **kwargs)
 
 
-def _atomic_json_dump(path, payload):
+def _atomic_json_dump(path, payload, indent=None):
     """Write JSON atomically (temp + replace) so a kill mid-write never
     leaves a truncated file for the next run to choke on (m19)."""
     tmp = f"{path}.tmp.{os.getpid()}"
     with open(tmp, "w") as f:
-        json.dump(payload, f)
+        json.dump(payload, f, indent=indent)
     os.replace(tmp, path)
 
 
@@ -3940,9 +3954,16 @@ def build_segment_reel(mp3_path, blocks, out_path, work_dir):
     meta_path = os.path.join(work_dir, "reel_chapters.txt")
     with open(meta_path, "w") as f:
         f.write(meta)
+    # Atomic final write (resumable runs, 2026-11-21): same temp +
+    # replace as _write_marked_file, so a kill can never leave a
+    # partial reel at the final path.
+    _final_tmp = _tmp_path(out_path)
     subprocess.run(
         ["ffmpeg", "-y", "-v", "error", "-i", tmp_out, "-i", meta_path,
-         "-map_metadata", "1", "-c", "copy", out_path], check=True)
+         "-map_metadata", "1", "-c", "copy", _final_tmp], check=True)
+    _fsync_file(_final_tmp)
+    os.replace(_final_tmp, out_path)
+    _fsync_dir(os.path.dirname(out_path) or ".")
     for sf in seg_files + [tmp_out, concat_list, meta_path]:
         if os.path.exists(sf):
             os.remove(sf)
@@ -5394,17 +5415,30 @@ def _build_state_entry(old, item, out_name, out_bytes, marked_dur,
 def _write_marked_file(mp3_path, out_path, blocks, sponsors, base_chapters,
                        duration):
     """ffmpeg -c copy + ad-chapter marking (shared by process_episode
-    and the B-only retry, M6). Returns (ad_spans, marked_chapters)."""
+    and the B-only retry, M6). Returns (ad_spans, marked_chapters).
+
+    Atomic (resumable runs, 2026-11-21): the copy and the chapter
+    embedding happen on a temp file in the same directory; the final
+    path is replaced only once the file is complete and fsynced, so a
+    kill can never leave a partial file at the final path (the 289
+    re-process was killed mid-mux and left a 75 MB partial file
+    there). A leftover <out-stem>.tmp.<pid>.mp3 file is inert (never
+    swept automatically — a concurrent writer's temp must not be
+    deleted)."""
     ad_spans = _ad_chapter_spans(blocks, sponsors, HOUSE_PLUGS)
     marked_chapters = insert_ad_chapters(base_chapters, ad_spans, duration)
+    tmp_out = _tmp_path(out_path)
     subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", mp3_path,
-                    "-c", "copy", out_path], check=True)
+                    "-c", "copy", tmp_out], check=True)
     if marked_chapters:
-        write_chapters(out_path, marked_chapters, duration)
+        write_chapters(tmp_out, marked_chapters, duration)
         log(f"marked {len(blocks)} ad chapters in "
             f"{os.path.basename(out_path)}")
     else:
         log("no confident ad blocks; publishing whole with original chapters")
+    _fsync_file(tmp_out)
+    os.replace(tmp_out, out_path)
+    _fsync_dir(os.path.dirname(out_path) or ".")
     return ad_spans, marked_chapters
 
 
@@ -5544,16 +5578,202 @@ def _retry_dynamic_only(item, state, channel_link, pcfg):
     return True, ""
 
 
-def process_episode(item, state, channel_link=None, pcfg=None):
+# ---------------------------------------------------------------------------
+# Run checkpoints (resumable runs, 2026-11-21): a killed process_episode
+# re-enters at the first incomplete stage instead of starting over.
+# The checkpoint is a record, never proof on its own: every claimed
+# stage is verified against its on-disk artifact before it is trusted
+# (see the _verify_stage_* helpers). Written with _atomic_json_dump,
+# so a kill can never leave a truncated checkpoint. Generic: the
+# checkpoint carries the podcast / guid / slug as data, never as
+# branching.
+# ---------------------------------------------------------------------------
+CHECKPOINT_VERSION = 1
+_CHECKPOINT_STAGES = ["download_a", "transcribe_a", "detect", "dynamic",
+                      "rescue_diff", "write_marked", "write_suspects",
+                      "state_saved"]
+
+
+def _checkpoint_path(work):
+    return os.path.join(work, "checkpoint.json")
+
+
+def _block_fingerprint(blocks):
+    """Stable identity for a block list: sha256 of the canonical JSON
+    (start/end/sharpness rounded to 3 decimals, label as-is)."""
+    canon = [[round(float(s), 3), round(float(e), 3), str(l),
+              round(float(ss), 3), round(float(es), 3)]
+             for (s, e, l, ss, es) in blocks]
+    return hashlib.sha256(
+        json.dumps(canon, sort_keys=True).encode()).hexdigest()
+
+
+def _suspects_fingerprint(suspects):
+    """Stable identity for a suspects list (start/end rounded to 3
+    decimals, label as-is)."""
+    canon = [[round(float(s), 3), round(float(e), 3), str(l)]
+             for (s, e, l) in suspects]
+    return hashlib.sha256(
+        json.dumps(canon, sort_keys=True).encode()).hexdigest()
+
+
+def _pipeline_md5():
+    try:
+        return hashlib.md5(open(os.path.abspath(__file__), "rb").read()
+                           ).hexdigest()
+    except OSError:
+        return None
+
+
+def _checkpoint_new(podcast, guid, slug):
+    return {"version": CHECKPOINT_VERSION, "podcast": podcast,
+            "guid": guid, "slug": slug,
+            "pipeline_md5": _pipeline_md5(),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "stages": {}}
+
+
+def _read_checkpoint(path):
+    try:
+        with open(path) as f:
+            ck = json.load(f)
+        if not isinstance(ck, dict) or ck.get("version") != CHECKPOINT_VERSION:
+            return None
+        if not isinstance(ck.get("stages"), dict):
+            return None
+        return ck
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _checkpoint_record(work, ck, stage, artifact, path=None):
+    """Record one completed stage, atomically (temp + replace via
+    _atomic_json_dump). Recording a stage overwrites only that stage;
+    later claims are left in place and re-verified at their own
+    boundary before they are ever trusted."""
+    p = path or _checkpoint_path(work)
+    ck.setdefault("stages", {})[stage] = {
+        "completed_at": datetime.now(timezone.utc).isoformat(), **artifact}
+    _atomic_json_dump(p, ck)
+    return ck
+
+
+def _verify_stage_download_a(mp3_path):
+    """True when the A file matches its download sidecar."""
+    return _verify_download_sidecar(mp3_path)
+
+
+def _verify_stage_transcribe_a(work, mp3_path):
+    """True when the A transcript cache belongs to this exact A file
+    and is complete: identity matches the file, every in-range chunk
+    exists with a matching config, and the chunk word sum equals
+    transcript.json."""
+    try:
+        ident = json.load(open(os.path.join(work, "a_identity.json")))
+        if ident.get("sha256") != sha256_file(mp3_path):
+            return False
+        if ident.get("size") != os.path.getsize(mp3_path):
+            return False
+        dur = float(ident.get("duration") or 0)
+        if dur <= 0:
+            return False
+        if not _transcript_cache_complete(work, dur):
+            return False
+        tj = json.load(open(os.path.join(work, "transcript.json")))
+        n_words = len(tj.get("words", []))
+        if not n_words:
+            return False
+        total = 0
+        for f in glob.glob(os.path.join(work, "chunk_*.json")):
+            total += len(json.load(open(f)).get("words", []))
+        return total == n_words
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
+def _verify_stage_write_marked(out_path, claimed, fingerprint, duration):
+    """True when the final marked file matches the checkpoint claim
+    (block fingerprint + size + SHA-256 + probe duration) for the
+    current blocks."""
+    try:
+        if claimed.get("block_fingerprint") != fingerprint:
+            return False
+        if os.path.getsize(out_path) != claimed.get("bytes"):
+            return False
+        if sha256_file(out_path) != claimed.get("sha256"):
+            return False
+        if abs(probe_duration(out_path) - duration) > 1.0:
+            return False
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _verify_stage_write_suspects(out_path, claimed):
+    """True when the final suspects reel matches the checkpoint claim
+    (size + SHA-256). The suspects-list fingerprint is checked by the
+    caller alongside this."""
+    try:
+        return (os.path.getsize(out_path) == claimed.get("bytes") and
+                sha256_file(out_path) == claimed.get("sha256"))
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def process_episode(item, state, channel_link=None, pcfg=None,
+                    resume_ck=None, checkpoint_path=None):
     slug = re.sub(r"[^a-z0-9]+", "-", item["title"].lower()).strip("-")[:60]
     work = os.path.join(EP_DIR, slug)
     os.makedirs(work, exist_ok=True)
     mp3_path = os.path.join(work, "original.mp3")
+    # Run checkpoint (resumable runs, 2026-11-21): a record of
+    # completed stages in the work dir, so a killed run re-enters at
+    # the first incomplete stage. A checkpoint from another episode
+    # is ignored (full run).
+    _ck_path = checkpoint_path or _checkpoint_path(work)
+    if resume_ck is not None and (
+            resume_ck.get("guid") != item.get("guid") or
+            resume_ck.get("slug") != slug):
+        log("  WARNING: resume checkpoint is for a different episode; "
+            "ignoring it (full run)")
+        resume_ck = None
+    ck = resume_ck if resume_ck is not None else _checkpoint_new(
+        PODCAST_ID, item.get("guid"), slug)
+    if resume_ck is not None:
+        # Resume assessment: which already-completed stages verify
+        # against their on-disk artifacts right now (later stages are
+        # re-verified at their own boundaries, once their inputs
+        # exist). This is the record the 289 kill lacked — how far
+        # the run got before it died.
+        _verified = []
+        if _verify_stage_download_a(mp3_path):
+            _verified.append("download_a")
+        if _verify_stage_transcribe_a(work, mp3_path):
+            _verified.append("transcribe_a")
+        log(f"  resuming from checkpoint: already verified: "
+            f"{', '.join(_verified) if _verified else 'none'}")
     download(item["audio_url"], mp3_path)
+    try:
+        _sc = json.load(open(_download_sidecar_path(mp3_path)))
+        _dl = {"bytes": _sc.get("bytes"), "sha256": _sc.get("sha256"),
+               "duration": _sc.get("duration")}
+    except (OSError, ValueError):
+        _dl = {"bytes": os.path.getsize(mp3_path),
+               "sha256": sha256_file(mp3_path), "duration": None}
+    _checkpoint_record(work, ck, "download_a", _dl, path=_ck_path)
 
     log(f"transcribing {item['title']}")
     words, duration = transcribe_chunked(mp3_path, work)
     log(f"transcript: {len(words)} words, {duration:.0f}s audio")
+    try:
+        _ident = json.load(open(os.path.join(work, "a_identity.json")))
+    except (OSError, ValueError):
+        _ident = {}
+    _checkpoint_record(work, ck, "transcribe_a", {
+        "sha256": _ident.get("sha256"), "size": _ident.get("size"),
+        "duration": duration, "words": len(words),
+        "chunks": len(glob.glob(os.path.join(work, "chunk_*.json")))},
+        path=_ck_path)
     _check_transcript_plausible(words, duration, item["title"])
 
     sponsors = extract_sponsors(item["description"])
@@ -5604,6 +5824,19 @@ def process_episode(item, state, channel_link=None, pcfg=None):
     missed = check_missed_sponsors(words, desc_sponsors, blocks)
     if not sponsors:
         log("no sponsors listed in description; sponsor-independent detection only")
+    # Checkpoint: detection complete. On a resume, a changed
+    # fingerprint means the re-run produced different blocks than the
+    # killed run — warn and continue with the fresh result (the fresh
+    # result wins; the fingerprint is a tripwire, not a gate).
+    _fp = _block_fingerprint(blocks)
+    _old_fp = ck.get("stages", {}).get("detect", {}).get("block_fingerprint")
+    if _old_fp and _old_fp != _fp:
+        log("  WARNING: resumed detection produced different blocks than "
+            "the killed run (fingerprint changed); continuing with the "
+            "fresh result")
+    _checkpoint_record(work, ck, "detect", {"blocks": len(blocks),
+                                            "block_fingerprint": _fp},
+                       path=_ck_path)
 
     # Dynamic slots (2026-11-11, DESIGN.md): second-download alignment
     # as a boundary source for dynamic ads. Runs after A detection,
@@ -5613,6 +5846,12 @@ def process_episode(item, state, channel_link=None, pcfg=None):
         desc_sponsors, own_domains, candidates_out, blocks)
     blocks = dyn["blocks"]
     block_sources = dyn["sources"]
+    _checkpoint_record(work, ck, "dynamic", {
+        "dynamic_status": dyn["dynamic_status"],
+        "b_sha256": dyn["b_sha256"], "b_duration": dyn["b_duration"],
+        "n_slots": len(dyn["dynamic_slots"]),
+        "blocks": len(blocks),
+        "block_fingerprint": _block_fingerprint(blocks)}, path=_ck_path)
 
     # Back-to-back split (2026-11-13): rescue a second sponsor's ad
     # trimmed from the head/tail of a fused heat-map region (see
@@ -5672,6 +5911,9 @@ def process_episode(item, state, channel_link=None, pcfg=None):
                       else "no podcast:transcript tags on this episode")
         log(f"  transcript-diff: skipped ({_td_reason}); "
             "detector-only output")
+    _checkpoint_record(work, ck, "rescue_diff", {
+        "blocks": len(blocks),
+        "block_fingerprint": _block_fingerprint(blocks)}, path=_ck_path)
 
     # Chapters model (2026-10-28, per the owner): no cutting. The published
     # file is the full original episode with detected ads marked as
@@ -5685,8 +5927,25 @@ def process_episode(item, state, channel_link=None, pcfg=None):
         base = [(ms / 1000.0, t) for ms, t in generate_chapters(words, duration)]
     out_name = f"{slug}-marked.mp3"
     out_path = os.path.join(SITE_DIR, out_name)
-    ad_spans, marked_chapters = _write_marked_file(
-        mp3_path, out_path, blocks, sponsors, base, duration)
+    # Resume: if the marked file is already complete and verified for
+    # these exact blocks, skip the ffmpeg mux entirely; the chapter
+    # spans are recomputed in memory (pure functions) for the state /
+    # report steps below.
+    _wm = ck.get("stages", {}).get("write_marked") or {}
+    if _wm and _verify_stage_write_marked(
+            out_path, _wm, _block_fingerprint(blocks), duration):
+        log("  resuming: marked file already complete and verified; "
+            "skipping the ffmpeg write")
+        ad_spans = _ad_chapter_spans(blocks, sponsors, HOUSE_PLUGS)
+        marked_chapters = insert_ad_chapters(base, ad_spans, duration)
+    else:
+        ad_spans, marked_chapters = _write_marked_file(
+            mp3_path, out_path, blocks, sponsors, base, duration)
+        _checkpoint_record(work, ck, "write_marked", {
+            "bytes": os.path.getsize(out_path),
+            "sha256": sha256_file(out_path),
+            "duration": probe_duration(out_path),
+            "block_fingerprint": _block_fingerprint(blocks)}, path=_ck_path)
     marked_dur = probe_duration(out_path)
     # Build suspect reel (2026-10-22, per the owner): segments the pipeline
     # was unsure about, pasted chronologically. The owner reviews these
@@ -5696,7 +5955,18 @@ def process_episode(item, state, channel_link=None, pcfg=None):
     if suspects:
         suspects_reel_name = f"{slug}-suspects.mp3"
         suspects_reel_path = os.path.join(SITE_DIR, suspects_reel_name)
-        build_segment_reel(mp3_path, suspects, suspects_reel_path, work)
+        _ws = ck.get("stages", {}).get("write_suspects") or {}
+        _sfp = _suspects_fingerprint(suspects)
+        if _ws and _ws.get("suspects_fingerprint") == _sfp and \
+                _verify_stage_write_suspects(suspects_reel_path, _ws):
+            log("  resuming: suspects reel already complete and verified; "
+                "skipping the reel build")
+        else:
+            build_segment_reel(mp3_path, suspects, suspects_reel_path, work)
+            _checkpoint_record(work, ck, "write_suspects", {
+                "bytes": os.path.getsize(suspects_reel_path),
+                "sha256": sha256_file(suspects_reel_path),
+                "suspects_fingerprint": _sfp}, path=_ck_path)
         log(f"suspects-reel: {suspects_reel_name} ({len(suspects)} segments)")
 
     def chapter_for_block(s):
@@ -5746,8 +6016,7 @@ def process_episode(item, state, channel_link=None, pcfg=None):
             "error": td_result["error"],
         },
     }
-    with open(os.path.join(work, "report.json"), "w") as f:
-        json.dump(report, f, indent=2)
+    _atomic_json_dump(os.path.join(work, "report.json"), report, indent=2)
 
     # T3-N9: rebuild the entry from the freshly read disk entry, so
     # a concurrent writer's fields for this episode (e.g. a publish
@@ -5789,6 +6058,9 @@ def process_episode(item, state, channel_link=None, pcfg=None):
             if suspects_reel_name else 0)
         save_state(state)
     _record_history(item, blocks, block_sources, duration)
+    _checkpoint_record(work, ck, "state_saved", {
+        "ads_marked": len(state_blocks),
+        "block_fingerprint": _block_fingerprint(blocks)}, path=_ck_path)
     log(f"done: {item['title']} -- marked {len(blocks)} ads as chapters")
     return report
 
@@ -5810,6 +6082,45 @@ def _record_process_crash(state, guid, title):
     _save_state_quietly(state)
 
 
+def _resume_episode(slug, checkpoint_path, items, state, channel_link, pcfg):
+    """One-off resume of a killed run (resumable runs, 2026-11-21).
+
+    Resolves the episode from the feed by derived slug, loads the
+    checkpoint (default <work>/checkpoint.json), and calls
+    process_episode with it. A checkpoint from a different pipeline
+    version, or for a different episode, is ignored (full run).
+    Exits non-zero when the slug is not in the feed — resume needs
+    the feed item for audio_url and description. Publishes nothing
+    itself; main() regenerates the feed afterwards (M26)."""
+    item = None
+    for it in items:
+        _s = re.sub(r"[^a-z0-9]+", "-", it["title"].lower()).strip("-")[:60]
+        if _s == slug:
+            item = it
+            break
+    if item is None:
+        raise SystemExit(f"--resume: no feed item with slug {slug!r}")
+    work = os.path.join(EP_DIR, slug)
+    ck_path = checkpoint_path or _checkpoint_path(work)
+    ck = _read_checkpoint(ck_path)
+    if ck is None:
+        log(f"  --resume {slug}: no readable checkpoint at {ck_path}; "
+            "full run from the top")
+    elif ck.get("guid") != item.get("guid") or ck.get("slug") != slug:
+        log("  --resume: checkpoint is for a different episode; "
+            "ignoring it (full run)")
+        ck = None
+    elif ck.get("pipeline_md5") != _pipeline_md5():
+        log("  --resume: checkpoint was written by a different pipeline "
+            "version; ignoring it (full run)")
+        ck = None
+    else:
+        log(f"  --resume {slug}: checkpoint at {ck_path} "
+            f"({len(ck.get('stages', {}))} stages recorded)")
+    process_episode(item, state, channel_link, pcfg, resume_ck=ck,
+                    checkpoint_path=ck_path)
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser()
@@ -5821,6 +6132,13 @@ def main():
                     help="print the gated dynamic slots for one already-"
                     "processed episode (slug as in the work dir) and exit; "
                     "writes no pipeline state and publishes nothing")
+    ap.add_argument("--resume", default=None, metavar="SLUG",
+                    help="resume a killed run for one episode (slug as in "
+                    "the work dir); re-enters at the first incomplete "
+                    "checkpoint stage")
+    ap.add_argument("--checkpoint", default=None, metavar="PATH",
+                    help="checkpoint file for --resume (default "
+                    "<work>/checkpoint.json)")
     args = ap.parse_args()
 
     cfg, pcfg = init_podcast(args.podcast)
@@ -5838,6 +6156,18 @@ def main():
         it["feed_has_transcript"] = feed_has_transcript
     channel_link = parse_channel_link(xml)
     log(f"feed has {len(items)} items")
+    if args.resume:
+        _resume_episode(args.resume, args.checkpoint, items, state,
+                        channel_link, pcfg)
+        # M26: the feed is regenerated on EVERY run, so a resumed run
+        # that changed the state cannot leave a stale feed behind.
+        try:
+            write_feed(state, SITE_DIR, xml)
+            log("feed regenerated")
+        except Exception as exc:
+            log(f"ERROR: feed regeneration failed: {exc!r}")
+            raise
+        return
     if args.slots_only:
         slots_only_mode(args.slots_only, items, channel_link)
         return
