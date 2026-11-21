@@ -426,6 +426,14 @@ Notes:
   test set is otherwise identical on all four paths, and the stale
   289 driver that could have clobbered the repaired state is
   deleted.
+- **T2-N7 applied with the cross-promo guard (2026-11-20,
+  APPLIED):** the held horizon patch is live together with a
+  generic content gate — a block that only reaches the floor
+  because of the audio horizon is marked only if a content method
+  (CTA, brand, cluster, duplicate, chapter, brand-orphan) voted in
+  it (TESTS.md entry 58). The test set is identical on all four
+  paths, and the cross-promo block is gone. All 61 original
+  findings and all 30 re-audit findings are now resolved.
 - **Content-length check on downloads (2026-11-19, APPLIED):** the
   download step now compares bytes received against the advertised
   Content-Length and fails loudly on a short read (TESTS.md entry 50).
