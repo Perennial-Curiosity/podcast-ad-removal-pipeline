@@ -434,6 +434,16 @@ Notes:
   it (TESTS.md entry 58). The test set is identical on all four
   paths, and the cross-promo block is gone. All 61 original
   findings and all 30 re-audit findings are now resolved.
+- **289 re-process with the fixed pipeline (2026-11-20/21):**
+  publish gate FAILED, not re-published (TESTS.md entry 59). Only
+  1 of 11 blocks matched the published 11 within 2 seconds. The
+  fresh audio was the full cut, so the tail block was in range —
+  but the slot flow gated zero slots: the M17 gate tightening
+  means dynamic ads for brands outside the description sponsors
+  can no longer gate, and the test set never caught it because
+  SponsorBlock labels are description sponsors only. The A folder
+  is now remediated (identity file present, stale chunk gone), and
+  the published file and state stand unchanged.
 - **Content-length check on downloads (2026-11-19, APPLIED):** the
   download step now compares bytes received against the advertised
   Content-Length and fails loudly on a short read (TESTS.md entry 50).
