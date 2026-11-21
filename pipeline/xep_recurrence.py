@@ -164,8 +164,12 @@ def _cache_key(ep_dir, slug, priors):
     """Cache key on transcript CONTENT (M5): SHA-256 of each
     transcript.json's bytes, plus the span-logic version. Two different
     transcripts with the same size and mtime no longer collide, and a
-    span-logic change invalidates the cache."""
-    key = [slug, XEP_CACHE_VERSION]
+    span-logic change invalidates the cache. (N9) The span parameters
+    are bound live on every call, so a retune invalidates
+    automatically with no manual version bump."""
+    params = (f"shingle={SHINGLE_SIZE}:min_span={MIN_SPAN_SECONDS}:"
+              f"max_gap={MAX_GAP_TOKENS}:min_priors={MIN_PRIOR_EPISODES}")
+    key = [slug, XEP_CACHE_VERSION, params]
     for p in priors:
         key.append(f"{p}:{_sha256_file(os.path.join(ep_dir, p, 'transcript.json'))}")
     key.append(f"self:{_sha256_file(os.path.join(ep_dir, slug, 'transcript.json'))}")
