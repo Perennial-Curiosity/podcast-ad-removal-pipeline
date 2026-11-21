@@ -4273,6 +4273,79 @@ round) — out of scope, left as-is. **T2-N7 is the only open
 item from this round** (held, patch preserved, unblock options
 above).
 
+---
+
+## 58. T2-N7 applied with the cross-promo guard — APPLIED 2026-11-20
+
+Owner (2026-11-20): "do them both" — apply T2-N7 with the
+cross-promo guard, then re-process 289. This entry covers the
+T2-N7 half; the 289 re-process is a separate step. Single
+agent (not a team round). Result: **FIXED, live.** Record:
+`sb_eval/ab/fix_round_2026-11-20-n7/` (NOTE.md with the
+frozen design, test results, merge record; patches
+`t2-n7.patch` + `t2-n7-guard.patch`; drivers
+`guard_t2n7.py` / `repro_t2n678.py` / `run_sb.py`; results
+`results/sb_patched.json`; backup in `coord/backups/`).
+HANDOFF.md item 35.
+
+Guard design (generic terms): a horizon-extension content
+gate at both heat-map block-emission sites in
+`detect_ad_blocks` — a block whose 2+-vote run clipped to the
+word horizon is below the 30-second floor is marked only if a
+*content* method — CTA, brand, cluster, cluster-popular,
+duplicate, publisher chapter, or brand-orphan — voted
+somewhere in the block. Otherwise it is dropped and stays a
+suspect, exactly as before N7. URL, voice, reverb, and
+history-preroll do not count as content: a spoken URL can be
+the show's own site, voice/reverb are delivery anomalies, and
+history-preroll is corroboration from other episodes. The
+guard is inert when no audio duration is passed (horizon
+equals word horizon), is scoped to heat-map blocks only, and
+references no show, network, sponsor, or house-plugs config.
+
+Verification: N7 patch dry-ran clean against live (all 9
+hunks) and applied to a staging copy; N7 repro 24/24 PASS;
+the SN-1096 single-episode run showed the cross-promo block
+(10210, 10241, `url/voice:twitter`) — defect reproduced on
+the frozen data. Guard driver 4/4 PASS (staging and live):
+the horizon-dependent {url, voice} block is dropped; the same
+shape with a brand-orphan content vote is kept as (90, 151);
+a non-horizon-dependent {url, voice} block is kept (edges
+identical on N7-only staging, proving the guard does not
+touch it); the fallback without audio_duration is unchanged.
+N7 repro 24/24 PASS on the guarded staging and on live (P6f
+still passes — its {url, brand-orphan} block carries a
+content vote). SN-1096 with the guard: the (10210, 10241)
+block is absent; 7 detector blocks, all identical to the
+N7-only run; FP 1 (baseline; N7-only was 2). Fallback check:
+detector blocks on SN-1096, unsub-287, and lex-fridman
+without audio_duration are identical to the frozen baseline
+on all three. Full SB set (N7+guard), all four paths
+identical to baseline: detector 0.757 (81/107) / FP 37 /
+median 4.8s / within-1s 26.5% / within-2s 38.3%; detect-only
+0.738 (79/107) / FP 31; slot-flow 0.738 (79/107) / FP 38;
+full 0.757 (81/107) / FP 44. Per-episode scores identical on
+all 25 episodes; the sole difference anywhere is a run-time
+timestamp string in one episode's slot log.
+
+Application: backup md5-verified, both patches applied to
+live (dry-run clean, all hunks), py_compile clean. New live
+md5: `6175c75fec20536d719d4ab6f3aa5b9b` (5,917 lines), diff vs
+the tested staging file empty. All other pipeline files
+unchanged. 289 state still 11 blocks with publish fields
+intact; 288 untouched (12 blocks, `b_failed`, no enclosure).
+No episode was processed and nothing was re-published. T2-N7
+is now closed — all 61 original findings and all 30 re-audit
+findings are resolved. Parent verified: live md5 and line
+count match the agent's claims; py_compile clean; the guard
+sites present in the live code (audio-duration horizon lines
+2072–2080, content-vote gate line 2256, _method_chapter
+audio_duration lines 3524/3540, call sites 5246/5589); the SB
+results file (`results/sb_patched.json`, live md5 asserted
+inside) matches the table above on all four paths; 289 state
+11 blocks / publish fields intact; 288 12 blocks, `b_failed`,
+no enclosure.
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
