@@ -284,8 +284,14 @@ def main():
     # leaves an explicit pending flag and the next run re-selects
     # this episode instead of believing it published.
     _update_episode_fields(guid, **fields)
-    # 3. regenerate feed
+    # 3. regenerate feed. T3-N9: re-load the state first -- the
+    # snapshot above predates checkpoint 1 and any concurrent
+    # writer, so building the pushed feed from it could serve stale
+    # enclosures (the Contents SHA guards the PUT, not the content).
+    # Checkpoint 1 already persisted this episode's enclosure
+    # fields, so the fresh snapshot carries them.
     xml = fetch_feed()
+    state = load_state()
     feed = write_feed(state, rp.SITE_DIR, xml)
     # 4. push feed (need current SHA; create if missing). m15: only
     # a 404 means "missing"; any other gh() failure fails fast.
