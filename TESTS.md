@@ -4109,6 +4109,170 @@ with no reuse check or delete, so it carries the same latent
 422 exposure on republishes. Left as-is. The 22 minor
 findings remain deferred per the owner's direction.
 
+---
+
+## 57. Fix round for the re-audit's 22 minor — APPLIED 2026-11-20
+
+Owner (2026-11-20): "fix the 22 minor findings." Three fix
+teams (same subsystem split), test-first, applied only if
+clean. Result: **21 FIXED, 1 HELD (T2-N7), 0 invalid.** No
+live episode was processed, nothing was re-published. Records:
+`sb_eval/ab/fix_round_2026-11-20-minor/` (team NOTEs with
+frozen designs, test results, patch lists, SB before/after;
+patches in team1/patches/ (4), team2/patches/ (3, incl. the
+HELD t2-n7.patch), team3/patches/ (5); consolidated SB
+results in `coord/results/sb_coord_consolidated.json`).
+
+Team 1 (download/caching/transcription) — all 11 FIXED:
+T1-N1 (cache-drop verified by re-glob, RuntimeError on
+survivors, no identity rewrite); T1-N2 (failed pin delete
+degrades to detector-only, no download call); T1-N3 (absolute
+floors: duration < 60s or < 20 words); T1-N4 (IndexError added
+to both transcribe_chunked except tuples, AttributeError in
+the fast path); T1-N5 (slots_only_mode loads via
+transcribe_chunked plus a plausibility gate); T1-N6 (accepted
+as designed plus one warning per call for un-stamped chunks —
+no forced re-transcription); T1-N8 (b_pin.json records
+SHA/bytes/duration/verified/uses; unverified pins expire after
+5 reuses, verified never expire); T1-N9 (_cache_key binds the
+live span parameters); T1/T3-N10 (_retry_dynamic_only verifies
+a_identity.json — SHA/size/duration ±1s — plus plausibility;
+malformed words report unavailable instead of crashing);
+T1-N11 (small-body error raises IOError, retryable, then curl
+fallback); T1-N12 (dynamic_slots/align.py fixed in place as a
+standalone CLI — filtered load_words, corrupt entries skipped
+with warnings).
+
+Team 2 (detection) — 2 FIXED, 1 HELD: T2-N6
+(check_missed_sponsors time-coverage now also accepts a
+generic label part via _is_generic_part — a marked-but-unnamed
+block covers mentions inside it); T2-N8 (new _stem_plural
+helper, strip trailing s/es only, plus stem-equality in the
+multi-token branch of find_mentions; M16 "minty mobile" still
+fails). **T2-N7 HELD — patch ready, do not apply as-is.** The
+audio-duration horizon is correct in design (repro passes
+fully) but the SB run makes numbers worse with no correctness
+reason: FP +1 on every path (detector 37→38, detect-only
+31→32, slot-flow 38→39, full 44→45), recall/median/within-1s/2s
+unchanged. The sole change in all 25 episodes is SN-1096
+gaining block (10210, 10241, `url/voice:twitter`) — Leo's
+sign-off cross-promo for sister show MacBreak Weekly, a house
+plug, not a paid ad; SponsorBlock correctly does not label
+it. Mechanism verified against the frozen cache: voice
+10210.0–10240.0 + url 10193.8–10242.1 overlap for 31s of 2
+votes under the audio horizon vs 27s under the word horizon,
+crossing the 30s floor. Patch preserved at
+`team2/patches/t2-n7.patch` (5,064 bytes). Unblock options:
+apply N7 together with a guard keeping sister-show/own-network
+cross-promos out of ad marking (a new design decision), or
+accept 1 FP as the price of a correct horizon.
+
+Team 3 (state/history/publishing) — all 8 FIXED: T3-N3
+(republish289.py M37 branch now consults the post-delete
+remaining set — fields kept when the suspects asset is still
+live, popped only when actually gone); T3-N4 (backup stamp
+carries microseconds; 8 rapid saves → 5 backups); T3-N5
+(save_state parses the current state before archiving; a
+corrupt current state is never archived); T3-N6
+(append_episode carries over verified flags from matched old
+rows — data check first: live history/unsubscribe.csv holds
+exactly 23 verified rows, unsub-286: 9, unsub-287: 8,
+slug-266: 6, intact, no data repair needed or done); T3-N7
+(_build_state_entry compares (start, end, sponsor, source));
+T3-N8 (_save_state_quietly added at the end of the streak
+block in _run_dynamic_for_episode); T3-N9, both halves (state
+half: load_state records a snapshot + JSON-normalised
+baseline, save_state merges the caller's diff onto the freshly
+read disk state, per-key/per-episode/per-subkey, with in-place
+refresh and fresh-entry rebuild; feed half: publish_github
+re-loads state before write_feed); T3-N11
+(tmp/retry289_final.py DELETED — git-format delete patch,
+verified with git apply; no .py file imports or invokes it).
+
+Consolidated SB (coordinator's own run on the fully patched
+tree, fresh variant dirs): **identical to baseline on all four
+paths** — detector 0.757 (81/107) / FP 37 / median 4.8s /
+within-1s 26.5% / within-2s 38.3%; detect-only 0.738 (79/107)
+/ FP 31; slot-flow 0.738 (79/107) / FP 38; full 0.757
+(81/107) / FP 44. Headlines, aggregates, transcript_diff
+and xep sections all match; the only per-episode difference
+anywhere is a run-time timestamp string in one episode's slot
+log.
+
+Application: all patches applied in staging
+(`coord/apply2/`) in order team1 run_pipeline → team2 t2-n8
+→ team2 t2-n6 → team3 run_pipeline → single-file patches.
+All dry-runs clean, no hunk failed. Single-team files verified
+byte-identical to team staging (xep_recurrence,
+transcript_diff, align.py, podcast_history, publish_github,
+republish289). **Cross-team conflict found by the
+coordinator's verification (integration fix, applied by hand
+to staging only):** Team 1's N10 driver failed 1 check on the
+consolidated tree — N10-A raised `TypeError: STATE_PATH is
+None`. Root cause: Team 3's N9 rebuild blocks put `with
+state_lock():` OUTSIDE the try that only guards
+`_load_state_raw()`, and `state_lock()` itself raises
+TypeError when STATE_PATH is None. The N10 fix itself works
+(the B flow was called); the failure is downstream. In
+production this cannot fire (main() always calls
+init_podcast() first), but the N9 design's stated intent is
+"fall back to the in-memory entry when the disk state cannot
+be read". The coordinator restructured BOTH rebuild blocks
+(_retry_dynamic_only and process_episode) so the whole locked
+block is guarded by an outer try/except TypeError falling
+back to the pre-N9 build-from-memory + save_state. After the
+restructure: N10 driver FAILURES: none on the consolidated
+tree; Team 3's N9 state + merge repros still PASS; py_compile
+clean. Coordinator re-ran all team verify drivers against the
+consolidated staging tree (Team 1 all PASS; Team 2 19 PASS /
+5 FAIL — all 5 are the HELD N7 checks, as expected; Team 3
+N4/N5, N6, N7, N8, N9, N9-merge, N3 all PASS), ran the
+consolidated SB harness on the fully patched tree (live md5s
+asserted at import), promoted to live after md5-verified
+backups (`coord/backups/`), and re-ran Team 2's repro and
+Team 1's N10 driver against the LIVE files (N6/N8/N10 pass;
+N7 checks fail as expected — held) plus Team 3's N9-feed repro
+against live (PASS: pushed feed has the new X enclosure,
+concurrent Y enclosure kept, no stale Y enclosure).
+
+Parent verified: all live md5s match the coordinator's
+claims; py_compile clean; tmp/retry289_final.py deleted
+(confirmed absent); T2-N7 patch exists (5,064 bytes); the 23
+verified history rows confirmed (unsub-286: 9, unsub-287: 8,
+slug-266: 6); consolidated SB JSON matches the table above;
+289 state 11 blocks / ads_marked 11 / publish fields intact;
+288 (guid 551638f2-d62c-11f1-8c05-87721ef2056a) 12 blocks,
+`b_failed`, no enclosure. One counting note: the coordinator
+reported run_pipeline.py as 5,846 lines; the live file with
+the exact claimed md5 measures 5,875 lines by both `wc -l`
+and Python readlines — the md5 is the identity, and the
+difference is the hand-applied integration restructure landing
+after the count.
+
+New live md5s: run_pipeline.py
+`ff445b8129571ebc01c78b5bf6ebfbac` (5,875 lines, was 5,432);
+xep_recurrence.py `ec8aa41b7daf6497d71eb4fa2fce51c9`;
+transcript_diff.py `4f1d1cd297a45a21a8a102dc1b0c6a2b`;
+podcast_history.py `1ef0b5e9b961d3f2463441da8748a38b`;
+publish_github.py `bc8e389eb27fcda4c077cc7992525337`;
+dynamic_slots/align.py `020eb20db181f266c077e5975549e378`;
+tmp/republish289.py `a3028314c8e8dd70faf027a10ba26348`;
+tmp/retry289_final.py DELETED. split_rescue.py,
+slot_align.py, publish_feed.py unchanged. Live verified ==
+staging (md5s match). Behaviour changes flagged by the
+teams: N9 invalidates existing `xep_spans.json` caches once
+(cheap recompute); N10 costs legacy episodes without
+`a_identity.json` the B-only shortcut until fully processed
+once (no live pending episode); N3 refuses any
+sub-60s/sub-20-word transcript; N1 fails an episode loudly on
+a failed cache drop; N2 degrades to detector-only on a failed
+pin delete; N8 bounds unverified-pin exposure to 5 reuses.
+The suspects-reel upload still re-uploads with no reuse check
+or delete (same latent 422 exposure noted in the previous
+round) — out of scope, left as-is. **T2-N7 is the only open
+item from this round** (held, patch preserved, unblock options
+above).
+
 ## Earlier rejected ideas — one-line index
 
 These predate the test log and are covered in the README sections
