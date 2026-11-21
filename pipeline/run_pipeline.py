@@ -59,6 +59,15 @@ MIN_AD_LEN = 45
 # 2026-10-26). Single-method blocks keep the 45s floor.
 HEATMAP_MIN_AD_LEN = 30
 MAX_AD_LEN = 12 * 60
+# T2-N7 guard: methods that reflect spoken ad content. A heat-map block
+# that only reaches the floor because of votes past the last transcribed
+# word (audio-horizon extension) must carry one of these; url / voice /
+# reverb / history-preroll alone are not content evidence — a spoken URL
+# can be the show's own site, voice/reverb are delivery anomalies, and
+# history-preroll is corroboration from other episodes, not evidence in
+# this episode's audio.
+_CONTENT_METHODS = frozenset({'cta', 'brand', 'cluster', 'cluster-popular',
+                              'duplicate', 'chapter', 'brand-orphan'})
 # Orphan-mention gap split (M11, revised 2026-11-20): mentions more
 # than one segment-length apart belong to different reads / content
 # mentions, not to one window. 180s is the segment span cap the URL
@@ -1969,7 +1978,8 @@ def _strip_own_identity_labels(blocks, sponsors, own_identity):
 
 
 def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
-                     own_domains=None, candidates_out=None, own_identity=None):
+                     own_domains=None, candidates_out=None, own_identity=None,
+                     audio_duration=None):
     # words: list of (start, end, word) from Whisper (may contain duplicates).
     """Locate ad-read blocks via multi-method heat map (2026-10-09).
 
@@ -2058,6 +2068,16 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     # (M21). Return before any method runs.
     if not words:
         return [], []
+    # T2-N7: the detection horizon is the audio duration, not the last
+    # transcribed word. audio_duration is the probe duration passed by
+    # the production call sites; None keeps the old word horizon.
+    # max() keeps the word horizon as a floor for a stale/short value.
+    # (Placed after the empty-words return: words[-1] is only safe here.)
+    # T2-N7 guard: _word_horizon is the pre-N7 horizon, for the
+    # horizon-extension content gate at block formation below.
+    _word_horizon = int(words[-1][0]) + 1
+    _horizon = max(_word_horizon, int(audio_duration) + 1) \
+        if audio_duration else _word_horizon
     candidates = []
     candidates.extend([(s, e, l, 'cta') for s, e, l in _method_cta(words, sponsors, silences, own_domains)])
     candidates.extend([(s, e, l, 'url') for s, e, l in _method_url(words, silences, own_domains)])
@@ -2066,7 +2086,7 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     candidates.extend([(s, e, l, 'cluster') for s, e, l in _method_cluster(words, sponsors, silences)])
     candidates.extend([(s, e, l, 'cluster-popular') for s, e, l in _method_cluster_popular(words, sponsors, silences)])
     candidates.extend([(s, e, l, 'duplicate') for s, e, l in find_duplicate_segments(words)])
-    candidates.extend([(s, e, l, 'chapter') for s, e, l in _method_chapter(words, chapters, silences)])
+    candidates.extend([(s, e, l, 'chapter') for s, e, l in _method_chapter(words, chapters, silences, audio_duration=audio_duration)])
     if mp3_path:
         candidates.extend([(s, e, l, 'voice') for s, e, l in _method_voice(words, mp3_path)])
         candidates.extend([(s, e, l, 'reverb') for s, e, l in _method_reverb(words, mp3_path)])
@@ -2151,7 +2171,7 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
     _hist_pos = [i for i, c in enumerate(candidates)
                  if c[3] == 'history-preroll']
     if _hist_pos:
-        _gd = int(words[-1][0]) + 1
+        _gd = _horizon
         _bv = [0] * _gd
         _bdet = [[] for _ in range(_gd)]
         for _cs, _ce, _cl, _cm in candidates:
@@ -2205,7 +2225,7 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
             candidates = _new_cands
 
     # Build heat map: per-second vote counts
-    duration = int(words[-1][0]) + 1
+    duration = _horizon
     votes = [0] * duration
     vote_detail = [[] for _ in range(duration)]  # which methods voted
     for s, e, label, method in candidates:
@@ -2230,15 +2250,32 @@ def detect_ad_blocks(words, sponsors, silences, mp3_path=None, chapters=None,
             be = sec
             dur = be - bs
             if HEATMAP_MIN_AD_LEN <= dur <= MAX_AD_LEN:
-                entries = sum([vote_detail[s] for s in range(bs, be)], [])
-                blocks.append((bs, be, f"{'/'.join(sorted(block_methods))}:{_pick_label(entries, bs, be)}"))
-                log(f"  heatmap {bs:.0f}s-{be:.0f}s ({dur:.0f}s) votes={sorted(block_methods)}")
+                # T2-N7 guard: a block that only reaches the floor
+                # because of votes past the last transcribed word
+                # (its 2+-vote run inside the word horizon is below
+                # the floor) must carry a content vote in the block —
+                # a CTA, brand mention, cluster, duplicate, publisher
+                # chapter, or orphan mention. A region with only a
+                # spoken URL and a voice/reverb anomaly past the last
+                # word is a sign-off cross-promo, not a paid ad: drop
+                # it (it stays a suspect, as before N7).
+                if min(be, _word_horizon) - bs < HEATMAP_MIN_AD_LEN and \
+                        not (block_methods & _CONTENT_METHODS):
+                    log(f"  heatmap {bs:.0f}s-{be:.0f}s ({dur:.0f}s) votes={sorted(block_methods)} dropped: horizon-dependent, no content evidence")
+                else:
+                    entries = sum([vote_detail[s] for s in range(bs, be)], [])
+                    blocks.append((bs, be, f"{'/'.join(sorted(block_methods))}:{_pick_label(entries, bs, be)}"))
+                    log(f"  heatmap {bs:.0f}s-{be:.0f}s ({dur:.0f}s) votes={sorted(block_methods)}")
     if in_block:
         be = duration
         dur = be - bs
         if HEATMAP_MIN_AD_LEN <= dur <= MAX_AD_LEN:
-            entries = sum([vote_detail[s] for s in range(bs, be)], [])
-            blocks.append((bs, be, f"{'/'.join(sorted(block_methods))}:{_pick_label(entries, bs, be)}"))
+            if min(be, _word_horizon) - bs < HEATMAP_MIN_AD_LEN and \
+                    not (block_methods & _CONTENT_METHODS):
+                log(f"  heatmap {bs:.0f}s-{be:.0f}s ({dur:.0f}s) votes={sorted(block_methods)} dropped: horizon-dependent, no content evidence")
+            else:
+                entries = sum([vote_detail[s] for s in range(bs, be)], [])
+                blocks.append((bs, be, f"{'/'.join(sorted(block_methods))}:{_pick_label(entries, bs, be)}"))
 
     # Gap-merge heat-map blocks (2026-10-27): dryness islands are
     # fragmented, so a single ad's 2+ regions can split (Unsubscribe 286
@@ -3484,7 +3521,7 @@ def _merge_chapters(id3_chapters, rss_chapters):
     return sorted(merged)
 
 
-def _method_chapter(words, chapters, silences):
+def _method_chapter(words, chapters, silences, audio_duration=None):
     """Method 'chapter': publisher-labeled ad chapters (2026-10-14).
 
     Chapters titled like '[Ad]', 'Ad:', 'Advertisement', 'Sponsor' are
@@ -3497,8 +3534,11 @@ def _method_chapter(words, chapters, silences):
     if not words:
         return []
     # Last word's END, not its start: the final chapter runs to the
-    # end of the last transcribed word (M21).
-    duration = words[-1][1]
+    # end of the last transcribed word (M21). T2-N7: when the audio
+    # duration is known, the final chapter runs to the audio end — a
+    # publisher chapter with no successor runs to the episode end.
+    duration = max(words[-1][1], audio_duration) \
+        if audio_duration else words[-1][1]
     pauses = get_pauses(words, silences)
     results = []
     ordered = sorted(chapters)
@@ -5202,7 +5242,8 @@ def slots_only_mode(slug, items, channel_link):
                                          chapters, own_domains=own_domains,
                                          candidates_out=candidates_out,
                                          own_identity=({_domain_stem(_channel_host)} | own_domains)
-                                         if _channel_host else own_domains)
+                                         if _channel_host else own_domains,
+                                         audio_duration=duration)
     a_sha256 = sha256_file(mp3_path)
     flow = run_slot_flow(work, words, duration, mp3_path, a_sha256,
                          item["audio_url"], sponsors, desc_sponsors,
@@ -5544,7 +5585,8 @@ def process_episode(item, state, channel_link=None, pcfg=None):
                                         chapters, own_domains=own_domains,
                                         candidates_out=candidates_out,
                                         own_identity=({_domain_stem(_channel_host)} | own_domains)
-                                        if _channel_host else own_domains)
+                                        if _channel_host else own_domains,
+                                        audio_duration=duration)
     # Cross-episode recurrence, positive direction (2026-11-11, KEPT):
     # recurring sponsor-copy spans from prior episodes of this show
     # extend already-detected blocks to the span's bounds. Runs after
